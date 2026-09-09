@@ -186,13 +186,49 @@ secure_env_file_permissions() {
   fi
 }
 
+ensure_python_venv_available() {
+  # On Debian/Ubuntu the venv module ships in a separate package that is
+  # often absent on minimal images. Install it (plus python3-pip so that
+  # pip is available inside the new venv) when apt-get is present.
+  if ! "$SYSTEM_PYTHON" -c "import ensurepip" >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      echo "python3-venv not available; installing python3-venv and python3-pip…" >&2
+      apt-get update -qq
+      # Determine the exact python version (e.g. 3.12) for the versioned package name.
+      local py_ver
+      py_ver=$("$SYSTEM_PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+      apt-get install -y -qq "python${py_ver}-venv" python3-pip
+    else
+      echo "Error: python3-venv (ensurepip) is not available and apt-get was not found." >&2
+      echo "Install the python3-venv package for your distribution and rerun this installer." >&2
+      exit 1
+    fi
+  fi
+}
+
 ensure_virtualenv() {
   if [[ -d "$VENV_DIR" ]]; then
     return
   fi
 
-  "$SYSTEM_PYTHON" -m venv "$VENV_DIR"
+  ensure_python_venv_available
+
+  # Create the venv without pip first; we bootstrap pip below via ensurepip
+  # so the venv works correctly even on distros that ship a stripped venv.
+  "$SYSTEM_PYTHON" -m venv --without-pip "$VENV_DIR"
   echo "Created virtual environment at ${VENV_DIR}." >&2
+
+  local venv_py
+  venv_py=$(venv_python)
+  if [[ -z "$venv_py" ]]; then
+    echo "Error: Unable to locate virtualenv python interpreter after creation." >&2
+    exit 1
+  fi
+
+  # Bootstrap pip inside the venv using the stdlib ensurepip module.
+  "$venv_py" -m ensurepip --upgrade
+  "$venv_py" -m pip install --quiet --upgrade pip setuptools wheel
+  echo "pip bootstrapped in ${VENV_DIR}." >&2
 }
 
 venv_python() {
@@ -216,7 +252,6 @@ install_dependencies() {
     exit 1
   fi
 
-  "$python_bin" -m pip install --upgrade pip setuptools wheel
   if [[ "$ENVIRONMENT" == "development" ]]; then
     "$python_bin" -m pip install --upgrade -e "$PROJECT_ROOT"
   else
@@ -237,205 +272,6 @@ install_sip_client() {
   apt-get update -qq
   apt-get install -y -qq baresip
   command -v baresip >/dev/null 2>&1 || { echo "Error: baresip installation failed." >&2; exit 1; }
-}
-
-# ---------------------------------------------------------------------------
-# PowerShell Core (pwsh) – optional dependency for Exchange Online fallback
-# ---------------------------------------------------------------------------
-
-install_pwsh() {
-  # Skip if pwsh is already available.
-  if command -v pwsh >/dev/null 2>&1; then
-    echo "PowerShell Core (pwsh) is already installed." >&2
-    return
-  fi
-
-  # Only attempt installation on Debian/Ubuntu where apt-get is available.
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "Warning: apt-get not found – skipping PowerShell Core installation." >&2
-    echo "Install PowerShell Core manually: https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell" >&2
-    return
-  fi
-
-  echo "Installing PowerShell Core (pwsh)…" >&2
-
-  # Packages required to register the Microsoft package repository.
-  if ! apt-get update -qq; then
-    echo "Warning: apt-get update failed – skipping PowerShell Core installation." >&2
-    return
-  fi
-  if ! apt-get install -y -qq apt-transport-https software-properties-common wget; then
-    echo "Warning: Failed to install prerequisite packages – skipping PowerShell Core installation." >&2
-    return
-  fi
-
-  # Detect the running distribution.  /etc/os-release is standard on all
-  # systemd-based distributions.
-  local version_id=""
-  if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    version_id="${VERSION_ID:-}"
-  fi
-
-  if [[ -z "$version_id" ]]; then
-    echo "Warning: Unable to determine OS version – skipping PowerShell Core installation." >&2
-    echo "Install PowerShell Core manually: https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell" >&2
-    return
-  fi
-
-  # Register the Microsoft package repository.
-  local pkg_url="https://packages.microsoft.com/config/ubuntu/${version_id}/packages-microsoft-prod.deb"
-  local tmp_deb
-  tmp_deb=$(mktemp /tmp/packages-microsoft-prod.XXXXXX.deb)
-  if ! wget -q -O "$tmp_deb" "$pkg_url"; then
-    rm -f "$tmp_deb"
-    echo "Warning: Failed to download Microsoft package list for Ubuntu ${version_id}." >&2
-    echo "Install PowerShell Core manually: https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell" >&2
-    return
-  fi
-  dpkg -i "$tmp_deb"
-  rm -f "$tmp_deb"
-
-  if ! apt-get update -qq; then
-    echo "Warning: apt-get update failed after adding Microsoft repository." >&2
-    return
-  fi
-  if ! apt-get install -y -qq powershell; then
-    echo "Warning: Failed to install powershell package." >&2
-    echo "Install PowerShell Core manually: https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell" >&2
-    return
-  fi
-
-  if command -v pwsh >/dev/null 2>&1; then
-    echo "PowerShell Core installed successfully." >&2
-  else
-    echo "Warning: PowerShell Core package installed but pwsh not found on PATH." >&2
-  fi
-}
-
-install_exo_module() {
-  local pwsh_bin
-  pwsh_bin=$(command -v pwsh 2>/dev/null || true)
-
-  if [[ -z "$pwsh_bin" ]]; then
-    echo "Warning: pwsh not available – skipping ExchangeOnlineManagement module install." >&2
-    return
-  fi
-
-  # Check if the module is already installed.
-  if "$pwsh_bin" -NoProfile -NonInteractive -Command \
-      'if (Get-Module -ListAvailable -Name ExchangeOnlineManagement) { exit 0 } else { exit 1 }' \
-      2>/dev/null; then
-    echo "ExchangeOnlineManagement PowerShell module is already installed." >&2
-    return
-  fi
-
-  echo "Installing ExchangeOnlineManagement PowerShell module…" >&2
-
-  "$pwsh_bin" -NoProfile -NonInteractive -Command \
-    'Install-Module -Name ExchangeOnlineManagement -Repository PSGallery -Scope AllUsers -Force -AllowClobber'
-
-  if "$pwsh_bin" -NoProfile -NonInteractive -Command \
-      'if (Get-Module -ListAvailable -Name ExchangeOnlineManagement) { exit 0 } else { exit 1 }' \
-      2>/dev/null; then
-    echo "ExchangeOnlineManagement module installed successfully." >&2
-  else
-    echo "Warning: ExchangeOnlineManagement module installation may have failed." >&2
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# .NET SDK + WiX v7 – required for building the Windows MSI tray installer
-# ---------------------------------------------------------------------------
-
-install_dotnet() {
-  if command -v dotnet >/dev/null 2>&1; then
-    echo ".NET SDK is already installed ($(dotnet --version))." >&2
-    return
-  fi
-
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "Warning: apt-get not found – skipping .NET SDK installation." >&2
-    echo "Install .NET SDK 8+ manually to enable MSI builds: https://dotnet.microsoft.com/download" >&2
-    return
-  fi
-
-  echo "Installing .NET SDK 8.0…" >&2
-
-  if ! apt-get update -qq; then
-    echo "Warning: apt-get update failed – skipping .NET SDK installation." >&2
-    return
-  fi
-
-  # Try 8.0 first (LTS); fall back to 9.0 if the distro only ships the newer SDK.
-  if apt-get install -y -qq dotnet-sdk-8.0 2>/dev/null; then
-    :
-  elif apt-get install -y -qq dotnet-sdk-9.0 2>/dev/null; then
-    :
-  else
-    echo "Warning: Could not install .NET SDK via apt-get." >&2
-    echo "Install .NET SDK 8+ manually: https://dotnet.microsoft.com/download" >&2
-    return
-  fi
-
-  if command -v dotnet >/dev/null 2>&1; then
-    echo ".NET SDK installed ($(dotnet --version))." >&2
-  else
-    echo "Warning: .NET SDK package installed but dotnet not found on PATH." >&2
-  fi
-}
-
-install_wix() {
-  # WiX v7 is a .NET global tool installed per-user under ~/.dotnet/tools.
-  # WiX v7 requires accepting the FireGiant Open Source Maintenance Fee
-  # (OSMF) EULA. We pass `-acceptEula wix7` on the `wix build` command line
-  # per https://docs.firegiant.com/wix/osmf/ so unattended builds do not
-  # fail with WIX7015.
-  export PATH="${HOME}/.dotnet/tools:${PATH}"
-
-  if command -v wix >/dev/null 2>&1; then
-    local current_version
-    current_version=$(wix --version 2>/dev/null | head -n1 | awk '{print $1}')
-    if [[ "$current_version" == 7.* ]]; then
-      echo "WiX v7 is already installed (version ${current_version})." >&2
-      return
-    fi
-    echo "Found WiX version ${current_version:-unknown}; replacing with v7…" >&2
-    local dotnet_bin_uninstall
-    dotnet_bin_uninstall=$(command -v dotnet 2>/dev/null || true)
-    if [[ -n "$dotnet_bin_uninstall" ]]; then
-      "$dotnet_bin_uninstall" tool uninstall --global wix >/dev/null 2>&1 || true
-    fi
-  fi
-
-  local dotnet_bin
-  dotnet_bin=$(command -v dotnet 2>/dev/null || true)
-
-  if [[ -z "$dotnet_bin" ]]; then
-    echo "Warning: dotnet not available – skipping WiX v7 installation." >&2
-    return
-  fi
-
-  echo "Installing WiX v7 (dotnet global tool)…" >&2
-
-  if ! "$dotnet_bin" tool install --global wix --version "7.*" 2>/dev/null; then
-    # Already installed at a different version; try updating instead.
-    if ! "$dotnet_bin" tool update --global wix --version "7.*" 2>/dev/null; then
-      echo "Warning: Failed to install WiX v7." >&2
-      return
-    fi
-  fi
-
-  # Re-export so the newly installed binary is on PATH for the rest of this session.
-  export PATH="${HOME}/.dotnet/tools:${PATH}"
-
-  if command -v wix >/dev/null 2>&1; then
-    echo "WiX v7 installed successfully." >&2
-  else
-    echo "Warning: WiX v7 installed but wix binary not found on PATH." >&2
-    echo "Add \${HOME}/.dotnet/tools to PATH to use it." >&2
-  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -532,18 +368,10 @@ build_tray_installers() {
     return
   fi
 
-  # Ensure WiX is on PATH (installed by install_wix above).
-  export PATH="${HOME}/.dotnet/tools:${PATH}"
-
-  if ! command -v wix >/dev/null 2>&1; then
-    echo "WiX v7 not available; skipping MSI build." >&2
-    return
-  fi
-
-  echo "Attempting to build Windows MSI installer…" >&2
+  echo "Attempting to build tray installers…" >&2
   local go_dir
   go_dir=$(dirname "$go_bin")
-  if (cd "$tray_dir" && PATH="${go_dir}:${HOME}/.dotnet/tools:${PATH}" make build-msi); then
+  if (cd "$tray_dir" && PATH="${go_dir}:${PATH}" make build-msi); then
     mkdir -p "$static_tray_dir"
     if [[ -f "${tray_dir}/dist/windows/myportal-tray.msi" ]]; then
       cp "${tray_dir}/dist/windows/myportal-tray.msi" "${static_tray_dir}/myportal-tray.msi"
@@ -593,10 +421,6 @@ SECURITY REMINDER:
 
 REMINDER
 
-install_pwsh
-install_exo_module
-install_dotnet
-install_wix
 install_go
 install_sip_client
 ensure_virtualenv
