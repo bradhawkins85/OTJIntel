@@ -1,5 +1,4 @@
 from . import (
-    agent,
     api_keys,
     audit_logs,
     auth,
@@ -12,7 +11,6 @@ from . import (
     knowledge_base,
     licenses,
     memberships,
-    m365,
     message_templates,
     modules,
     mcp,
@@ -30,7 +28,6 @@ from . import (
 )
 
 __all__ = [
-    "agent",
     "api_keys",
     "audit_logs",
     "auth",
@@ -42,7 +39,6 @@ __all__ = [
     "issues",
     "knowledge_base",
     "licenses",
-    "m365",
     "message_templates",
     "modules",
     "mcp",

@@ -55,7 +55,6 @@ from starlette.datastructures import FormData, URL
 from http import HTTPStatus
 
 from app.api.routes import (
-    agent,
     api_keys,
     asset_custom_fields,
     audit_logs,
@@ -74,7 +73,6 @@ from app.api.routes import (
     knowledge_base as knowledge_base_api,
     licenses as licenses_api,
     memberships,
-    m365 as m365_api,
     message_templates as message_templates_api,
     modules as modules_api,
     notifications,
@@ -180,7 +178,6 @@ from app.services import ticket_attachments as attachments_service
 from app.services import template_variables
 from app.services import webhook_monitor
 from app.services import issues as issues_service
-from app.services import reports as reports_service
 from app.services import reporting as reporting_service
 from app.services import service_status as service_status_service
 from app.services import system_state as system_state_service
@@ -900,7 +897,6 @@ async def authenticated_swagger_ui(request: Request) -> Response:
 
 app.include_router(auth.router)
 app.include_router(dashboard_api.router)
-app.include_router(agent.router)
 app.include_router(users.router)
 app.include_router(companies.router)
 app.include_router(essential8_api.router)
@@ -913,7 +909,6 @@ app.include_router(bc11.router)
 app.include_router(bcp.router)
 app.include_router(roles.router)
 app.include_router(memberships.router)
-app.include_router(m365_api.router)
 app.include_router(message_templates_api.router)
 app.include_router(ports.router)
 app.include_router(notifications.router)

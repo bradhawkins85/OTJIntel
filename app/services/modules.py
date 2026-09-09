@@ -37,9 +37,7 @@ from app.repositories import scheduled_tasks as scheduled_tasks_repo
 from app.repositories import tickets as tickets_repo
 from app.repositories import webhook_events as webhook_repo
 from app.security.encryption import decrypt_secret, encrypt_secret
-from app.services import call_recordings as call_recordings_service
 from app.services import email as email_service, webhook_monitor
-from app.services import unifi_talk as unifi_talk_service
 from app.services.realtime import RefreshNotifier, refresh_notifier
 from app.services import tickets as tickets_service
 from app.core.module_capabilities import COMMANDS_BY_MODULE, MODULE_CAPABILITIES
@@ -4798,6 +4796,7 @@ async def _validate_call_recordings(
     event_future: asyncio.Future[int | None] | None = None,
 ) -> dict[str, Any]:
     """Validate configuration and synchronise recordings from disk."""
+    from app.services import call_recordings as call_recordings_service
     configured_path = str(settings.get("recordings_path") or "").strip()
     override_path = str(
         payload.get("path") or payload.get("recordings_path") or ""
@@ -4864,6 +4863,8 @@ async def _invoke_unifi_talk(
     event_future: asyncio.Future[int | None] | None = None,
 ) -> dict[str, Any]:
     """Download call recordings from Unifi Talk via SFTP and sync to database."""
+    from app.services import call_recordings as call_recordings_service
+    from app.services import unifi_talk as unifi_talk_service
     remote_host = str(settings.get("remote_host") or "").strip()
     remote_path = (
         str(settings.get("remote_path") or "").strip()

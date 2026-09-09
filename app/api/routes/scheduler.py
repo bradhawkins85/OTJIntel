@@ -24,7 +24,7 @@ from app.schemas.scheduler import (
     WebhookEventResponse,
     WebhookEventsBulkDeleteResponse,
 )
-from app.services import cron_calendar, scheduled_task_preview, webhook_monitor
+from app.services import cron_calendar, webhook_monitor
 from app.services.scheduler import scheduler_service
 
 router = APIRouter(prefix="/scheduler", tags=["Scheduler"])
@@ -158,6 +158,8 @@ async def preview_task(
     _: None = Depends(require_database),
     __: dict[str, Any] = Depends(require_super_admin),
 ) -> ScheduledTaskPreviewResponse:
+    from app.services import scheduled_task_preview
+
     existing = await scheduled_tasks_repo.get_task(task_id)
     if not existing:
         raise HTTPException(

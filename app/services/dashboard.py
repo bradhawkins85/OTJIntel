@@ -28,7 +28,6 @@ from fastapi import Request
 
 from app.core.logging import log_error
 from app.repositories import change_log as change_log_repo
-from app.repositories import invoices as invoice_repo
 from app.repositories import licenses as license_repo
 from app.repositories import notifications as notifications_repo
 from app.repositories import tickets as tickets_repo
@@ -231,50 +230,6 @@ async def _attention_section(ctx: _DashboardContext) -> dict[str, Any]:
                     "count": unassigned,
                     "severity": "warning",
                     "href": "/admin/tickets?assigned=unassigned",
-                }
-            )
-
-    # 3. Overdue / outstanding invoices for the active company
-    if ctx.active_company_id is not None and ctx.has_permission("can_manage_invoices"):
-        try:
-            invoices = await invoice_repo.list_company_invoices(int(ctx.active_company_id))
-        except Exception as exc:
-            log_error("Dashboard: invoice lookup failed", error=str(exc))
-            invoices = []
-        today = datetime.now(timezone.utc).date()
-        overdue = 0
-        outstanding = 0
-        outstanding_amount = Decimal("0")
-        for invoice in invoices or []:
-            status = str(invoice.get("status") or "").strip().lower()
-            if status in _CLOSED_INVOICE_STATUSES:
-                continue
-            outstanding += 1
-            amount = invoice.get("amount")
-            if isinstance(amount, Decimal):
-                outstanding_amount += amount
-            due_date = invoice.get("due_date")
-            if due_date and due_date < today:
-                overdue += 1
-        if overdue:
-            items.append(
-                {
-                    "key": "invoices.overdue",
-                    "label": "Overdue invoices",
-                    "count": overdue,
-                    "severity": "danger",
-                    "href": "/invoices",
-                }
-            )
-        elif outstanding:
-            items.append(
-                {
-                    "key": "invoices.outstanding",
-                    "label": "Outstanding invoices",
-                    "count": outstanding,
-                    "severity": "info",
-                    "href": "/invoices",
-                    "detail": _format_currency(outstanding_amount),
                 }
             )
 

@@ -86,11 +86,9 @@ async def get_asset_custom_fields(asset_id: int):
 async def set_asset_custom_fields(
     asset_id: int,
     fields: list[FieldValueSet],
-    send_tray_notification: bool = False,
 ):
     """Set custom field values for an asset."""
     from app.schemas.asset_custom_fields import FieldType
-    from app.services import tray as tray_service
 
     for field in fields:
         definition = await custom_fields_repo.get_field_definition(field.field_definition_id)
@@ -122,17 +120,6 @@ async def set_asset_custom_fields(
             value_date=value_date,
             value_boolean=value_boolean,
         )
-
-    if send_tray_notification:
-        asset = await assets_repo.get_asset_by_id(asset_id)
-        if asset and asset.get("company_id"):
-            asset_name = str(asset.get("name") or f"Asset #{asset_id}").strip()
-            await tray_service.push_notification_to_company_devices(
-                company_id=int(asset["company_id"]),
-                title="Asset updated",
-                body=f"{asset_name} has been updated.",
-                asset_ids=[asset_id],
-            )
 
     return {"message": "Custom fields updated successfully"}
 

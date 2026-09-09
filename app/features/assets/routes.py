@@ -16,9 +16,7 @@ from app.repositories import asset_custom_fields as asset_custom_fields_repo
 from app.repositories import assets as asset_repo
 from app.repositories import companies as company_repo
 from app.repositories import network_devices as network_devices_repo
-from app.repositories import tray as tray_repo
 from app.repositories import user_companies as user_company_repo
-from app.services import tray as tray_service
 from app.services import hudu as hudu_service
 
 router = APIRouter(tags=["Assets"])
@@ -270,22 +268,7 @@ async def assets_page(request: Request):
     cf_values_by_asset = await asset_custom_fields_repo.get_all_asset_field_values(
         asset_ids
     )
-    tray_devices_by_asset = await tray_repo.list_active_devices_by_asset_ids(asset_ids)
-
     for record in prepared:
-        tray_device = (
-            tray_devices_by_asset.get(int(record["id"])) if record.get("id") else None
-        )
-        record["tray_device_uid"] = (
-            tray_device.get("device_uid") if tray_device else None
-        )
-        record["tray_device_hostname"] = (
-            tray_device.get("hostname") if tray_device else None
-        )
-        record["tray_agent_synced"] = bool(record["tray_device_uid"])
-        record["can_open_chat"] = bool(
-            record["tray_device_uid"] and main_module.settings.matrix_enabled
-        )
         asset_id = record.get("id")
         asset_cf = cf_values_by_asset.get(asset_id, {})
         for field_def in field_definitions:
@@ -744,50 +727,6 @@ async def configure_network_scanner(request: Request, device_id: int):
         local_cidrs,
     )
     return RedirectResponse(url="/devices", status_code=status.HTTP_303_SEE_OTHER)
-
-
-@router.post("/devices/scanners/{device_id}/scan")
-async def scan_network_now(request: Request, device_id: int):
-    main_module = _main()
-    user, membership, _company, company_id, redirect = await _load_asset_context(
-        request, "menu.network_devices"
-    )
-    if redirect:
-        return redirect
-    if not (
-        user.get("is_super_admin")
-        or main_module._membership_menu_can(user, membership, "menu.network_devices", write=True)
-    ):
-        raise HTTPException(status_code=403, detail="Network Devices write access required")
-
-    scanner = next(
-        (
-            item
-            for item in await network_devices_repo.list_scanners(company_id)
-            if int(item["id"]) == device_id and item.get("network_scanner_enabled")
-        ),
-        None,
-    )
-    if scanner is None:
-        raise HTTPException(status_code=404, detail="Enabled subnet scanner not found")
-
-    payload = {"type": "scan_network"}
-    delivered = await tray_service.send_to_device(
-        str(scanner.get("device_uid") or ""), payload
-    )
-    await tray_repo.log_command(
-        device_id=device_id,
-        command="scan_network",
-        payload_json=json.dumps(payload),
-        initiated_by_user_id=int(user["id"]),
-        status="delivered" if delivered else "queued",
-    )
-    message = (
-        "Scan request sent to the agent."
-        if delivered
-        else "Scan request queued until the agent reconnects."
-    )
-    return main_module.flash_redirect("/devices", message, "success")
 
 
 @router.get("/assets/{asset_id}", response_class=RedirectResponse)
