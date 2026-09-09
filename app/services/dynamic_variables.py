@@ -7,7 +7,6 @@ from typing import Any
 from app.repositories import assets as assets_repo
 from app.repositories import asset_custom_fields as asset_custom_fields_repo
 from app.repositories import issues as issues_repo
-from app.repositories import huntress as huntress_repo
 from app.repositories import reporting as reporting_repo
 from app.services import reporting as reporting_service
 

@@ -35,12 +35,10 @@ from app.repositories import companies as company_repo
 from app.repositories import staff as staff_repo
 from app.repositories import assets as assets_repo
 from app.repositories import licenses as licenses_repo
-from app.repositories import shop as shop_repo
 from app.repositories import compliance_checks as compliance_repo
 from app.repositories import essential8 as e8_repo
 from app.repositories import issues as issues_repo
 from app.repositories import business_continuity_plans as bc_plans_repo
-from app.repositories import m365_best_practices as bp_repo
 from app.repositories import subscriptions as subscriptions_repo
 from app.repositories import subscription_categories as sub_cat_repo
 
@@ -262,6 +260,8 @@ async def seed_demo_data(seeded_by_user_id: int | None = None) -> dict[str, Any]
             "SELECT id FROM shop_products WHERE sku = %s", (spec["sku"],)
         )
         if existing:
+            from app.repositories import shop as shop_repo
+
             product = await shop_repo.get_product_by_id(int(existing["id"]))
         else:
             try:
@@ -543,6 +543,8 @@ async def seed_demo_data(seeded_by_user_id: int | None = None) -> dict[str, Any]
     created_m365 = 0
     for check_id, check_name, status, details in m365_checks:
         try:
+            from app.repositories import m365_best_practices as bp_repo
+
             await bp_repo.upsert_result(
                 company_id=company_id,
                 check_id=check_id,

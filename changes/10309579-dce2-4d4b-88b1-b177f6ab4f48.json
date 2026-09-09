@@ -1,0 +1,7 @@
+{
+  "guid": "10309579-dce2-4d4b-88b1-b177f6ab4f48",
+  "occurred_at": "2026-09-09T00:00Z",
+  "change_type": "Fix",
+  "summary": "Removed stale MyPortal-only imports and tray integrations so OTJIntel starts without restoring excluded functionality.",
+  "content_hash": "e4bba415c7ca49ab8dfd14d615760dc665528e0a5a02141c70301c44eb82e8c5"
+}

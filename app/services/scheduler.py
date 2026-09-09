@@ -17,30 +17,18 @@ from app.core.database import db
 from app.core.logging import log_error, log_info
 from app.repositories import scheduled_tasks as scheduled_tasks_repo
 from app.repositories import m365 as m365_repo
-from app.services import asset_importer
 from app.services import automations as automations_service
-from app.services import company_id_lookup
 from app.services import imap as imap_service
-from app.services import invoice_generator as invoice_generator_service
 from app.services import m365 as m365_service
-from app.services import mac_vendors as mac_vendors_service
 from app.services import modules as modules_service
-from app.services import products as products_service
-from app.services import staff_importer
 from app.services import (
     staff_onboarding_workflows as staff_onboarding_workflows_service,
 )
-from app.services import subscription_price_changes
-from app.services import subscription_renewals
 from app.services import tickets as tickets_service
-from app.services import tray_installer as tray_installer_service
-from app.services import unbill_time_entries as unbill_time_entries_service
 from app.services import value_templates
 from app.services import webhook_monitor
-from app.services import xero as xero_service
 from app.services import service_status as service_status_service
 from app.services import ticket_shipment_tracking as shipment_watch_service
-from app.services import backup_jobs as backup_jobs_service
 from app.repositories import rag_index as rag_index_repo
 from app.repositories import rag_relationships as rag_relationship_repo
 from app.core.module_capabilities import COMMANDS_BY_MODULE, modules_for_command
@@ -438,6 +426,7 @@ class SchedulerService:
 
     async def _run_subscription_renewals(self) -> None:
         """Run subscription renewal invoice creation (T-60 job) with distributed lock."""
+        from app.services import subscription_renewals
         async with db.acquire_lock("subscription_renewals", timeout=5) as lock_acquired:
             if not lock_acquired:
                 log_info(
@@ -507,6 +496,7 @@ class SchedulerService:
 
     async def _run_backup_history_seed(self) -> None:
         """Seed daily 'unknown' backup events with distributed lock."""
+        from app.services import backup_jobs as backup_jobs_service
         async with db.acquire_lock("backup_history_seed", timeout=5) as lock_acquired:
             if not lock_acquired:
                 log_info(
@@ -521,6 +511,7 @@ class SchedulerService:
 
     async def _run_backup_alert_check(self) -> None:
         """Check backup alert thresholds and create tickets with distributed lock."""
+        from app.services import backup_jobs as backup_jobs_service
         async with db.acquire_lock("backup_alert_check", timeout=5) as lock_acquired:
             if not lock_acquired:
                 log_info(
@@ -644,20 +635,24 @@ class SchedulerService:
 
             try:
                 if command == "update_mac_vendors":
+                    from app.services import mac_vendors as mac_vendors_service
                     details = json.dumps(
                         await mac_vendors_service.update_mac_vendors(), default=str
                     )
                 elif command == "sync_staff":
+                    from app.services import staff_importer
                     company_id = task.get("company_id")
                     if company_id:
                         await staff_importer.import_contacts_for_company(
                             int(company_id)
                         )
                 elif command == "sync_assets":
+                    from app.services import asset_importer
                     company_id = task.get("company_id")
                     if company_id:
                         await asset_importer.import_assets_for_company(int(company_id))
                 elif command == "sync_tactical_assets":
+                    from app.services import asset_importer
                     company_id = task.get("company_id")
                     if company_id:
                         processed = (
@@ -679,6 +674,7 @@ class SchedulerService:
                     summary = await modules_service.pull_companies_from_tacticalrmm()
                     details = json.dumps(summary, default=str)
                 elif command in {"sync_o365", "sync_m365_data"}:
+                    from app.services import staff_importer
                     company_id = task.get("company_id")
                     if company_id:
                         company_id_int = int(company_id)
@@ -832,6 +828,7 @@ class SchedulerService:
                         status = "skipped"
                         details = "Company context required"
                 elif command == "sync_to_xero":
+                    from app.services import xero as xero_service
                     company_id = task.get("company_id")
                     if company_id:
                         result = await xero_service.sync_company(int(company_id))
@@ -856,6 +853,7 @@ class SchedulerService:
                         status = "skipped"
                         details = "Company context required"
                 elif command == "sync_to_xero_auto_send":
+                    from app.services import xero as xero_service
                     company_id = task.get("company_id")
                     if company_id:
                         result = await xero_service.sync_company(
@@ -882,6 +880,7 @@ class SchedulerService:
                         status = "skipped"
                         details = "Company context required"
                 elif command == "generate_invoice":
+                    from app.services import invoice_generator as invoice_generator_service
                     company_id = task.get("company_id")
                     if company_id:
                         result = await invoice_generator_service.generate_invoice(
@@ -902,6 +901,7 @@ class SchedulerService:
                         status = "skipped"
                         details = "Company context required"
                 elif command == "unbill_time_entries":
+                    from app.services import unbill_time_entries as unbill_time_entries_service
                     company_id = task.get("company_id")
                     result = await unbill_time_entries_service.unbill_time_entries(
                         int(company_id) if company_id else None
@@ -912,6 +912,7 @@ class SchedulerService:
                         if result_status == "skipped":
                             status = "skipped"
                 elif command == "refresh_company_ids":
+                    from app.services import company_id_lookup
                     company_id = task.get("company_id")
                     if company_id:
                         result = await company_id_lookup.lookup_missing_company_ids(
@@ -966,29 +967,15 @@ class SchedulerService:
                             status = "skipped"
                             details = str(exc)
                 elif command == "update_products":
+                    from app.services import products as products_service
                     await products_service.update_products_from_feed()
                 elif command == "update_stock_feed":
+                    from app.services import products as products_service
                     await products_service.update_stock_feed()
                 elif command == "system_update":
                     output = await self.run_system_update(force_restart=force_restart)
                     if output:
                         details = output
-                elif command == "update_tray_icon_installer":
-                    settings = get_settings()
-                    updated_assets = (
-                        await tray_installer_service.fetch_latest_tray_installers(
-                            repo=settings.github_tray_msi_repo,
-                            github_token=settings.github_token,
-                        )
-                    )
-                    details = json.dumps(
-                        {
-                            "repo": settings.github_tray_msi_repo,
-                            "assets": updated_assets,
-                            "updated": any(updated_assets.values()),
-                        },
-                        default=str,
-                    )
                 elif command == "rag_index_start":
                     active = await rag_index_repo.get_active_job()
                     if active:
@@ -1192,12 +1179,14 @@ class SchedulerService:
                         result = await m365_mail_service.sync_account(account_id)
                         details = json.dumps(result, default=str) if result else None
                 elif command == "send_price_change_notifications":
+                    from app.services import subscription_price_changes
                     result = (
                         await subscription_price_changes.send_price_change_notifications()
                     )
                     details = json.dumps(result, default=str)
                     log_info("Price change notifications sent", **result)
                 elif command == "apply_scheduled_price_changes":
+                    from app.services import subscription_price_changes
                     result = (
                         await subscription_price_changes.apply_scheduled_price_changes()
                     )

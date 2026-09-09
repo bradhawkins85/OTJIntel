@@ -86,7 +86,7 @@ from app.security.session import SessionData
 from app.services import audit as audit_service
 from app.services import labour_types as labour_types_service
 from app.services import ticket_attachments as attachments_service
-from app.services import ticket_importer, tickets as tickets_service
+from app.services import tickets as tickets_service
 from app.services.audit_diff import summarise_reply_body
 from app.services.sanitization import sanitize_rich_text
 
@@ -1157,6 +1157,8 @@ async def import_syncro_tickets_endpoint(
     current_user: dict = Depends(require_super_admin),
 ) -> SyncroTicketImportSummary:
     try:
+        from app.services import ticket_importer
+
         summary = await ticket_importer.import_from_request(
             mode=payload.mode.value,
             ticket_id=payload.ticket_id,
