@@ -1,1 +1,0 @@
-ALTER TABLE companies ADD COLUMN IF NOT EXISTS payment_method VARCHAR(50) NOT NULL DEFAULT 'invoice';

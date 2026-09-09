@@ -1,2 +1,0 @@
-ALTER TABLE shop_products
-  ADD COLUMN IF NOT EXISTS stock_wa INT NOT NULL DEFAULT 0 AFTER stock_sa;
