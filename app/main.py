@@ -500,17 +500,7 @@ async def _get_extra_csp_script_sources() -> list[str]:
     Returns:
         List of valid HTTPS URLs to allow as script sources
     """
-    sources = []
-    
-    try:
-        module_list = await modules_service.list_modules()
-        module_lookup = {module.get("slug"): module for module in module_list if module.get("slug")}
-    except Exception:
-        # If we fail to get module config, return empty list
-        # The CSP will still work with default sources
-        pass
-    
-    return sources
+    return []
 
 
 # Configure CORS with security-first defaults
@@ -720,28 +710,6 @@ app.add_middleware(
 templates = Jinja2Templates(directory=str(templates_config.template_path))
 
 
-def _parse_tray_agent_version(value: str | None) -> tuple[int, int, int]:
-    raw = (value or "").strip()
-    if not raw:
-        return (0, 0, 0)
-    if raw.startswith(("v", "V")):
-        raw = raw[1:]
-    numeric = re.split(r"[-+]", raw, maxsplit=1)[0]
-    parts = [part.strip() for part in numeric.split(".") if part.strip()]
-    nums: list[int] = []
-    for part in parts[:3]:
-        nums.append(int(part) if part.isdigit() else 0)
-    while len(nums) < 3:
-        nums.append(0)
-    return nums[0], nums[1], nums[2]
-
-
-def _is_tray_agent_outdated(agent_version: str | None, latest_version: str | None) -> bool:
-    if not (latest_version or "").strip():
-        return False
-    return _parse_tray_agent_version(agent_version) < _parse_tray_agent_version(latest_version)
-
-
 def _static_url(path: str) -> str:
     """Generate cache-busted URL for static files.
     
@@ -889,66 +857,6 @@ async def refresh_updates(websocket: WebSocket) -> None:
         pass
     finally:
         await refresh_notifier.disconnect(websocket)
-
-
-@app.websocket("/ws/tray/{device_uid}")
-async def tray_device_socket(websocket: WebSocket, device_uid: str) -> None:
-    """Persistent connection used by the tray client.
-
-    The handshake authenticates with a bearer auth_token supplied via the
-    ``Authorization`` header, the ``X-Tray-Token`` header, or the ``token``
-    query parameter (the latter for environments where headers cannot be
-    set on a websocket open).  Messages are JSON; the protocol is documented
-    in ``docs/tray_app.md``.
-    """
-
-    from app.repositories import tray as tray_repo
-    from app.services import tray as tray_service
-
-    token = (
-        websocket.headers.get("X-Tray-Token")
-        or websocket.query_params.get("token")
-        or ""
-    )
-    if not token:
-        auth_header = websocket.headers.get("Authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header.split(" ", 1)[1].strip()
-    if not token:
-        await websocket.close(code=4401)
-        return
-
-    device = await tray_repo.get_device_by_auth_hash(tray_service.hash_token(token))
-    if not device or device.get("device_uid") != device_uid:
-        await websocket.close(code=4401)
-        return
-
-    await websocket.accept()
-    tray_service.register_connection(device_uid, websocket)
-    await tray_service.deliver_queued_commands(device)
-    try:
-        while True:
-            try:
-                message = await websocket.receive_json()
-            except (WebSocketDisconnect, RuntimeError):
-                break
-            except Exception:  # pragma: no cover - malformed payload
-                continue
-            msg_type = message.get("type") if isinstance(message, dict) else None
-            if msg_type == "pong":
-                continue
-            if msg_type == "heartbeat":
-                await tray_repo.update_device_heartbeat(
-                    int(device["id"]),
-                    console_user=message.get("console_user"),
-                    last_ip=(websocket.client.host if websocket.client else None),
-                    agent_version=message.get("agent_version"),
-                )
-                continue
-            # Other inbound message types (chat_message, env_snapshot, etc.)
-            # are handled by feature-specific services in follow-up phases.
-    finally:
-        tray_service.unregister_connection(device_uid, websocket)
 
 
 # MCP WebSocket endpoint (only enabled if MCP_ENABLED is true)
@@ -2596,14 +2504,6 @@ async def on_startup() -> None:
         else:
             log_info("Demo data seeded on startup", **{k: v for k, v in result.items() if k != "skipped"})
 
-    async def _fetch_tray_msi() -> None:
-        from app.services import tray_installer as tray_installer_service
-
-        await tray_installer_service.fetch_latest_tray_installers(
-            repo=settings.github_tray_msi_repo,
-            github_token=settings.github_token,
-        )
-
     startup_tasks = [
         ("sync_change_log_sources", change_log_service.sync_change_log_sources()),
         ("ensure_default_modules", modules_service.ensure_default_modules()),
@@ -2611,7 +2511,6 @@ async def on_startup() -> None:
         ("bootstrap_default_bcp_template", _bootstrap_default_bcp_template()),
         ("migrate_sync_m365_data_tasks", _migrate_sync_m365_data_tasks()),
         ("seed_demo_data_once", _seed_demo_data_once()),
-        ("fetch_latest_tray_msi", _fetch_tray_msi()),
     ]
 
     results = await asyncio.gather(
@@ -2637,12 +2536,6 @@ async def on_startup() -> None:
     if settings.enable_background_relationships and settings.rag_relationship_workers > 0:
         for _ in range(settings.rag_relationship_workers):
             _rag_relationship_tasks.append(asyncio.create_task(rag_relationship_service.relationship_worker(_rag_relationship_stop)))
-    if settings.matrix_enabled:
-        from app.services import matrix_sync, matrix_ai_waiting_assistant
-        import asyncio as _asyncio
-        _asyncio.create_task(matrix_sync.run_sync_loop())
-        _asyncio.create_task(matrix_ai_waiting_assistant.run_worker_loop())
-
     # Load every built-in feature pack discovered under ``app/features/``.
     pack_slugs = [
         slug.strip()
@@ -2688,10 +2581,6 @@ async def on_startup() -> None:
 async def on_shutdown() -> None:
     global _app_ready
     _app_ready = False
-    if settings.matrix_enabled:
-        from app.services import matrix_sync, matrix_ai_waiting_assistant
-        matrix_sync.stop_sync_loop()
-        matrix_ai_waiting_assistant.stop_worker_loop()
     if globals().get("_rag_relationship_stop") is not None:
         _rag_relationship_stop.set()
     for task in globals().get("_rag_relationship_tasks", []) or []:
@@ -3137,33 +3026,12 @@ async def m365_page(request: Request):
             "token_expires_at": expires_display,
         }
 
-    # Fetch per-company admin credentials for super admins
-    admin_credential_view = None
-    if user.get("is_super_admin"):
-        admin_creds = await m365_service.get_company_admin_credentials(company_id)
-        if admin_creds:
-            admin_expires = admin_creds.get("client_secret_expires_at")
-            if isinstance(admin_expires, datetime):
-                admin_expires_display = admin_expires.replace(tzinfo=timezone.utc).isoformat()
-            elif admin_expires:
-                admin_expires_display = str(admin_expires)
-            else:
-                admin_expires_display = None
-            admin_credential_view = {
-                "client_id": admin_creds.get("client_id"),
-                "tenant_id": admin_creds.get("tenant_id"),
-                "client_secret_expires_at": admin_expires_display,
-            }
-
     extra = {
         "title": "Office 365",
         "company": company,
         "credential": credential_view,
-        "admin_credential": admin_credential_view,
         "is_super_admin": bool(user.get("is_super_admin")),
         "has_credentials": bool(credentials),
-        "has_admin_credentials": bool(admin_credential_view),
-        "admin_credentials_configured": bool(all(await _get_m365_admin_credentials(company_id))),
     }
     return await _render_template("m365/index.html", request, user, extra=extra)
 
@@ -6418,8 +6286,6 @@ def _ticket_related_fallback_url(source_type: str, source_id: Any) -> str | None
         return f"/admin/companies/{quote(identifier, safe='')}"
     if source_type == "staff":
         return f"/admin/staff/{quote(identifier, safe='')}"
-    if source_type == "chats":
-        return f"/chat/{quote(identifier, safe='')}"
     if source_type == "issues":
         return f"/admin/issues/{quote(identifier, safe='')}"
     return None
