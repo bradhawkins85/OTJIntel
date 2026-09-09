@@ -52,3 +52,24 @@ def test_install_environment_uses_distinct_development_service_name() -> None:
     script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
     contents = script_path.read_text(encoding="utf-8")
     assert 'printf \'%s\' "myportal-development"' in contents
+
+
+def test_production_installer_provisions_a_local_mysql_server() -> None:
+    script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
+    contents = script_path.read_text(encoding="utf-8")
+
+    assert "ensure_production_mysql()" in contents
+    assert 'apt-get install -y -qq default-mysql-server' in contents
+    assert 'systemctl enable --now "$candidate"' in contents
+    assert "CREATE DATABASE IF NOT EXISTS" in contents
+    assert "CREATE USER IF NOT EXISTS" in contents
+    assert "ensure_production_mysql\ninstall_go" in contents
+
+
+def test_mysql_provisioning_is_limited_to_production_and_local_hosts() -> None:
+    script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
+    contents = script_path.read_text(encoding="utf-8")
+
+    assert '[[ "$ENVIRONMENT" == "production" ]] || return 0' in contents
+    assert 'if ! is_local_database_host "$database_host"; then' in contents
+    assert "remote; skipping local server provisioning" in contents

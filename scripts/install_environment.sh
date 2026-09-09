@@ -616,6 +616,118 @@ run_privileged() {
   return 127
 }
 
+is_local_database_host() {
+  local host="${1,,}"
+  [[ "$host" == "localhost" || "$host" == "127.0.0.1" || "$host" == "::1" ]]
+}
+
+ensure_production_mysql() {
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+
+  local database_host database_user database_password database_name
+  database_host=$(read_env_value "DB_HOST" "")
+  database_user=$(read_env_value "DB_USER" "")
+  database_password=$(read_env_value "DB_PASSWORD" "")
+  database_name=$(read_env_value "DB_NAME" "")
+
+  # An empty DB_HOST selects the application's SQLite fallback. Remote MySQL
+  # servers are deliberately never installed or modified by this host installer.
+  if [[ -z "$database_host" ]]; then
+    echo "DB_HOST is empty; using the SQLite fallback without provisioning MySQL." >&2
+    return 0
+  fi
+  if ! is_local_database_host "$database_host"; then
+    echo "MySQL host '${database_host}' is remote; skipping local server provisioning." >&2
+    return 0
+  fi
+  if [[ -z "$database_user" || -z "$database_password" || -z "$database_name" ]]; then
+    echo "Error: DB_USER, DB_PASSWORD, and DB_NAME are required for local MySQL." >&2
+    return 1
+  fi
+  if [[ ! "$database_user" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+    echo "Error: DB_USER must contain 1-32 letters, digits, dots, underscores, or hyphens." >&2
+    return 1
+  fi
+  if [[ ! "$database_name" =~ ^[A-Za-z0-9_\$]{1,64}$ ]]; then
+    echo "Error: DB_NAME must contain 1-64 letters, digits, underscores, or dollar signs." >&2
+    return 1
+  fi
+
+  if ! command -v mysql >/dev/null 2>&1 || \
+     { ! command -v mysqld >/dev/null 2>&1 && \
+       ! command -v mariadbd >/dev/null 2>&1 && \
+       [[ ! -x /usr/sbin/mysqld && ! -x /usr/sbin/mariadbd ]]; }; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "Error: Local MySQL is configured but neither mysql nor apt-get is available." >&2
+      return 1
+    fi
+    echo "Installing the local MySQL server…" >&2
+    run_privileged apt-get update -qq
+    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq default-mysql-server
+  fi
+
+  local mysql_service=""
+  if command -v systemctl >/dev/null 2>&1; then
+    local candidate
+    for candidate in mysql.service mariadb.service; do
+      if run_privileged systemctl cat "$candidate" >/dev/null 2>&1; then
+        if run_privileged systemctl enable --now "$candidate"; then
+          mysql_service="$candidate"
+          break
+        fi
+      fi
+    done
+  fi
+  if [[ -z "$mysql_service" ]] && command -v service >/dev/null 2>&1; then
+    if run_privileged service mysql start >/dev/null 2>&1; then
+      mysql_service="mysql"
+    elif run_privileged service mariadb start >/dev/null 2>&1; then
+      mysql_service="mariadb"
+    fi
+  fi
+  if [[ -z "$mysql_service" ]]; then
+    echo "Error: MySQL was installed but its service could not be started." >&2
+    return 1
+  fi
+
+  local attempt
+  for attempt in {1..30}; do
+    if run_privileged mysqladmin --protocol=socket --user=root ping >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  if ! run_privileged mysqladmin --protocol=socket --user=root ping >/dev/null 2>&1; then
+    echo "Error: MySQL did not become ready after 30 seconds." >&2
+    return 1
+  fi
+
+  if ! DB_BOOTSTRAP_USER="$database_user" \
+    DB_BOOTSTRAP_PASSWORD="$database_password" \
+    DB_BOOTSTRAP_NAME="$database_name" \
+    "$SYSTEM_PYTHON" - <<'PY' | run_privileged mysql --protocol=socket --user=root; then
+import os
+
+
+def mysql_literal(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+user = mysql_literal(os.environ["DB_BOOTSTRAP_USER"])
+password = mysql_literal(os.environ["DB_BOOTSTRAP_PASSWORD"])
+database = os.environ["DB_BOOTSTRAP_NAME"]
+print(f"CREATE DATABASE IF NOT EXISTS `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+print(f"CREATE USER IF NOT EXISTS {user}@'localhost' IDENTIFIED BY {password};")
+print(f"ALTER USER {user}@'localhost' IDENTIFIED BY {password};")
+print(f"GRANT ALL PRIVILEGES ON `{database}`.* TO {user}@'localhost';")
+print("FLUSH PRIVILEGES;")
+PY
+    echo "Error: Failed to provision the MySQL database and application user." >&2
+    return 1
+  fi
+  echo "Provisioned MySQL database '${database_name}' and user '${database_user}'." >&2
+}
+
 reset_project_permissions() {
   local service_user="$1"
   if [[ "${EUID:-$(id -u)}" != "0" ]]; then
@@ -730,6 +842,9 @@ ensure_env_secret "TOTP_ENCRYPTION_KEY" 48
 ensure_env_secret "SMTP2GO_WEBHOOK_SECRET" 32
 ensure_env_secret "PLAUSIBLE_PEPPER" 32
 ensure_env_secret "MCP_TOKEN" 32
+if [[ "$ENV_FILE_CREATED" == "1" ]]; then
+  ensure_env_secret "DB_PASSWORD" 32
+fi
 secure_env_file_permissions
 
 cat <<'REMINDER'
@@ -744,6 +859,7 @@ SECURITY REMINDER:
 
 REMINDER
 
+ensure_production_mysql
 install_go
 install_sip_client
 ensure_virtualenv
