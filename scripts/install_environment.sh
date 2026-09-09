@@ -190,14 +190,33 @@ ensure_python_venv_available() {
   # On Debian/Ubuntu the venv module ships in a separate package that is
   # often absent on minimal images. Install it (plus python3-pip so that
   # pip is available inside the new venv) when apt-get is present.
+  #
+  # Note: on Debian/Ubuntu, `import ensurepip` may succeed even when the
+  # bundled pip wheels have been stripped out (python3-pip is a separate
+  # package). We therefore also check that ensurepip actually has wheels.
+  local needs_venv=false
+  local needs_pip=false
+
   if ! "$SYSTEM_PYTHON" -c "import ensurepip" >/dev/null 2>&1; then
+    needs_venv=true
+    needs_pip=true
+  elif ! "$SYSTEM_PYTHON" -c "import ensurepip; ensurepip._get_packages_info()" >/dev/null 2>&1; then
+    # ensurepip is present but has no bundled pip wheels (stripped Debian/Ubuntu install)
+    needs_pip=true
+  fi
+
+  if $needs_venv || $needs_pip; then
     if command -v apt-get >/dev/null 2>&1; then
-      echo "python3-venv not available; installing python3-venv and python3-pip…" >&2
+      echo "Installing missing Python packaging tools (python3-venv and/or python3-pip)…" >&2
       apt-get update -qq
       # Determine the exact python version (e.g. 3.12) for the versioned package name.
       local py_ver
       py_ver=$("$SYSTEM_PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-      apt-get install -y -qq "python${py_ver}-venv" python3-pip
+      if $needs_venv; then
+        apt-get install -y -qq "python${py_ver}-venv" python3-pip
+      else
+        apt-get install -y -qq python3-pip
+      fi
     else
       echo "Error: python3-venv (ensurepip) is not available and apt-get was not found." >&2
       echo "Install the python3-venv package for your distribution and rerun this installer." >&2
@@ -227,6 +246,28 @@ ensure_virtualenv() {
 
   # Bootstrap pip inside the venv using the stdlib ensurepip module.
   "$venv_py" -m ensurepip --upgrade
+
+  # Verify pip is now importable; on stripped Debian/Ubuntu images ensurepip
+  # may succeed but leave no pip wheel. Fall back to the system pip installer.
+  if ! "$venv_py" -m pip --version >/dev/null 2>&1; then
+    echo "ensurepip did not install pip; falling back to get-pip.py…" >&2
+    local get_pip_url="https://bootstrap.pypa.io/get-pip.py"
+    local get_pip_tmp
+    get_pip_tmp=$(mktemp /tmp/get-pip-XXXXXX.py)
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$get_pip_url" -o "$get_pip_tmp"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q "$get_pip_url" -O "$get_pip_tmp"
+    else
+      echo "Error: pip could not be bootstrapped and neither curl nor wget is available." >&2
+      echo "Install python3-pip and rerun the installer." >&2
+      rm -f "$get_pip_tmp"
+      exit 1
+    fi
+    "$venv_py" "$get_pip_tmp" --quiet
+    rm -f "$get_pip_tmp"
+  fi
+
   "$venv_py" -m pip install --quiet --upgrade pip setuptools wheel
   echo "pip bootstrapped in ${VENV_DIR}." >&2
 }
