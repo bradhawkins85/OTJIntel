@@ -5,6 +5,12 @@ The instructions below describe how to install MyPortal as a hardened
 setup that keeps the application running, applies migrations at startup,
 and limits exposure in the event of a compromise.
 
+If you run `scripts/install_production.sh` or `scripts/install_development.sh`
+from the repository checkout, the installer now generates and starts a
+project-local unit automatically. Use the manual steps below when you want
+the hardened `/opt/myportal` + `/etc/myportal.env` layout or need to tailor
+the unit file further.
+
 ## 1. Create a dedicated service account
 
 Run these commands as `root` (or with `sudo`) to create an unprivileged

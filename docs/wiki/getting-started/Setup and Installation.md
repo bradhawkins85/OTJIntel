@@ -101,9 +101,14 @@ sudo scripts/install_development.sh
 
 These scripts:
 - Check and install Python requirements
-- Create systemd services for running as a service
+- Align `.env` with the selected environment
+- Create and start a systemd service on Linux hosts with `systemd`
 - Pull code from GitHub private repos using credentials from .env
 - Set up appropriate database isolation
+
+By default, the production installer creates `myportal.service` on port
+8000. The development installer creates `myportal-development.service` on
+port 8001 so it can coexist with a production deployment on the same host.
 
 ### Manual Production Setup
 
