@@ -32,3 +32,23 @@ def test_install_environment_seeds_auto_refresh() -> None:
     script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
     contents = script_path.read_text(encoding="utf-8")
     assert 'ensure_env_default "ENABLE_AUTO_REFRESH" "false"' in contents
+
+
+def test_install_environment_aligns_env_file_with_selected_environment() -> None:
+    script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
+    contents = script_path.read_text(encoding="utf-8")
+    assert 'set_env_value "ENVIRONMENT" "$ENVIRONMENT"' in contents
+
+
+def test_install_environment_installs_and_starts_systemd_service() -> None:
+    script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
+    contents = script_path.read_text(encoding="utf-8")
+    assert "install_systemd_service()" in contents
+    assert 'run_privileged systemctl daemon-reload' in contents
+    assert 'run_privileged systemctl enable --now "$unit_name"' in contents
+
+
+def test_install_environment_uses_distinct_development_service_name() -> None:
+    script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
+    contents = script_path.read_text(encoding="utf-8")
+    assert 'printf \'%s\' "myportal-development"' in contents
