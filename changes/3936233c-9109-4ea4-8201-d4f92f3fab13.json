@@ -1,0 +1,7 @@
+{
+  "guid": "3936233c-9109-4ea4-8201-d4f92f3fab13",
+  "occurred_at": "2026-09-09T00:00Z",
+  "change_type": "Fix",
+  "summary": "Provision and start a local MySQL server during production installation when one is missing.",
+  "content_hash": "4767eb7f70f97acbdb96efa138905621a9986e4de22d2db67e2df18121b2e65f"
+}
