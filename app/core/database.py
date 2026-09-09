@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Iterable, Any
+from typing import TYPE_CHECKING, AsyncIterator, Iterable, Any
 import re
 
 import aiomysql
-import aiosqlite
 from loguru import logger
+
+if TYPE_CHECKING:
+    import aiosqlite
 
 from .config import get_settings
 
@@ -120,6 +122,7 @@ class Database:
             return
         
         if self._use_sqlite:
+            import aiosqlite  # lazy import: only needed for the SQLite fallback
             logger.info("Connecting to SQLite database")
             db_path = self._get_sqlite_path()
             self._sqlite_conn = await aiosqlite.connect(str(db_path))
