@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+import pytest
+
+from app.repositories import staff
+
+
+class _DummyStaffDB:
+    def __init__(self, rows):
+        self.rows = rows
+        self.last_sql: str | None = None
+        self.last_params: tuple | None = None
+
+    async def fetch_all(self, sql, params):
+        self.last_sql = sql.strip()
+        self.last_params = params
+        return self.rows
+
+
+class _DummyCustomFieldsRepo:
+    async def get_all_staff_field_values(self, company_id, staff_ids):
+        return {int(staff_id): {} for staff_id in staff_ids}
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_list_enabled_staff_users_returns_rows(monkeypatch):
+    dummy_rows = [
+        {
+            "staff_id": 11,
+            "user_id": 101,
+            "email": "bravo@example.com",
+            "mobile_phone": "0412 345 678",
+        },
+        {"staff_id": 5, "user_id": None, "email": "alpha@example.com"},
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+
+    result = await staff.list_enabled_staff_users(3)
+
+    assert dummy_db.last_params == (3,)
+    assert "FROM staff AS s" in (dummy_db.last_sql or "")
+    assert "s.created_at AS created_at" in (dummy_db.last_sql or "")
+    assert "s.updated_at AS updated_at" in (dummy_db.last_sql or "")
+    assert "s.mobile_phone AS mobile_phone" in (dummy_db.last_sql or "")
+    assert "u.created_at" not in (dummy_db.last_sql or "")
+    assert "u.updated_at" not in (dummy_db.last_sql or "")
+    assert result[0]["id"] == 101
+    assert result[0]["requester_value"] == "user:101"
+    assert result[0]["is_registered_user"] is True
+    assert result[0]["mobile_phone"] == "0412 345 678"
+    assert result[1]["id"] == 5
+    assert result[1]["requester_value"] == "staff:5"
+    assert result[1]["is_registered_user"] is False
+    assert result is not dummy_rows
+
+
+@pytest.mark.anyio
+async def test_list_enabled_staff_users_deduplicates_by_email(monkeypatch):
+    dummy_rows = [
+        {"staff_id": 11, "user_id": 101, "email": "Casey@Example.com"},
+        {"staff_id": 12, "user_id": 101, "email": " casey@example.com "},
+        {"staff_id": 13, "user_id": None, "email": "other@example.com"},
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+
+    result = await staff.list_enabled_staff_users(3)
+
+    assert [row["staff_id"] for row in result] == [11, 13]
+
+
+@pytest.mark.anyio
+async def test_list_active_staff_for_offboarding_deduplicates_by_email(monkeypatch):
+    dummy_rows = [
+        {"id": 1, "first_name": "Evan", "last_name": "One", "email": "evan@example.com"},
+        {"id": 2, "first_name": "Evan", "last_name": "Two", "email": "EVAN@example.com"},
+        {"id": 3, "first_name": "Riley", "last_name": "Three", "email": "riley@example.com"},
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+
+    result = await staff.list_active_staff_for_offboarding(3)
+
+    assert [row["id"] for row in result] == [1, 3]
+
+
+@pytest.mark.anyio
+async def test_list_enabled_staff_users_handles_empty(monkeypatch):
+    dummy_db = _DummyStaffDB([])
+    monkeypatch.setattr(staff, "db", dummy_db)
+
+    result = await staff.list_enabled_staff_users(9)
+
+    assert result == []
+    assert dummy_db.last_params == (9,)
+
+
+@pytest.mark.anyio
+async def test_list_staff_supports_polling_filters_and_cursor(monkeypatch):
+    dummy_rows = [
+        {
+            "id": 7,
+            "company_id": 3,
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+            "email": "ada@example.com",
+            "enabled": 1,
+            "is_ex_staff": 0,
+            "date_onboarded": None,
+            "date_offboarded": None,
+            "m365_last_sign_in": None,
+            "created_at": None,
+            "updated_at": None,
+            "onboarding_complete": 0,
+            "onboarding_completed_at": None,
+            "onboarding_status": "requested",
+        }
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+    monkeypatch.setattr(staff, "staff_custom_fields_repo", _DummyCustomFieldsRepo())
+
+    result = await staff.list_staff(
+        3,
+        enabled=True,
+        onboarding_complete=False,
+        onboarding_status="requested",
+        offboarding_complete=False,
+        offboarding_status="approved",
+        created_after="2026-01-01T00:00:00",
+        updated_after="2026-01-02T00:00:00",
+        offboarding_requested_after="2026-01-04T00:00:00",
+        offboarding_updated_after="2026-01-05T00:00:00",
+        scheduled_from="2026-01-06T00:00:00",
+        scheduled_to="2026-01-07T00:00:00",
+        due_only=True,
+        cursor="2026-01-03T00:00:00|15",
+        page_size=100,
+    )
+
+    assert len(result) == 1
+    assert "s.onboarding_complete = %s" in (dummy_db.last_sql or "")
+    assert "LOWER(s.onboarding_status) = LOWER(%s)" in (dummy_db.last_sql or "")
+    assert "LOWER(s.onboarding_status) LIKE 'offboarding_%'" in (dummy_db.last_sql or "")
+    assert "LOWER(s.onboarding_status) <> 'offboarding_completed'" in (dummy_db.last_sql or "")
+    assert "s.created_at > %s" in (dummy_db.last_sql or "")
+    assert "s.updated_at > %s" in (dummy_db.last_sql or "")
+    assert "s.date_offboarded > %s" in (dummy_db.last_sql or "")
+    assert "e.scheduled_for_utc >= %s" in (dummy_db.last_sql or "")
+    assert "e.scheduled_for_utc <= %s" in (dummy_db.last_sql or "")
+    assert "LOWER(COALESCE(e.state, '')) IN ('approved', 'offboarding_approved')" in (dummy_db.last_sql or "")
+    assert "(s.updated_at > %s OR (s.updated_at = %s AND s.id > %s))" in (dummy_db.last_sql or "")
+    assert "ORDER BY s.updated_at ASC, s.id ASC" in (dummy_db.last_sql or "")
+    assert "LIMIT %s" in (dummy_db.last_sql or "")
+    assert dummy_db.last_params[-1] == 100
+
+
+@pytest.mark.anyio
+async def test_list_staff_can_include_portal_last_login(monkeypatch):
+    last_login = datetime(2026, 6, 12, 8, 30)
+    dummy_rows = [
+        {
+            "id": 1,
+            "company_id": 3,
+            "first_name": "Alice",
+            "last_name": "Smith",
+            "email": "alice@example.com",
+            "enabled": 1,
+            "is_ex_staff": 0,
+            "date_onboarded": None,
+            "date_offboarded": None,
+            "m365_last_sign_in": None,
+            "portal_last_login_at": last_login,
+            "created_at": None,
+            "updated_at": None,
+            "onboarding_complete": 0,
+            "onboarding_completed_at": None,
+            "onboarding_status": None,
+        },
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+    monkeypatch.setattr(staff, "staff_custom_fields_repo", _DummyCustomFieldsRepo())
+
+    result = await staff.list_staff(3, include_portal_last_login=True)
+
+    assert "u.last_login_at AS portal_last_login_at" in (dummy_db.last_sql or "")
+    assert "LEFT JOIN users AS u" in (dummy_db.last_sql or "")
+    assert "LOWER(u.email) = LOWER(s.email)" in (dummy_db.last_sql or "")
+    assert result[0]["portal_last_login_at"] == "2026-06-12T08:30:00+00:00"
+
+
+@pytest.mark.anyio
+async def test_list_staff_exclude_package_staff_adds_sql_condition(monkeypatch):
+    """list_staff with exclude_package_staff=True includes the SQL condition to exclude package_ staff."""
+    dummy_rows = [
+        {
+            "id": 1,
+            "company_id": 3,
+            "first_name": "Alice",
+            "last_name": "Smith",
+            "email": "alice@example.com",
+            "enabled": 1,
+            "is_ex_staff": 0,
+            "date_onboarded": None,
+            "date_offboarded": None,
+            "m365_last_sign_in": None,
+            "created_at": None,
+            "updated_at": None,
+            "onboarding_complete": 0,
+            "onboarding_completed_at": None,
+            "onboarding_status": None,
+        },
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+    monkeypatch.setattr(staff, "staff_custom_fields_repo", _DummyCustomFieldsRepo())
+
+    await staff.list_staff(3, enabled=True, exclude_package_staff=True)
+
+    assert "LOWER(SUBSTR(s.email, 1, 8))" in (dummy_db.last_sql or "")
+    assert "'package_'" in (dummy_db.last_sql or "")
+
+
+@pytest.mark.anyio
+async def test_list_staff_without_exclude_package_staff_omits_sql_condition(monkeypatch):
+    """list_staff without exclude_package_staff does not add the package_ SQL condition."""
+    dummy_rows = [
+        {
+            "id": 1,
+            "company_id": 3,
+            "first_name": "Alice",
+            "last_name": "Smith",
+            "email": "alice@example.com",
+            "enabled": 1,
+            "is_ex_staff": 0,
+            "date_onboarded": None,
+            "date_offboarded": None,
+            "m365_last_sign_in": None,
+            "created_at": None,
+            "updated_at": None,
+            "onboarding_complete": 0,
+            "onboarding_completed_at": None,
+            "onboarding_status": None,
+        },
+    ]
+    dummy_db = _DummyStaffDB(dummy_rows)
+    monkeypatch.setattr(staff, "db", dummy_db)
+    monkeypatch.setattr(staff, "staff_custom_fields_repo", _DummyCustomFieldsRepo())
+
+    await staff.list_staff(3, enabled=True, exclude_package_staff=False)
+
+    assert "LOWER(SUBSTR(s.email, 1, 8))" not in (dummy_db.last_sql or "")

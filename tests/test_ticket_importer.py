@@ -1,0 +1,2699 @@
+import json
+from typing import Any
+
+import pytest
+
+from app.services import ticket_importer
+from app.services import syncro
+from app.repositories import assets as assets_repo
+from app.repositories import tickets as tickets_repo
+from app.repositories import companies as company_repo
+from app.services import tickets as tickets_service
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def _no_ticket_update_events(monkeypatch):
+    async def fake_emit_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(tickets_service, "emit_ticket_updated_event", fake_emit_event)
+
+    async def fake_refresh_summary(ticket_id):
+        return None
+
+    async def fake_refresh_tags(ticket_id):
+        return None
+
+    monkeypatch.setattr(
+        tickets_service, "refresh_ticket_ai_summary", fake_refresh_summary
+    )
+    monkeypatch.setattr(tickets_service, "refresh_ticket_ai_tags", fake_refresh_tags)
+
+
+def test_normalise_status_mapping():
+    allowed = {"open", "in_progress", "pending", "resolved", "closed"}
+    default = "open"
+    assert (
+        ticket_importer._normalise_status("In Progress", allowed, default)
+        == "in_progress"
+    )
+    assert (
+        ticket_importer._normalise_status("Waiting on customer", allowed, default)
+        == "pending"
+    )
+    assert (
+        ticket_importer._normalise_status("Completed", allowed, default) == "resolved"
+    )
+
+
+def test_normalise_priority_mapping():
+    assert ticket_importer._normalise_priority("Critical") == "urgent"
+    assert ticket_importer._normalise_priority("LOW") == "low"
+    assert ticket_importer._normalise_priority(None) == "normal"
+
+
+def test_clean_text_converts_basic_html():
+    value = "<p>Hello<br />World</p>\n<div>Next&nbsp;Line</div>"
+    assert ticket_importer._clean_text(value) == "Hello\nWorld\nNext Line"
+
+
+def test_clean_text_preserves_angle_brackets_when_not_tags():
+    assert (
+        ticket_importer._clean_text("Value is < 3 &amp; rising")
+        == "Value is < 3 & rising"
+    )
+
+
+def test_clean_text_trims_tabs_and_spaces_per_line():
+    value = " \tFirst\t \n\t Second \t\nThird\t "
+    assert ticket_importer._clean_text(value) == "First\nSecond\nThird"
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_creates_new_ticket(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        assert ticket_id == 101
+        return {
+            "id": 101,
+            "subject": "Printer offline",
+            "priority": "High",
+            "status": "In Progress",
+            "problem": "Printer in marketing is jammed",
+            "customer_id": "200",
+            "created_at": "2025-01-01T08:30:00Z",
+            "updated_at": "2025-01-02T10:45:00Z",
+        }
+
+    async def fake_get_company(syncro_id):
+        assert syncro_id == "200"
+        return {"id": 7}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_get_existing(external_reference):
+        assert external_reference == "101"
+        return None
+
+    created_calls = {}
+
+    async def fake_create_ticket(**kwargs):
+        created_calls.update(kwargs)
+        # Return the ticket with the ID that was passed, or 55 if none was passed
+        return {"id": kwargs.get("id") or 55, **kwargs}
+
+    update_calls = []
+
+    async def fake_update_ticket(ticket_id, **fields):
+        update_calls.append((ticket_id, fields))
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(101, rate_limiter=None)
+
+    assert summary.mode == "single"
+    assert summary.fetched == 1
+    assert summary.created == 1
+    assert summary.updated == 0
+    assert summary.skipped == 0
+    assert created_calls["company_id"] == 7
+    assert created_calls["priority"] == "high"
+    assert created_calls["status"] == "in_progress"
+    assert created_calls["ticket_number"] == "101"
+    assert created_calls["requester_id"] is None
+    assert created_calls["module_slug"] == "syncro"
+    assert created_calls["trigger_automations"] is False
+    assert created_calls["record_initial_reply"] is False
+    # Now the ticket ID should match the Syncro ticket number
+    assert created_calls["id"] == 101
+    assert update_calls[0][0] == 101
+    assert "created_at" in update_calls[0][1]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_uses_staff_requester_when_no_portal_user(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):  # noqa: ARG001
+        return {
+            "id": 512,
+            "subject": "VPN issue",
+            "status": "New",
+            "problem": "Cannot connect",
+            "customer_id": "200",
+            "contact": {"email": "staff.requester@example.com"},
+        }
+
+    async def fake_get_company(syncro_id):
+        assert syncro_id == "200"
+        return {"id": 7}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_get_existing(_external_reference):
+        return None
+
+    created_calls = {}
+
+    async def fake_create_ticket(**kwargs):
+        created_calls.update(kwargs)
+        return {"id": kwargs.get("id") or 512, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_user_by_email(email):
+        assert email == "staff.requester@example.com"
+        return None
+
+    async def fake_get_staff_by_company_and_email(company_id, email):
+        assert company_id == 7
+        assert email == "staff.requester@example.com"
+        return {"id": 44}
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+    monkeypatch.setattr(
+        ticket_importer.staff_repo,
+        "get_staff_by_company_and_email",
+        fake_get_staff_by_company_and_email,
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(512, rate_limiter=None)
+
+    assert summary.created == 1
+    assert created_calls["requester_id"] is None
+    assert created_calls["requester_staff_id"] == 44
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_updates_existing_staff_requester(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):  # noqa: ARG001
+        return {
+            "id": 513,
+            "subject": "Laptop issue",
+            "status": "New",
+            "problem": "Blue screen",
+            "customer_id": "201",
+            "contact": {"email": "staff.requester@example.com"},
+        }
+
+    async def fake_get_existing(external_reference):
+        return {"id": 99, "external_reference": external_reference}
+
+    async def fake_get_company(syncro_id):
+        assert syncro_id == "201"
+        return {"id": 8}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    update_calls = []
+
+    async def fake_update_ticket(ticket_id, **fields):
+        update_calls.append((ticket_id, fields))
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_user_by_email(email):
+        assert email == "staff.requester@example.com"
+        return None
+
+    async def fake_get_staff_by_company_and_email(company_id, email):
+        assert company_id == 8
+        assert email == "staff.requester@example.com"
+        return {"id": 45}
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+    monkeypatch.setattr(
+        ticket_importer.staff_repo,
+        "get_staff_by_company_and_email",
+        fake_get_staff_by_company_and_email,
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(513, rate_limiter=None)
+
+    assert summary.updated == 1
+    assert update_calls[0][0] == 99
+    assert update_calls[0][1]["requester_id"] is None
+    assert update_calls[0][1]["requester_staff_id"] == 45
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_does_not_queue_ollama_generation(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Imported ticket",
+            "status": "New",
+            "problem": "Imported from Syncro",
+        }
+
+    async def fake_get_existing(_external_reference):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        assert kwargs["module_slug"] == "syncro"
+        assert kwargs["trigger_automations"] is False
+        return {"id": kwargs.get("id") or 222, **kwargs}
+
+    async def fail_refresh_summary(_ticket_id):
+        raise AssertionError("Syncro imports must not queue Ollama summary generation")
+
+    async def fail_refresh_tags(_ticket_id):
+        raise AssertionError("Syncro imports must not queue Ollama tag generation")
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(
+        tickets_service, "refresh_ticket_ai_summary", fail_refresh_summary
+    )
+    monkeypatch.setattr(tickets_service, "refresh_ticket_ai_tags", fail_refresh_tags)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", lambda _email: None
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(222, rate_limiter=None)
+
+    assert summary.created == 1
+    assert summary.updated == 0
+    assert summary.skipped == 0
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_updates_existing(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Network outage",
+            "priority": "Critical",
+            "status": "Resolved",
+            "problem": "Restored connectivity",
+            "customer_id": "200",
+            "resolved_at": "2025-01-03T12:00:00Z",
+        }
+
+    async def fake_get_existing(external_reference):
+        return {"id": 99, "external_reference": external_reference}
+
+    update_calls = []
+
+    async def fake_update_ticket(ticket_id, **fields):
+        update_calls.append((ticket_id, fields))
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_company(syncro_id):
+        assert syncro_id == "200"
+        return {"id": 3}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(500, rate_limiter=None)
+
+    assert summary.updated == 1
+    assert summary.created == 0
+    assert update_calls[0][0] == 99
+    assert update_calls[0][1]["status"] == "resolved"
+    assert update_calls[0][1]["ticket_number"] == "500"
+    assert update_calls[0][1]["requester_id"] is None
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_skips_existing_when_syncro_updated_at_unchanged(
+    monkeypatch,
+):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Network outage",
+            "status": "Resolved",
+            "updated_at": "2025-01-02T10:45:00Z",
+        }
+
+    async def fake_get_existing(external_reference):
+        return {
+            "id": 99,
+            "external_reference": external_reference,
+            "syncro_updated_at": "2025-01-02T10:45:00Z",
+            "updated_at": "2025-01-05T09:00:00Z",
+        }
+
+    async def fail_update_ticket(*args, **kwargs):
+        raise AssertionError("Unchanged Syncro tickets should not update MyPortal")
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_repo, "update_ticket", fail_update_ticket)
+
+    summary = await ticket_importer.import_ticket_by_id(500, rate_limiter=None)
+
+    assert summary.updated == 0
+    assert summary.created == 0
+    assert summary.skipped == 1
+    assert summary.skipped_reasons == [
+        "Syncro ticket 500 has not changed since last import"
+    ]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_skips_existing_when_myportal_updated_at_is_newer(
+    monkeypatch,
+):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Network outage",
+            "priority": "Critical",
+            "status": "Resolved",
+            "updated_at": "2025-01-03T10:45:00Z",
+        }
+
+    async def fake_get_existing(external_reference):
+        return {
+            "id": 99,
+            "external_reference": external_reference,
+            "syncro_updated_at": "2025-01-02T10:45:00Z",
+            "updated_at": "2025-01-05T09:00:00Z",
+        }
+
+    async def fail_update_ticket(*args, **kwargs):
+        raise AssertionError("Older Syncro tickets should not update MyPortal")
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_repo, "update_ticket", fail_update_ticket)
+
+    summary = await ticket_importer.import_ticket_by_id(500, rate_limiter=None)
+
+    assert summary.updated == 0
+    assert summary.created == 0
+    assert summary.skipped == 1
+    assert summary.skipped_reasons == [
+        "Syncro ticket 500 is older than the MyPortal ticket and was not imported"
+    ]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_updates_existing_when_syncro_is_newer_than_myportal(
+    monkeypatch,
+):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Network outage",
+            "priority": "Critical",
+            "status": "Resolved",
+            "updated_at": "2025-01-05T10:45:00Z",
+        }
+
+    async def fake_get_existing(external_reference):
+        return {
+            "id": 99,
+            "external_reference": external_reference,
+            "syncro_updated_at": "2025-01-02T10:45:00Z",
+            "updated_at": "2025-01-03T09:00:00Z",
+        }
+
+    update_calls = []
+
+    async def fake_update_ticket(ticket_id, **fields):
+        update_calls.append((ticket_id, fields))
+        return {"id": ticket_id, **fields}
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", lambda _email: None
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(500, rate_limiter=None)
+
+    assert summary.updated == 1
+    assert (
+        update_calls[0][1]["syncro_updated_at"].isoformat()
+        == "2025-01-05T10:45:00+00:00"
+    )
+    assert update_calls[0][1]["updated_at"].isoformat() == "2025-01-05T10:45:00+00:00"
+
+
+@pytest.mark.anyio
+async def test_import_ticket_range_handles_missing(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        if ticket_id == 10:
+            return {
+                "id": 10,
+                "subject": "Login error",
+                "status": "Open",
+                "priority": "Normal",
+            }
+        return None
+
+    async def fake_get_existing(external_reference):
+        if external_reference == "10":
+            return None
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": 10, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        company_repo, "get_company_by_syncro_id", lambda syncro_id: None
+    )
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+
+    summary = await ticket_importer.import_ticket_range(10, 11, rate_limiter=None)
+
+    assert summary.mode == "range"
+    assert summary.fetched == 1
+    assert summary.created == 1
+    assert summary.skipped == 1
+
+
+@pytest.mark.anyio
+async def test_import_ticket_by_id_reports_skip_reason_when_missing(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):  # noqa: ARG001
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+
+    summary = await ticket_importer.import_ticket_by_id(404, rate_limiter=None)
+
+    assert summary.skipped == 1
+    assert summary.as_dict()["skipped_reasons"] == [
+        "Syncro ticket 404 was not returned by the Syncro API"
+    ]
+
+
+@pytest.mark.anyio
+async def test_upsert_ticket_reports_missing_id_skip_reason(monkeypatch):
+    allowed = {"open", "closed"}
+
+    outcome = await ticket_importer._upsert_ticket(
+        {"subject": "No Syncro id"},
+        allowed,
+        "open",
+        {},
+    )
+    summary = ticket_importer.TicketImportSummary(mode="single", fetched=1)
+    summary.record(outcome)
+
+    assert summary.skipped == 1
+    assert summary.as_dict()["skipped_reasons"] == [
+        "Syncro ticket payload did not include an id"
+    ]
+
+
+@pytest.mark.anyio
+async def test_resolve_company_creates_company_when_missing(monkeypatch):
+    created_payload: dict[str, Any] = {}
+
+    async def fake_get_company_by_syncro_id(syncro_company_id: str):  # noqa: ARG001
+        return None
+
+    async def fake_get_company_by_name(company_name: str):  # noqa: ARG001
+        return None
+
+    async def fake_create_company(**payload):
+        created_payload.update(payload)
+        return {"id": 42, **payload}
+
+    monkeypatch.setattr(
+        company_repo, "get_company_by_syncro_id", fake_get_company_by_syncro_id
+    )
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(company_repo, "create_company", fake_create_company)
+
+    ticket = {
+        "id": 501,
+        "customer_id": "9001",
+        "customer": {"id": 9001, "business_name": "Example Holdings"},
+    }
+
+    company_id = await ticket_importer._resolve_company_id(ticket)
+
+    assert company_id == 42
+    assert created_payload["name"] == "Example Holdings"
+    assert created_payload["syncro_company_id"] == "9001"
+
+
+@pytest.mark.anyio
+async def test_import_all_tickets_uses_pagination(monkeypatch):
+    pages = {
+        1: (
+            [
+                {
+                    "id": 201,
+                    "subject": "Laptop setup",
+                    "status": "Open",
+                    "priority": "Normal",
+                    "customer_id": "300",
+                }
+            ],
+            {"total_pages": 2},
+        ),
+        2: (
+            [
+                {
+                    "id": 202,
+                    "subject": "VPN issue",
+                    "status": "Resolved",
+                    "priority": "High",
+                    "customer_id": "300",
+                }
+            ],
+            {"total_pages": 2},
+        ),
+    }
+
+    async def fake_list_tickets(page, per_page=25, rate_limiter=None):
+        return pages.get(page, ([], {}))
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        for page_tickets, _meta in pages.values():
+            for ticket in page_tickets:
+                if ticket["id"] == ticket_id:
+                    return dict(ticket, comments=[], attachments=[])
+        return None
+
+    async def fake_get_existing(external_reference):
+        if external_reference == "202":
+            return {"id": 88, "external_reference": external_reference}
+        return None
+
+    created = []
+    updated = []
+
+    async def fake_create_ticket(**kwargs):
+        created.append(kwargs)
+        return {"id": 77, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        updated.append((ticket_id, fields))
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_company(syncro_id):
+        return {"id": 12}
+
+    monkeypatch.setattr(syncro, "list_tickets", fake_list_tickets)
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+
+    summary = await ticket_importer.import_all_tickets(rate_limiter=None)
+
+    assert summary.mode == "all"
+    assert summary.fetched == 2
+    assert summary.created == 1
+    assert summary.updated == 1
+    assert created[0]["external_reference"] == "201"
+    assert updated[0][0] == 88
+
+
+
+@pytest.mark.anyio
+async def test_import_all_tickets_processes_most_recent_changes_first(monkeypatch):
+    pages = {
+        1: (
+            [
+                {
+                    "id": 401,
+                    "subject": "Older page one ticket",
+                    "status": "Open",
+                    "priority": "Normal",
+                    "updated_at": "2024-01-02T10:00:00Z",
+                    "comments": [],
+                    "attachments": [],
+                },
+                {
+                    "id": 402,
+                    "subject": "Newest page one ticket",
+                    "status": "Open",
+                    "priority": "Normal",
+                    "updated_at": "2024-01-04T10:00:00Z",
+                    "comments": [],
+                    "attachments": [],
+                },
+            ],
+            {"total_pages": 2},
+        ),
+        2: (
+            [
+                {
+                    "id": 403,
+                    "subject": "Newest overall ticket",
+                    "status": "Open",
+                    "priority": "Normal",
+                    "updated_at": "2024-01-05T10:00:00Z",
+                    "comments": [],
+                    "attachments": [],
+                },
+                {
+                    "id": 404,
+                    "subject": "Oldest overall ticket",
+                    "status": "Open",
+                    "priority": "Normal",
+                    "updated_at": "2024-01-01T10:00:00Z",
+                    "comments": [],
+                    "attachments": [],
+                },
+            ],
+            {"total_pages": 2},
+        ),
+    }
+    processed: list[int] = []
+
+    async def fake_list_tickets(page, per_page=25, rate_limiter=None):
+        return pages.get(page, ([], {}))
+
+    async def fake_get_existing(_external_reference):
+        return None
+
+    async def fake_upsert_ticket(ticket, *args, **kwargs):
+        processed.append(ticket["id"])
+        return "created"
+
+    monkeypatch.setattr(syncro, "list_tickets", fake_list_tickets)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(ticket_importer, "_upsert_ticket", fake_upsert_ticket)
+
+    summary = await ticket_importer.import_all_tickets(rate_limiter=None)
+
+    assert summary.fetched == 4
+    assert summary.created == 4
+    assert processed == [403, 402, 401, 404]
+
+
+@pytest.mark.anyio
+async def test_import_all_tickets_hydrates_detail_for_attachments(monkeypatch):
+    pages = {
+        1: (
+            [
+                {
+                    "id": 301,
+                    "subject": "Missing attachment on list payload",
+                    "status": "Open",
+                    "priority": "Normal",
+                }
+            ],
+            {"total_pages": 1},
+        )
+    }
+    saved = []
+
+    async def fake_list_tickets(page, per_page=25, rate_limiter=None):
+        return pages.get(page, ([], {}))
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        assert ticket_id == 301
+        return {
+            "id": 301,
+            "subject": "Missing attachment on list payload",
+            "status": "Open",
+            "priority": "Normal",
+            "attachments": [
+                {
+                    "id": 901,
+                    "file_name": "purchase-order.pdf",
+                    "file": {
+                        "url": "https://example.test/purchase-order.pdf",
+                        "thumb": {
+                            "url": "https://example.test/thumb_purchase-order.pdf"
+                        },
+                        "main": {"url": "https://example.test/main_purchase-order.pdf"},
+                    },
+                    "content_type": "application/pdf",
+                    "file_size": 13,
+                }
+            ],
+            "comments": [],
+        }
+
+    async def fake_get_existing(_external_reference):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": kwargs.get("id") or 301, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    async def fake_list_attachments(_ticket_id):
+        return []
+
+    async def fake_download_file(url):
+        assert url == "https://example.test/purchase-order.pdf"
+        return b"%PDF-1.4\nbody", "application/pdf"
+
+    async def fake_save_file_bytes(**kwargs):
+        saved.append(kwargs)
+        return {"id": 1, "original_filename": kwargs["original_filename"]}
+
+    monkeypatch.setattr(syncro, "list_tickets", fake_list_tickets)
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.attachments_repo, "list_attachments", fake_list_attachments
+    )
+    monkeypatch.setattr(ticket_importer.syncro, "download_file", fake_download_file)
+    monkeypatch.setattr(
+        ticket_importer.attachments_service, "save_file_bytes", fake_save_file_bytes
+    )
+
+    summary = await ticket_importer.import_all_tickets(rate_limiter=None)
+
+    assert summary.fetched == 1
+    assert summary.created == 1
+    assert [item["original_filename"] for item in saved] == ["purchase-order.pdf"]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_syncs_comments_and_watchers(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        assert ticket_id == 5001
+        return {
+            "id": ticket_id,
+            "number": "TCK-5001",
+            "subject": "Email outage",
+            "priority": {"name": "Normal"},
+            "status": {"name": "Open"},
+            "customer_business_then_name": "Acme Corp - Jane Doe",
+            "comments": [
+                {
+                    "id": 1,
+                    "subject": "Initial Issue",
+                    "body": "Customer message",
+                    "tech": "customer-reply",
+                    "email_sender": "customer@example.com",
+                    "hidden": False,
+                    "destination_emails": [
+                        "customer@example.com",
+                        "tech@example.com",
+                        "manager@example.com",
+                    ],
+                    "created_at": "2025-01-01T08:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "body": "Internal update",
+                    "tech": "agent",
+                    "email_sender": "tech@example.com",
+                    "hidden": True,
+                    "destination_emails": [
+                        "tech@example.com",
+                        "support@hawkinsitsolutions.com.au",
+                    ],
+                    "created_at": "2025-01-01T09:00:00Z",
+                },
+            ],
+            "contact": {"email": "customer@example.com"},
+        }
+
+    async def fake_get_existing(_external_reference):
+        return None
+
+    async def fake_get_company_by_syncro_id(_syncro_id):
+        return None
+
+    async def fake_get_company_by_name(name):
+        if name in {"Acme Corp - Jane Doe", "Acme Corp"}:
+            return {"id": 8}
+        return None
+
+    created_call = {}
+
+    async def fake_create_ticket(**kwargs):
+        created_call.update(kwargs)
+        # Return the ticket with the ID that was passed, or 400 if none was passed
+        return {"id": kwargs.get("id") or 400, **kwargs}
+
+    update_calls = []
+
+    async def fake_update_ticket(ticket_id, **fields):
+        update_calls.append((ticket_id, fields))
+        return {"id": ticket_id, **fields}
+
+    reply_calls = []
+
+    async def fake_list_replies(ticket_id, include_internal=True):  # noqa: ARG001
+        return []
+
+    async def fake_create_reply(**kwargs):
+        reply_calls.append(kwargs)
+        return {"id": len(reply_calls), **kwargs}
+
+    async def fake_list_watchers(ticket_id):  # noqa: ARG001
+        return []
+
+    added_watchers = []
+    recorded_recipients = []
+
+    async def fake_record_recipients(**kwargs):
+        recorded_recipients.append(kwargs)
+        return len(kwargs.get("to") or [])
+
+    async def fake_add_watcher(ticket_id, user_id=None, email=None):
+        added_watchers.append((ticket_id, user_id, email))
+
+    async def fake_get_user_by_email(email):
+        mapping = {
+            "customer@example.com": {"id": 21},
+            "tech@example.com": {"id": 31},
+            "manager@example.com": {"id": 41},
+        }
+        return mapping.get(email)
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(
+        company_repo, "get_company_by_syncro_id", fake_get_company_by_syncro_id
+    )
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+    monkeypatch.setattr(
+        ticket_importer.email_recipients, "record_recipients", fake_record_recipients
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(5001, rate_limiter=None)
+
+    assert summary.created == 1
+    assert created_call["ticket_number"] == "TCK-5001"
+    assert created_call["company_id"] == 8
+    assert created_call["requester_id"] == 21
+    assert created_call["description"] == "Customer message"
+    assert created_call["record_initial_reply"] is False
+    # Verify the ticket ID was set to 5001 from the number
+    assert created_call["id"] == 5001
+    # 1 metadata note + 2 comments
+    assert len(reply_calls) == 3
+    # First reply is the metadata note (contact info only — no assets/custom fields)
+    assert reply_calls[0]["external_reference"] == "syncro_metadata_5001"
+    assert reply_calls[0]["is_internal"] is True
+    assert reply_calls[0]["author_id"] is None
+    assert reply_calls[0].get("minutes_spent") is None
+    assert reply_calls[0].get("is_billable", False) is False
+    # Ticket comments follow the metadata note
+    assert reply_calls[1]["external_reference"] == "1"
+    assert reply_calls[1]["is_internal"] is False
+    assert reply_calls[1]["author_id"] == 21
+    assert reply_calls[1].get("minutes_spent") is None
+    assert reply_calls[1].get("is_billable", False) is False
+    assert reply_calls[2]["external_reference"] == "2"
+    assert reply_calls[2]["is_internal"] is True
+    assert reply_calls[2]["author_id"] == 31
+    assert reply_calls[2].get("minutes_spent") is None
+    assert reply_calls[2].get("is_billable", False) is False
+    assert [call["to"] for call in recorded_recipients] == [
+        ["customer@example.com", "manager@example.com", "tech@example.com"],
+        ["support@hawkinsitsolutions.com.au", "tech@example.com"],
+    ]
+    assert all(call["tracking_id"] is None for call in recorded_recipients)
+    # The ticket ID should now be 5001, not 400
+    assert added_watchers == [(5001, 41, None)]
+
+
+@pytest.mark.anyio
+async def test_syncro_destination_email_without_user_is_added_as_email_watcher(monkeypatch):
+    async def fake_list_watchers(ticket_id):  # noqa: ARG001
+        return []
+
+    added_watchers = []
+
+    async def fake_add_watcher(ticket_id, user_id=None, email=None):
+        added_watchers.append((ticket_id, user_id, email))
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    await ticket_importer._sync_ticket_watchers(
+        7001,
+        [
+            {
+                "tech": "customer-reply",
+                "email_sender": "requester@example.com",
+                "destination_emails": [
+                    "requester@example.com",
+                    "external@example.com",
+                ],
+            },
+            {
+                "tech": "agent",
+                "email_sender": "tech@example.com",
+                "destination_emails": [
+                    "tech@example.com",
+                    "support@hawkinsitsolutions.com.au",
+                    "external@example.com",
+                ],
+            },
+        ],
+        contact_email="requester@example.com",
+    )
+
+    assert added_watchers == [(7001, None, "external@example.com")]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_skips_existing_comment_replies(monkeypatch):
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Sync ticket",
+            "priority": "Normal",
+            "status": "Open",
+            "comments": [
+                {"id": 1, "body": "Existing", "tech": "agent", "hidden": False},
+                {"id": 2, "body": "New", "tech": "agent", "hidden": False},
+            ],
+        }
+
+    async def fake_get_existing(_external_reference):
+        return {"id": 90, "external_reference": "700"}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    async def fake_list_replies(ticket_id, include_internal=True):  # noqa: ARG001
+        return [{"external_reference": "1"}]
+
+    reply_calls = []
+
+    async def fake_create_reply(**kwargs):
+        reply_calls.append(kwargs)
+        return {"id": len(reply_calls), **kwargs}
+
+    async def fake_list_watchers(ticket_id):  # noqa: ARG001
+        return []
+
+    async def fake_add_watcher(ticket_id, user_id):  # noqa: ARG001
+        raise AssertionError(
+            "Watchers should not be added when no watcher emails are present"
+        )
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    async def fake_get_company(syncro_id):
+        return {"id": 5}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(700, rate_limiter=None)
+
+    assert summary.updated == 1
+    assert len(reply_calls) == 1
+    assert reply_calls[0]["external_reference"] == "2"
+    assert reply_calls[0].get("minutes_spent") is None
+    assert reply_calls[0].get("is_billable", False) is False
+
+
+@pytest.mark.anyio
+async def test_import_from_request_records_webhook_success(monkeypatch):
+    summary = ticket_importer.TicketImportSummary(mode="single", fetched=1, created=1)
+
+    async def fake_import_ticket_by_id(ticket_id, rate_limiter=None, **_kwargs):
+        assert ticket_id == 42
+        return summary
+
+    recorded: dict[str, dict[str, object]] = {}
+
+    async def fake_create_manual_event(**kwargs):
+        recorded["create"] = kwargs
+        return {"id": 77}
+
+    async def fake_record_success(
+        event_id,
+        *,
+        attempt_number,
+        response_status,
+        response_body,
+        **_kwargs,
+    ):
+        recorded["success"] = {
+            "event_id": event_id,
+            "attempt_number": attempt_number,
+            "response_status": response_status,
+            "response_body": response_body,
+        }
+        return {"id": event_id, "status": "succeeded"}
+
+    async def fake_record_failure(
+        *args, **kwargs
+    ):  # pragma: no cover - should not be called
+        raise AssertionError("record_manual_failure should not be invoked on success")
+
+    monkeypatch.setattr(
+        ticket_importer, "import_ticket_by_id", fake_import_ticket_by_id
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "create_manual_event", fake_create_manual_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_success", fake_record_success
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_failure", fake_record_failure
+    )
+
+    result = await ticket_importer.import_from_request(
+        mode="single", ticket_id=42, start_id=None, end_id=None, rate_limiter=None
+    )
+
+    assert result is summary
+    assert recorded["create"]["name"] == "syncro.ticket.import"
+    assert recorded["create"]["target_url"].startswith(
+        "syncro://tickets/import?mode=single"
+    )
+    assert recorded["create"]["payload"]["ticketId"] == 42
+    success_payload = json.loads(recorded["success"]["response_body"])
+    assert success_payload == summary.as_dict()
+    assert recorded["success"]["response_status"] == 200
+
+
+@pytest.mark.anyio
+async def test_import_from_request_falls_back_to_repo(monkeypatch):
+    summary = ticket_importer.TicketImportSummary(mode="single", fetched=1, created=1)
+
+    async def fake_import_ticket_by_id(ticket_id, rate_limiter=None, **_kwargs):
+        assert ticket_id == 21
+        return summary
+
+    recorded: dict[str, dict[str, object]] = {}
+    attempts: list[dict[str, object]] = []
+    completions: list[dict[str, object]] = []
+
+    async def fake_create_manual_event(**kwargs):
+        raise RuntimeError("webhook monitor unavailable")
+
+    async def fake_create_event(**kwargs):
+        recorded["fallback_create"] = kwargs
+        return {"id": 55}
+
+    async def fake_mark_in_progress(event_id):
+        recorded["mark_in_progress"] = {"event_id": event_id}
+
+    async def fake_record_success(
+        *_args, **_kwargs
+    ):  # pragma: no cover - should not be called
+        raise AssertionError(
+            "webhook_monitor.record_manual_success should not be used on fallback"
+        )
+
+    async def fake_record_attempt(
+        *,
+        event_id,
+        attempt_number,
+        status,
+        response_status,
+        response_body,
+        error_message,
+        **_extra,
+    ):
+        attempts.append(
+            {
+                "event_id": event_id,
+                "attempt_number": attempt_number,
+                "status": status,
+                "response_status": response_status,
+                "response_body": response_body,
+                "error_message": error_message,
+            }
+        )
+
+    async def fake_mark_event_completed(
+        event_id, *, attempt_number, response_status, response_body
+    ):
+        completions.append(
+            {
+                "event_id": event_id,
+                "attempt_number": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    monkeypatch.setattr(
+        ticket_importer, "import_ticket_by_id", fake_import_ticket_by_id
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "create_manual_event", fake_create_manual_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_success", fake_record_success
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_failure", lambda *_, **__: None
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "create_event", fake_create_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "mark_in_progress", fake_mark_in_progress
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "record_attempt", fake_record_attempt
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo,
+        "mark_event_completed",
+        fake_mark_event_completed,
+    )
+
+    result = await ticket_importer.import_from_request(
+        mode="single", ticket_id=21, start_id=None, end_id=None, rate_limiter=None
+    )
+
+    assert result is summary
+    assert recorded["fallback_create"]["name"] == "syncro.ticket.import"
+    assert recorded["mark_in_progress"]["event_id"] == 55
+    assert attempts == [
+        {
+            "event_id": 55,
+            "attempt_number": 1,
+            "status": "succeeded",
+            "response_status": 200,
+            "response_body": json.dumps(summary.as_dict()),
+            "error_message": None,
+        }
+    ]
+    assert completions == [
+        {
+            "event_id": 55,
+            "attempt_number": 1,
+            "response_status": 200,
+            "response_body": json.dumps(summary.as_dict()),
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_import_from_request_fallback_repo_create_failure(monkeypatch):
+    summary = ticket_importer.TicketImportSummary(mode="single", fetched=1, created=1)
+
+    async def fake_import_ticket_by_id(ticket_id, rate_limiter=None, **_kwargs):
+        assert ticket_id == 22
+        return summary
+
+    errors: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_create_manual_event(**_kwargs):
+        raise RuntimeError("webhook monitor down")
+
+    async def fake_create_event(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    async def fake_mark_in_progress(
+        _event_id,
+    ):  # pragma: no cover - should not be called
+        raise AssertionError(
+            "mark_in_progress should not be invoked when creation fails"
+        )
+
+    async def fake_record_success(
+        *_args, **_kwargs
+    ):  # pragma: no cover - should not be called
+        raise AssertionError(
+            "record_manual_success should not be called without an event"
+        )
+
+    def fake_log_error(message, **kwargs):
+        errors.append((message, kwargs))
+
+    monkeypatch.setattr(
+        ticket_importer, "import_ticket_by_id", fake_import_ticket_by_id
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "create_manual_event", fake_create_manual_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_success", fake_record_success
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_failure", lambda *_, **__: None
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "create_event", fake_create_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "mark_in_progress", fake_mark_in_progress
+    )
+    monkeypatch.setattr(ticket_importer, "log_error", fake_log_error)
+
+    result = await ticket_importer.import_from_request(
+        mode="single", ticket_id=22, start_id=None, end_id=None, rate_limiter=None
+    )
+
+    assert result is summary
+    messages = [message for message, _payload in errors]
+    assert "Failed to create fallback Syncro ticket import event" in messages
+
+
+@pytest.mark.anyio
+async def test_import_from_request_fallback_mark_in_progress_failure(monkeypatch):
+    summary = ticket_importer.TicketImportSummary(mode="single", fetched=1, created=1)
+
+    async def fake_import_ticket_by_id(ticket_id, rate_limiter=None, **_kwargs):
+        assert ticket_id == 23
+        return summary
+
+    recorded: dict[str, object] = {}
+
+    async def fake_create_manual_event(**_kwargs):
+        raise RuntimeError("webhook monitor down")
+
+    async def fake_create_event(**kwargs):
+        recorded["create_event"] = kwargs
+        return {"id": 66}
+
+    async def fake_mark_in_progress(event_id):
+        recorded["mark_in_progress_attempt"] = event_id
+        raise RuntimeError("write lock timeout")
+
+    async def fake_record_success(
+        *_args, **_kwargs
+    ):  # pragma: no cover - should not be called
+        raise AssertionError(
+            "record_manual_success should not be called when mark_in_progress fails"
+        )
+
+    errors: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log_error(message, **kwargs):
+        errors.append((message, kwargs))
+
+    monkeypatch.setattr(
+        ticket_importer, "import_ticket_by_id", fake_import_ticket_by_id
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "create_manual_event", fake_create_manual_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_success", fake_record_success
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_failure", lambda *_, **__: None
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "create_event", fake_create_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "mark_in_progress", fake_mark_in_progress
+    )
+    monkeypatch.setattr(ticket_importer, "log_error", fake_log_error)
+
+    result = await ticket_importer.import_from_request(
+        mode="single", ticket_id=23, start_id=None, end_id=None, rate_limiter=None
+    )
+
+    assert result is summary
+    assert recorded["create_event"]["name"] == "syncro.ticket.import"
+    assert recorded["mark_in_progress_attempt"] == 66
+    messages = [message for message, _payload in errors]
+    assert "Failed to mark fallback Syncro ticket import event in progress" in messages
+
+
+@pytest.mark.anyio
+async def test_import_from_request_fallback_failure_records_repo(monkeypatch):
+    async def fake_import_ticket_by_id(ticket_id, rate_limiter=None, **_kwargs):
+        assert ticket_id == 24
+        raise RuntimeError("boom")
+
+    async def fake_create_manual_event(**_kwargs):
+        raise RuntimeError("webhook monitor down")
+
+    async def fake_create_event(**_kwargs):
+        return {"id": 88}
+
+    async def fake_mark_in_progress(event_id):
+        assert event_id == 88
+
+    async def fake_record_success(
+        *_args, **_kwargs
+    ):  # pragma: no cover - should not run
+        raise AssertionError(
+            "webhook_monitor.record_manual_success should not be invoked"
+        )
+
+    async def fake_record_failure(
+        *_args, **_kwargs
+    ):  # pragma: no cover - should not run
+        raise AssertionError(
+            "webhook_monitor.record_manual_failure should not be invoked"
+        )
+
+    attempts: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+
+    async def fake_record_attempt(
+        *,
+        event_id,
+        attempt_number,
+        status,
+        response_status,
+        response_body,
+        error_message,
+        **_extra,
+    ):
+        attempts.append(
+            {
+                "event_id": event_id,
+                "attempt_number": attempt_number,
+                "status": status,
+                "response_status": response_status,
+                "response_body": response_body,
+                "error_message": error_message,
+            }
+        )
+
+    async def fake_mark_event_failed(
+        event_id, *, attempt_number, error_message, response_status, response_body
+    ):
+        failures.append(
+            {
+                "event_id": event_id,
+                "attempt_number": attempt_number,
+                "error_message": error_message,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    monkeypatch.setattr(
+        ticket_importer, "import_ticket_by_id", fake_import_ticket_by_id
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "create_manual_event", fake_create_manual_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_success", fake_record_success
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_failure", fake_record_failure
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "create_event", fake_create_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "mark_in_progress", fake_mark_in_progress
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "record_attempt", fake_record_attempt
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_events_repo, "mark_event_failed", fake_mark_event_failed
+    )
+
+    with pytest.raises(RuntimeError):
+        await ticket_importer.import_from_request(
+            mode="single", ticket_id=24, start_id=None, end_id=None, rate_limiter=None
+        )
+
+    assert attempts == [
+        {
+            "event_id": 88,
+            "attempt_number": 1,
+            "status": "failed",
+            "response_status": None,
+            "response_body": None,
+            "error_message": "boom",
+        }
+    ]
+    assert failures == [
+        {
+            "event_id": 88,
+            "attempt_number": 1,
+            "error_message": "boom",
+            "response_status": None,
+            "response_body": None,
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_import_from_request_records_webhook_failure(monkeypatch):
+    async def fake_import_ticket_by_id(ticket_id, rate_limiter=None, **_kwargs):
+        raise RuntimeError("boom")
+
+    recorded: dict[str, dict[str, object]] = {}
+
+    async def fake_create_manual_event(**kwargs):
+        recorded["create"] = kwargs
+        return {"id": 91}
+
+    async def fake_record_success(
+        *args, **kwargs
+    ):  # pragma: no cover - should not be called
+        raise AssertionError("record_manual_success should not be invoked on failure")
+
+    async def fake_record_failure(
+        event_id,
+        *,
+        attempt_number,
+        status,
+        error_message,
+        response_status,
+        response_body,
+    ):
+        recorded["failure"] = {
+            "event_id": event_id,
+            "attempt_number": attempt_number,
+            "status": status,
+            "error_message": error_message,
+            "response_status": response_status,
+            "response_body": response_body,
+        }
+        return {"id": event_id, "status": status}
+
+    monkeypatch.setattr(
+        ticket_importer, "import_ticket_by_id", fake_import_ticket_by_id
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "create_manual_event", fake_create_manual_event
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_success", fake_record_success
+    )
+    monkeypatch.setattr(
+        ticket_importer.webhook_monitor, "record_manual_failure", fake_record_failure
+    )
+
+    with pytest.raises(RuntimeError):
+        await ticket_importer.import_from_request(
+            mode="single", ticket_id=99, start_id=None, end_id=None, rate_limiter=None
+        )
+
+    assert recorded["failure"]["event_id"] == 91
+    assert recorded["failure"]["status"] == "failed"
+    assert recorded["failure"]["error_message"] == "boom"
+
+
+# ---------------------------------------------------------------------------
+# New tests for enhanced Syncro ticket import features
+# ---------------------------------------------------------------------------
+
+
+def test_extract_comment_author_name_from_tech():
+    comment = {"tech": "Alice Tech", "body": "Fixed the issue"}
+    assert ticket_importer._extract_comment_author_name(comment) == "Alice Tech"
+
+
+def test_extract_comment_author_name_ignores_customer_reply():
+    comment = {"tech": "customer-reply", "body": "Reply from customer"}
+    assert ticket_importer._extract_comment_author_name(comment) is None
+
+
+def test_extract_comment_author_name_from_nested_user():
+    comment = {"user": {"name": "Bob Technician"}, "body": "Done"}
+    assert ticket_importer._extract_comment_author_name(comment) == "Bob Technician"
+
+
+def test_extract_time_worked_minutes_hhmm():
+    comment = {"time_worked": "01:30"}
+    assert ticket_importer._extract_time_worked_minutes(comment) == 90
+
+
+def test_extract_time_worked_minutes_hhmmss():
+    comment = {"time_worked": "02:15:45"}
+    assert (
+        ticket_importer._extract_time_worked_minutes(comment) == 136
+    )  # 2*60+15+1 (round up)
+
+
+def test_extract_time_worked_minutes_from_cost_hours():
+    comment = {"time_cost_hours": 1.5}
+    assert ticket_importer._extract_time_worked_minutes(comment) == 90
+
+
+def test_extract_time_worked_minutes_none():
+    assert ticket_importer._extract_time_worked_minutes({}) is None
+
+
+def test_build_comment_body_with_header_includes_author_time_billable():
+    comment = {"tech": "Alice Tech", "time_worked": "00:30", "billable": True}
+    result = ticket_importer._build_comment_body_with_header(comment, "Hello World")
+    assert "Author: Alice Tech" in result
+    assert "Time: 30m" in result
+    assert "Billable:" not in result
+    assert "Hello World" in result
+    assert "---" in result
+
+
+def test_build_comment_body_with_header_not_billable():
+    comment = {"tech": "Bob", "billable": False}
+    result = ticket_importer._build_comment_body_with_header(comment, "Some body")
+    assert "Billable:" not in result
+
+
+def test_build_comment_body_with_header_no_author_no_time_returns_body():
+    comment = {"tech": "customer-reply"}
+    result = ticket_importer._build_comment_body_with_header(comment, "Customer text")
+    assert "Billable:" not in result
+    assert "Author:" not in result
+    assert "Customer text" in result
+
+
+def test_build_comment_body_with_header_explicit_is_billable_override():
+    """Billable flag is stored on the reply record but no longer shown in body."""
+    comment = {"tech": "Tech"}
+    result = ticket_importer._build_comment_body_with_header(
+        comment, "Work done", minutes=30
+    )
+    assert "Billable:" not in result
+
+
+def test_resolve_comment_billable_from_comment_field():
+    assert ticket_importer._resolve_comment_billable({"billable": True}) is True
+    assert ticket_importer._resolve_comment_billable({"billable": False}) is False
+    assert ticket_importer._resolve_comment_billable({"is_billable": True}) is True
+    assert ticket_importer._resolve_comment_billable({}) is False
+
+
+def test_resolve_comment_billable_billable_false_not_shadowed_by_is_billable():
+    """Explicit billable=False must not be overridden by is_billable=True."""
+    comment = {"billable": False, "is_billable": True}
+    assert ticket_importer._resolve_comment_billable(comment) is False
+
+
+def test_resolve_comment_billable_timer_overrides_comment():
+    """Labor log (timer) billable takes priority over the comment's own field."""
+    comment = {"id": 42, "billable": False}
+    timer_billable = {"42": True}
+    assert ticket_importer._resolve_comment_billable(comment, timer_billable) is True
+
+
+def test_resolve_comment_billable_timer_false_overrides_comment_true():
+    """Labor log (timer) billable=False overrides comment billable=True."""
+    comment = {"id": 5, "billable": True}
+    timer_billable = {"5": False}
+    assert ticket_importer._resolve_comment_billable(comment, timer_billable) is False
+
+
+def test_resolve_comment_billable_from_timer_map():
+    """When comment has no billable field, the timer_billable map is used."""
+    comment = {"id": 42, "body": "Fixed it"}
+    timer_billable = {"42": True}
+    assert ticket_importer._resolve_comment_billable(comment, timer_billable) is True
+
+
+def test_resolve_comment_billable_timer_map_false():
+    comment = {"id": 7, "body": "Reviewed"}
+    timer_billable = {"7": False}
+    assert ticket_importer._resolve_comment_billable(comment, timer_billable) is False
+
+
+def test_resolve_comment_billable_no_timer_match():
+    """No match in timer map → falls back to comment fields then defaults to False."""
+    comment = {"id": 99, "body": "Note"}
+    timer_billable = {"1": True}
+    assert ticket_importer._resolve_comment_billable(comment, timer_billable) is False
+
+
+def test_build_timer_billable_map_basic():
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": 10, "billable": True, "recorded": False},
+            {"id": 2, "comment_id": 20, "billable": True, "recorded": True},
+        ]
+    }
+    result = ticket_importer._build_timer_billable_map(ticket)
+    assert result == {"10": True, "20": False}
+
+
+def test_build_timer_billable_map_coerces_string_values():
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": 10, "billable": "true", "recorded": "false"},
+            {"id": 2, "comment_id": 20, "billable": "true", "recorded": "true"},
+            {"id": 3, "comment_id": 30, "billable": "0", "recorded": "0"},
+        ]
+    }
+    result = ticket_importer._build_timer_billable_map(ticket)
+    assert result == {"10": True, "20": False, "30": False}
+
+
+def test_build_timer_billable_map_skips_null_comment_id():
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": None, "billable": True, "recorded": False},
+            {"id": 2, "comment_id": 5, "billable": True, "recorded": False},
+        ]
+    }
+    result = ticket_importer._build_timer_billable_map(ticket)
+    assert result == {"5": True}
+
+
+def test_build_timer_billable_map_recorded_true_overrides_timer_billable_field():
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": 10, "billable": True, "recorded": True},
+            {"id": 2, "comment_id": 20, "billable": False, "recorded": True},
+            {"id": 3, "comment_id": 30, "billable": True, "recorded": False},
+        ]
+    }
+    result = ticket_importer._build_timer_billable_map(ticket)
+    assert result == {"10": False, "20": False, "30": True}
+
+
+def test_build_timer_billable_map_treats_recorded_syncro_sample_as_non_billable():
+    ticket = {
+        "ticket_timers": [
+            {
+                "id": 40289461,
+                "ticket_id": 113547897,
+                "user_id": 172491,
+                "recorded": True,
+                "billable": True,
+                "comment_id": 422438348,
+                "ticket_line_item_id": 43160482,
+                "active_duration": 600,
+                "billable_time": 600,
+                "billable_override": None,
+            }
+        ]
+    }
+
+    result = ticket_importer._build_timer_billable_map(ticket)
+
+    assert result == {"422438348": False}
+
+
+def test_build_timer_billable_map_no_timers():
+    assert ticket_importer._build_timer_billable_map({}) == {}
+    assert ticket_importer._build_timer_billable_map({"ticket_timers": []}) == {}
+
+
+def test_build_timer_time_map_basic():
+    # billable_time is in seconds: 60s = 1 min, 30s = 1 min (rounds up at >= 30s)
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": 10, "billable": True, "billable_time": 60},
+            {"id": 2, "comment_id": 20, "billable": False, "billable_time": 30},
+        ]
+    }
+    result = ticket_importer._build_timer_time_map(ticket)
+    assert result == {"10": 1, "20": 1}
+
+
+def test_build_timer_time_map_skips_null_comment_id():
+    # 45s rounds up to 1 min; 15s rounds down to 0 (excluded)
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": None, "billable_time": 45},
+            {"id": 2, "comment_id": 7, "billable_time": 15},
+        ]
+    }
+    result = ticket_importer._build_timer_time_map(ticket)
+    assert result == {}
+
+
+def test_build_timer_time_map_skips_missing_billable_time():
+    # 45s rounds up to 1 min
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": 10, "billable": True},
+            {"id": 2, "comment_id": 20, "billable_time": 45},
+        ]
+    }
+    result = ticket_importer._build_timer_time_map(ticket)
+    assert result == {"20": 1}
+
+
+def test_build_timer_time_map_no_timers():
+    assert ticket_importer._build_timer_time_map({}) == {}
+    assert ticket_importer._build_timer_time_map({"ticket_timers": []}) == {}
+
+
+def test_build_timer_time_map_seconds_to_minutes_conversion():
+    # 90s = 1m 30s -> 2 min (30s rounds up), 120s = 2m exactly, 29s -> 0 (excluded)
+    ticket = {
+        "ticket_timers": [
+            {"id": 1, "comment_id": 1, "billable_time": 90},
+            {"id": 2, "comment_id": 2, "billable_time": 120},
+            {"id": 3, "comment_id": 3, "billable_time": 29},
+        ]
+    }
+    result = ticket_importer._build_timer_time_map(ticket)
+    assert result == {"1": 2, "2": 2}
+
+
+def test_extract_contact_info_from_contact_dict():
+    ticket = {
+        "contact": {
+            "name": "Jane Doe",
+            "email": "jane@example.com",
+            "phone": "555-1234",
+            "mobile": "555-5678",
+            "address": "123 Main St",
+            "address_2": "Suite 100",
+        }
+    }
+    info = ticket_importer._extract_contact_info(ticket)
+    assert info["name"] == "Jane Doe"
+    assert info["email"] == "jane@example.com"
+    assert info["phone"] == "555-1234"
+    assert info["mobile"] == "555-5678"
+    assert info["address"] == "123 Main St"
+    assert info["address_2"] == "Suite 100"
+
+
+def test_extract_contact_info_empty_when_no_contact():
+    assert ticket_importer._extract_contact_info({}) == {}
+
+
+def test_extract_custom_fields_returns_label_value_pairs():
+    ticket = {
+        "custom_fields": [
+            {"name": "Site Location", "value": "Head Office"},
+            {"label": "Priority Override", "value": "Critical"},
+            {"name": "Empty Field", "value": ""},  # empty value should be skipped
+        ]
+    }
+    fields = ticket_importer._extract_custom_fields(ticket)
+    assert len(fields) == 2
+    assert fields[0] == {"label": "Site Location", "value": "Head Office"}
+    assert fields[1] == {"label": "Priority Override", "value": "Critical"}
+
+
+def test_extract_custom_fields_empty():
+    assert ticket_importer._extract_custom_fields({}) == []
+
+
+def test_extract_ticket_assets_returns_asset_list():
+    ticket = {
+        "assets": [
+            {"name": "Server01", "asset_tag": "SRV001", "serial_number": "XYZ123"},
+            {"name": "Laptop02", "asset_tag": None, "serial_number": "ABC456"},
+        ]
+    }
+    assets = ticket_importer._extract_ticket_assets(ticket)
+    assert len(assets) == 2
+    assert assets[0]["name"] == "Server01"
+    assert assets[0]["asset_tag"] == "SRV001"
+    assert assets[0]["serial_number"] == "XYZ123"
+    assert assets[1]["name"] == "Laptop02"
+    assert assets[1]["serial_number"] == "ABC456"
+
+
+def test_extract_ticket_assets_empty():
+    assert ticket_importer._extract_ticket_assets({}) == []
+
+
+def test_build_ticket_metadata_note_with_all_sections():
+    ticket = {
+        "contact": {
+            "name": "John Smith",
+            "email": "john@example.com",
+            "phone": "555-0001",
+        },
+        "assets": [
+            {"name": "Laptop01", "asset_tag": "LT001", "serial_number": "SN999"}
+        ],
+        "custom_fields": [{"name": "Department", "value": "Finance"}],
+    }
+    note = ticket_importer._build_ticket_metadata_note(ticket)
+    assert note is not None
+    assert "=== Assigned Contact ===" in note
+    assert "Name: John Smith" in note
+    assert "Email: john@example.com" in note
+    assert "Phone: 555-0001" in note
+    assert "=== Associated Assets ===" in note
+    assert "Laptop01" in note
+    assert "Tag: LT001" in note
+    assert "S/N: SN999" in note
+    assert "=== Custom Fields ===" in note
+    assert "Department: Finance" in note
+
+
+def test_build_ticket_metadata_note_returns_none_when_empty():
+    assert ticket_importer._build_ticket_metadata_note({}) is None
+
+
+def test_build_ticket_metadata_note_only_contact():
+    ticket = {"contact": {"name": "Alice", "email": "alice@example.com"}}
+    note = ticket_importer._build_ticket_metadata_note(ticket)
+    assert note is not None
+    assert "=== Assigned Contact ===" in note
+    assert "=== Associated Assets ===" not in note
+    assert "=== Custom Fields ===" not in note
+
+
+@pytest.mark.anyio
+async def test_import_ticket_creates_metadata_note_with_billable_time(monkeypatch):
+    """Ticket with contact info and a billable comment with time creates metadata note."""
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Server Down",
+            "priority": "High",
+            "status": "Open",
+            "problem": "Server not responding",
+            "customer_id": "300",
+            "contact": {
+                "name": "Jane Client",
+                "email": "jane@client.com",
+                "phone": "555-9999",
+            },
+            "assets": [{"name": "ServerA", "asset_tag": "SRV-A"}],
+            "custom_fields": [{"name": "Location", "value": "Data Centre"}],
+            "comments": [
+                {
+                    "id": 10,
+                    "body": "Rebooted the server",
+                    "tech": "Bob Tech",
+                    "user_email": "bob@company.com",
+                    "time_worked": "00:45",
+                    "billable": True,
+                    "hidden": False,
+                    "created_at": "2025-06-01T10:00:00Z",
+                }
+            ],
+        }
+
+    async def fake_get_existing(_ref):
+        return None
+
+    async def fake_get_company(syncro_id):
+        return {"id": 5}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": kwargs.get("id") or 9000, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    reply_calls = []
+
+    async def fake_list_replies(ticket_id, include_internal=True):  # noqa: ARG001
+        return []
+
+    async def fake_create_reply(**kwargs):
+        reply_calls.append(kwargs)
+        return {"id": len(reply_calls), **kwargs}
+
+    async def fake_list_watchers(ticket_id):  # noqa: ARG001
+        return []
+
+    async def fake_add_watcher(ticket_id, user_id):  # noqa: ARG001
+        pass
+
+    async def fake_get_user_by_email(email):
+        if email == "jane@client.com":
+            return {"id": 50}
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    async def fake_list_company_assets(_company_id):
+        return []
+
+    monkeypatch.setattr(assets_repo, "list_company_assets", fake_list_company_assets)
+
+    summary = await ticket_importer.import_ticket_by_id(9000, rate_limiter=None)
+
+    assert summary.created == 1
+    # 2 replies: 1 metadata note + 1 comment
+    assert len(reply_calls) == 2
+
+    # First reply is the metadata note
+    meta = reply_calls[0]
+    assert meta["external_reference"] == "syncro_metadata_9000"
+    assert meta["is_internal"] is True
+    assert meta["author_id"] is None
+    assert "=== Assigned Contact ===" in meta["body"]
+    assert "Name: Jane Client" in meta["body"]
+    assert "=== Associated Assets ===" in meta["body"]
+    assert "ServerA" in meta["body"]
+    assert "=== Custom Fields ===" in meta["body"]
+    assert "Location: Data Centre" in meta["body"]
+
+    # Second reply is the comment with time, billable, and author
+    comment_reply = reply_calls[1]
+    assert comment_reply["external_reference"] == "10"
+    assert comment_reply["is_billable"] is True
+    assert comment_reply["minutes_spent"] == 45
+    assert "Author: Bob Tech" in comment_reply["body"]
+    assert "Time: 45m" in comment_reply["body"]
+    assert "Billable:" not in comment_reply["body"]
+    assert "Rebooted the server" in comment_reply["body"]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_billable_from_ticket_timers(monkeypatch):
+    """Billable flag sourced from ticket_timers when comments lack the field."""
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Network issue",
+            "priority": "Normal",
+            "status": "Open",
+            "comments": [
+                {
+                    "id": 55,
+                    "body": "Investigated the switch",
+                    "tech": "Carol",
+                    "user_email": "carol@company.com",
+                    "created_at": "2025-07-01T09:00:00Z",
+                    # No "billable" field — Syncro omits it from comments
+                },
+                {
+                    "id": 56,
+                    "body": "Replaced cable",
+                    "tech": "Carol",
+                    "user_email": "carol@company.com",
+                    "created_at": "2025-07-01T10:00:00Z",
+                    # No "billable" field
+                },
+            ],
+            "ticket_timers": [
+                # Comment 55 is billable, comment 56 is non-billable because Syncro
+                # sets recorded=True for labor entered without a charge.
+                {
+                    "id": 1,
+                    "comment_id": 55,
+                    "billable": True,
+                    "recorded": False,
+                    "billable_time": 60,
+                },
+                {
+                    "id": 2,
+                    "comment_id": 56,
+                    "billable": True,
+                    "recorded": True,
+                    "billable_time": 30,
+                },
+            ],
+        }
+
+    async def fake_get_existing(_ref):
+        return None
+
+    async def fake_get_company(syncro_id):
+        return None
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": kwargs.get("id") or 7000, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    reply_calls = []
+
+    async def fake_list_replies(ticket_id, include_internal=True):  # noqa: ARG001
+        return []
+
+    async def fake_create_reply(**kwargs):
+        reply_calls.append(kwargs)
+        return {"id": len(reply_calls), **kwargs}
+
+    async def fake_list_watchers(ticket_id):  # noqa: ARG001
+        return []
+
+    async def fake_add_watcher(ticket_id, user_id):  # noqa: ARG001
+        pass
+
+    async def fake_get_user_by_email(email):  # noqa: ARG001
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(7000, rate_limiter=None)
+
+    assert summary.created == 1
+    # 2 comment replies (no metadata note — no contact/assets/custom fields)
+    assert len(reply_calls) == 2
+
+    billable_reply = next(r for r in reply_calls if r.get("external_reference") == "55")
+    non_billable_reply = next(
+        r for r in reply_calls if r.get("external_reference") == "56"
+    )
+
+    assert billable_reply["is_billable"] is True
+    assert "Billable:" not in billable_reply["body"]
+    # Time comes from billable_time on the labor log (ticket_timer).
+    # billable_time is in seconds: 60s = 1 min, 30s = 1 min (rounds up at >= 30s).
+    assert billable_reply["minutes_spent"] == 1
+    assert "Time: 1m" in billable_reply["body"]
+
+    assert non_billable_reply["is_billable"] is False
+    assert "Billable:" not in non_billable_reply["body"]
+    assert non_billable_reply["minutes_spent"] == 1
+    assert "Time: 1m" in non_billable_reply["body"]
+
+
+@pytest.mark.anyio
+async def test_metadata_note_not_duplicated_on_reimport(monkeypatch):
+    """Re-importing a ticket should not create a second metadata note."""
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": ticket_id,
+            "subject": "Duplicate check",
+            "priority": "Normal",
+            "status": "Open",
+            "contact": {"name": "Test User", "email": "test@example.com"},
+        }
+
+    async def fake_get_existing(_ref):
+        return {"id": 8888, "external_reference": "8888"}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    reply_calls = []
+
+    async def fake_list_replies(ticket_id, include_internal=True):  # noqa: ARG001
+        # Simulate metadata note already exists
+        return [{"external_reference": "syncro_metadata_8888"}]
+
+    async def fake_create_reply(**kwargs):
+        reply_calls.append(kwargs)
+        return {"id": len(reply_calls), **kwargs}
+
+    async def fake_list_watchers(ticket_id):  # noqa: ARG001
+        return []
+
+    async def fake_add_watcher(ticket_id, user_id):  # noqa: ARG001
+        pass
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    async def fake_get_company(syncro_id):
+        return {"id": 1}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(8888, rate_limiter=None)
+
+    assert summary.updated == 1
+    # No replies created — metadata note already exists and no new comments
+    assert len(reply_calls) == 0
+
+
+@pytest.mark.anyio
+async def test_import_ticket_links_matching_asset(monkeypatch):
+    """When a Syncro ticket lists an asset whose name matches a MyPortal asset for the
+    same company, that asset should be linked to the ticket via replace_ticket_assets.
+    """
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": 300,
+            "subject": "Server issue",
+            "priority": "High",
+            "status": "Open",
+            "customer_id": "10",
+            "assets": [{"name": "Server-01", "asset_tag": "SRV-001"}],
+        }
+
+    async def fake_get_company(syncro_id):
+        return {"id": 5}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_get_existing(_ref):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": 300, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    async def fake_list_company_assets(company_id):
+        return [
+            {"id": 42, "company_id": 5, "name": "Server-01"},
+            {"id": 43, "company_id": 5, "name": "Workstation-02"},
+        ]
+
+    replace_calls = []
+
+    async def fake_replace_ticket_assets(ticket_id, asset_ids):
+        replace_calls.append((ticket_id, list(asset_ids)))
+        return []
+
+    async def fake_list_replies(ticket_id, include_internal=True):
+        return []
+
+    async def fake_create_reply(**kwargs):
+        return {"id": 1, **kwargs}
+
+    async def fake_list_watchers(ticket_id):
+        return []
+
+    async def fake_add_watcher(ticket_id, user_id):
+        pass
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+    monkeypatch.setattr(assets_repo, "list_company_assets", fake_list_company_assets)
+    monkeypatch.setattr(
+        tickets_repo, "replace_ticket_assets", fake_replace_ticket_assets
+    )
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+
+    summary = await ticket_importer.import_ticket_by_id(300, rate_limiter=None)
+
+    assert summary.created == 1
+    assert len(replace_calls) == 1
+    ticket_id_linked, asset_ids_linked = replace_calls[0]
+    assert ticket_id_linked == 300
+    assert asset_ids_linked == [42]
+
+
+@pytest.mark.anyio
+async def test_import_ticket_no_asset_link_when_no_name_match(monkeypatch):
+    """When no Syncro asset name matches a MyPortal asset, replace_ticket_assets is not called."""
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": 301,
+            "subject": "Unknown asset",
+            "priority": "Normal",
+            "status": "Open",
+            "customer_id": "10",
+            "assets": [{"name": "Unknown-Device-XYZ"}],
+        }
+
+    async def fake_get_company(syncro_id):
+        return {"id": 5}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_get_existing(_ref):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": 301, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    async def fake_list_company_assets(company_id):
+        return [
+            {"id": 42, "company_id": 5, "name": "Server-01"},
+        ]
+
+    replace_calls = []
+
+    async def fake_replace_ticket_assets(ticket_id, asset_ids):
+        replace_calls.append((ticket_id, list(asset_ids)))
+        return []
+
+    async def fake_list_replies(ticket_id, include_internal=True):
+        return []
+
+    async def fake_create_reply(**kwargs):
+        return {"id": 1, **kwargs}
+
+    async def fake_list_watchers(ticket_id):
+        return []
+
+    async def fake_add_watcher(ticket_id, user_id):
+        pass
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+    monkeypatch.setattr(assets_repo, "list_company_assets", fake_list_company_assets)
+    monkeypatch.setattr(
+        tickets_repo, "replace_ticket_assets", fake_replace_ticket_assets
+    )
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(tickets_repo, "list_watchers", fake_list_watchers)
+    monkeypatch.setattr(tickets_repo, "add_watcher", fake_add_watcher)
+
+    summary = await ticket_importer.import_ticket_by_id(301, rate_limiter=None)
+
+    assert summary.created == 1
+    assert len(replace_calls) == 0
+
+
+@pytest.mark.anyio
+async def test_import_ticket_no_asset_link_when_ticket_has_no_assets(monkeypatch):
+    """When a Syncro ticket has no asset list, replace_ticket_assets is not called."""
+
+    async def fake_get_ticket(ticket_id, rate_limiter=None):
+        return {
+            "id": 302,
+            "subject": "Simple ticket",
+            "priority": "Normal",
+            "status": "Open",
+            "customer_id": "10",
+        }
+
+    async def fake_get_company(syncro_id):
+        return {"id": 5}
+
+    async def fake_get_company_by_name(_name):
+        return None
+
+    async def fake_get_existing(_ref):
+        return None
+
+    async def fake_create_ticket(**kwargs):
+        return {"id": 302, **kwargs}
+
+    async def fake_update_ticket(ticket_id, **fields):
+        return {"id": ticket_id, **fields}
+
+    async def fake_get_user_by_email(_email):
+        return None
+
+    list_assets_calls = []
+
+    async def fake_list_company_assets(company_id):
+        list_assets_calls.append(company_id)
+        return []
+
+    replace_calls = []
+
+    async def fake_replace_ticket_assets(ticket_id, asset_ids):
+        replace_calls.append((ticket_id, list(asset_ids)))
+        return []
+
+    monkeypatch.setattr(syncro, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(company_repo, "get_company_by_syncro_id", fake_get_company)
+    monkeypatch.setattr(company_repo, "get_company_by_name", fake_get_company_by_name)
+    monkeypatch.setattr(
+        tickets_repo, "get_ticket_by_external_reference", fake_get_existing
+    )
+    monkeypatch.setattr(tickets_service, "create_ticket", fake_create_ticket)
+    monkeypatch.setattr(tickets_repo, "update_ticket", fake_update_ticket)
+    monkeypatch.setattr(
+        ticket_importer.user_repo, "get_user_by_email", fake_get_user_by_email
+    )
+    monkeypatch.setattr(assets_repo, "list_company_assets", fake_list_company_assets)
+    monkeypatch.setattr(
+        tickets_repo, "replace_ticket_assets", fake_replace_ticket_assets
+    )
+
+    summary = await ticket_importer.import_ticket_by_id(302, rate_limiter=None)
+
+    assert summary.created == 1
+    # No assets in the ticket -- list_company_assets should not even be called
+    assert len(list_assets_calls) == 0
+    assert len(replace_calls) == 0
+
+
+def test_extract_comment_body_prefers_rich_text_preview():
+    comment = {
+        "body": "Formatted",
+        "rich_text_preview": '<p>Formatted</p><img src="https://example.test/image.png">',
+    }
+
+    assert ticket_importer._extract_comment_body(comment) == (
+        '<p>Formatted</p><img src="https://example.test/image.png">'
+    )
+
+
+def test_extract_comment_body_appends_full_body_when_rich_text_preview_is_truncated():
+    comment = {
+        "body": "First line\nSecond line\nThird line with <unsafe> markers",
+        "rich_text_preview": '<p>First line<br/>Second...</p><img src="https://example.test/image.png">',
+    }
+
+    result = ticket_importer._extract_comment_body(comment)
+
+    assert result is not None
+    assert "<p>First line<br>Second...</p>" in result
+    assert '<img src="https://example.test/image.png">' in result
+    assert "Full ticket body from Syncro" in result
+    assert "First line\nSecond line\nThird line with  markers" in result
+
+
+def test_append_imported_image_markup_replaces_syncro_img_src():
+    body = (
+        "<p>[embedded image]</p>"
+        '<img src="https://attachments.services.syncromsp.com/uploads/repairshopr/file/18728202/image005.png" '
+        'alt="image005.png">'
+    )
+    attachments = [
+        {
+            "id": 55,
+            "mime_type": "image/png",
+            "original_filename": "image005.png",
+            "syncro_source_url": "https://attachments.services.syncromsp.com/uploads/repairshopr/file/18728202/image005.png",
+        }
+    ]
+
+    result = ticket_importer._append_imported_image_markup(body, 123, attachments)
+
+    assert "attachments.services.syncromsp.com" not in result
+    assert 'src="/api/tickets/123/attachments/55/download"' in result
+    assert "syncro-embedded-images" not in result
+
+
+def test_extract_comment_image_candidates_from_html_img():
+    comment = {
+        "body": '<p>[embedded image]</p><img src="https://example.test/files/image.png" alt="screen.png">'
+    }
+
+    assert ticket_importer._extract_comment_image_candidates(comment) == [
+        {
+            "url": "https://example.test/files/image.png",
+            "filename": "screen.png",
+            "mime_type": "image/png",
+        }
+    ]
+
+
+def test_extract_comment_image_candidates_from_attachments_only_images():
+    comment = {
+        "attachments": [
+            {
+                "download_url": "/attachments/1",
+                "filename": "photo",
+                "content_type": "image/png",
+            },
+            {
+                "download_url": "/attachments/2",
+                "filename": "note.txt",
+                "content_type": "text/plain",
+            },
+        ]
+    }
+
+    assert ticket_importer._extract_comment_image_candidates(comment) == [
+        {"url": "/attachments/1", "filename": "photo", "mime_type": "image/png"}
+    ]
+
+
+def test_extract_comment_image_candidates_from_nested_inline_attachment_urls():
+    comment = {
+        "body": "Screenshots: [embedded image]",
+        "attachments": [
+            {
+                "attachment": {
+                    "content_url": "https://example.test/ticket-attachments/inline",
+                    "file_name": "[embedded image]",
+                    "content_type": "image/jpeg",
+                }
+            }
+        ],
+    }
+
+    assert ticket_importer._extract_comment_image_candidates(comment) == [
+        {
+            "url": "https://example.test/ticket-attachments/inline",
+            "filename": "[embedded image]",
+            "mime_type": "image/jpeg",
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_sync_ticket_replies_imports_embedded_images(monkeypatch):
+    async def fake_list_replies(ticket_id, include_internal=True):  # noqa: ARG001
+        return []
+
+    reply_calls = []
+
+    async def fake_create_reply(**kwargs):
+        reply_calls.append(kwargs)
+        return {"id": 1, **kwargs}
+
+    async def fake_download_file(url):
+        assert url == "https://example.test/files/image.png"
+        return b"png-bytes", "image/png"
+
+    attachment_calls = []
+
+    async def fake_save_file_bytes(**kwargs):
+        attachment_calls.append(kwargs)
+        return {"id": 10, **kwargs}
+
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(syncro, "download_file", fake_download_file)
+    monkeypatch.setattr(
+        ticket_importer.attachments_service, "save_file_bytes", fake_save_file_bytes
+    )
+
+    await ticket_importer._sync_ticket_replies(
+        123,
+        [
+            {
+                "id": 77,
+                "body": '<p>[embedded image]</p><img src="https://example.test/files/image.png" alt="screen.png">',
+                "tech": "agent",
+                "hidden": False,
+            }
+        ],
+        requester_id=None,
+        contact_email=None,
+    )
+
+    assert reply_calls[0]["external_reference"] == "77"
+    assert len(attachment_calls) == 1
+    assert attachment_calls[0]["ticket_id"] == 123
+    assert attachment_calls[0]["contents"] == b"png-bytes"
+    assert attachment_calls[0]["original_filename"] == "screen.png"
+    assert attachment_calls[0]["mime_type"] == "image/png"
+    assert attachment_calls[0]["access_level"] == "closed"
+
+
+@pytest.mark.anyio
+async def test_sync_ticket_replies_can_mark_imported_billable_time_as_billed(
+    monkeypatch,
+):
+    async def fake_list_replies(ticket_id):
+        assert ticket_id == 123
+        return []
+
+    async def fake_create_reply(**kwargs):
+        return {"id": 456, **kwargs}
+
+    billed_calls = []
+
+    async def fake_create_billed_time_entry(**kwargs):
+        billed_calls.append(kwargs)
+        return {"id": 1, **kwargs}
+
+    monkeypatch.setattr(tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_repo, "create_reply", fake_create_reply)
+    monkeypatch.setattr(
+        ticket_importer.billed_time_repo,
+        "create_billed_time_entry",
+        fake_create_billed_time_entry,
+    )
+
+    async def fake_import_comment_images(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        ticket_importer, "_import_comment_images", fake_import_comment_images
+    )
+
+    await ticket_importer._sync_ticket_replies(
+        123,
+        [
+            {
+                "id": "syncro-comment-1",
+                "body": "Worked on billing setup",
+                "time_worked": "00:45:00",
+                "is_billable": True,
+            }
+        ],
+        requester_id=None,
+        contact_email=None,
+        mark_billable_time_as_billed=True,
+    )
+
+    assert billed_calls == [
+        {
+            "ticket_id": 123,
+            "reply_id": 456,
+            "xero_invoice_number": "SYNCRO-IMPORT-ALREADY-BILLED",
+            "minutes_billed": 45,
+        }
+    ]

@@ -1,0 +1,66 @@
+<section class="card card--panel" data-report-section="top_mailboxes">
+  <header class="card__header report-section__header">
+    <h2>Mailbox sizes</h2>
+  </header>
+  <div class="card__body">
+    {% macro archive_size(bytes) %}
+      {%- if bytes is none %}None{% else %}{{ bytes | filesizeformat }}{% endif -%}
+    {% endmacro %}
+    {% set user_mailboxes = section.data.user_mailboxes or [] %}
+    {% set shared_mailboxes = section.data.shared_mailboxes or [] %}
+    {% if user_mailboxes or shared_mailboxes %}
+      {% if user_mailboxes %}
+        <h3 style="margin: 0 0 var(--space-2); font-size: 1rem;">User mailboxes</h3>
+        <div class="table-wrapper" style="margin-bottom: var(--space-4);">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Display name</th>
+              <th>User principal name</th>
+              <th>Mailbox size</th>
+              <th>Archive size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for mb in user_mailboxes %}
+              <tr>
+                <td>{{ mb.display_name }}</td>
+                <td>{{ mb.user_principal_name }}</td>
+                <td>{{ mb.primary_bytes | filesizeformat }}</td>
+                <td>{{ archive_size(mb.archive_bytes) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      {% endif %}
+      {% if shared_mailboxes %}
+        <h3 style="margin: 0 0 var(--space-2); font-size: 1rem;">Shared mailboxes</h3>
+        <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Display name</th>
+              <th>User principal name</th>
+              <th>Mailbox size</th>
+              <th>Archive size</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for mb in shared_mailboxes %}
+              <tr>
+                <td>{{ mb.display_name }}</td>
+                <td>{{ mb.user_principal_name }}</td>
+                <td>{{ mb.primary_bytes | filesizeformat }}</td>
+                <td>{{ archive_size(mb.archive_bytes) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      {% endif %}
+    {% else %}
+      <p class="report-empty">No mailbox data is available for this company.</p>
+    {% endif %}
+  </div>
+</section>

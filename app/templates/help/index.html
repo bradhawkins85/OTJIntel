@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block title %}Help{% endblock %}
+
+{% block header_title %}
+  <span class="header__title-text">Help</span>
+{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([]) }}
+{% endblock %}
+
+{% block content %}
+<div class="help">
+  {% if help_sections %}
+    <div class="help__layout">
+      <nav class="help__sidebar card card--panel" aria-label="Help articles">
+        {% for section in help_sections %}
+        <div class="help__nav-section">
+          <span class="help__nav-section-title">{{ section.name }}</span>
+          <ul class="help__nav-list">
+            {% for article in section.articles %}
+            <li class="help__nav-item">
+              <a href="/help/{{ section.slug }}/{{ article.slug }}" class="help__nav-link">{{ article.name }}</a>
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endfor %}
+      </nav>
+
+      <div class="help__content help__content--placeholder card card--panel" role="status">
+        <p class="help__placeholder-message">Select an article from the left menu.</p>
+      </div>
+    </div>
+  {% else %}
+    <div class="card card--panel">
+      <div class="empty-state">
+        <h3 class="empty-state__title">No help articles found</h3>
+        <p class="empty-state__subtitle">Help documentation is not available yet.</p>
+      </div>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

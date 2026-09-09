@@ -1,0 +1,750 @@
+"""Tests for the local invoice generator service."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import date
+from decimal import Decimal
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.services import invoice_generator
+
+# ---------------------------------------------------------------------------
+# Helper fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_company(company_id: int = 1) -> dict[str, Any]:
+    return {"id": company_id, "name": "Test Company"}
+
+
+def _make_recurring_items() -> list[dict[str, Any]]:
+    return [
+        {
+            "Description": "Managed IT support",
+            "Quantity": 1.0,
+            "UnitAmount": 500.0,
+            "ItemCode": "MSP-MANAGED",
+        },
+        {
+            "Description": "Per-device fee",
+            "Quantity": 5.0,
+            "UnitAmount": 10.0,
+            "ItemCode": "MSP-DEVICE",
+        },
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _mock_ticket_expenses(monkeypatch):
+    """Keep invoice generator tests isolated from the ticket expense database."""
+
+    monkeypatch.delenv("XERO_LINE_ITEM_TEMPLATE", raising=False)
+    monkeypatch.setattr(
+        invoice_generator.expenses_repo, "list_expenses", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        invoice_generator.expenses_repo, "mark_expenses_billed", AsyncMock()
+    )
+
+
+# ---------------------------------------------------------------------------
+# _generate_invoice_number
+# ---------------------------------------------------------------------------
+
+
+def test_generate_invoice_number_first(monkeypatch):
+    """When no invoices exist for the current month, sequence starts at 1."""
+
+    async def fake_get_max_seq(prefix: str) -> int:
+        return 0
+
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", fake_get_max_seq
+    )
+
+    from datetime import datetime, timezone
+
+    fixed_now = datetime(2026, 3, 18, tzinfo=timezone.utc)
+    with patch("app.services.invoice_generator.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = asyncio.run(invoice_generator._generate_invoice_number())
+
+    assert result == "INV-202603-0001"
+
+
+def test_generate_invoice_number_increments(monkeypatch):
+    """Sequence number increments beyond the current maximum."""
+
+    async def fake_get_max_seq(prefix: str) -> int:
+        return 12
+
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", fake_get_max_seq
+    )
+
+    from datetime import datetime, timezone
+
+    fixed_now = datetime(2026, 3, 18, tzinfo=timezone.utc)
+    with patch("app.services.invoice_generator.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = asyncio.run(invoice_generator._generate_invoice_number())
+
+    assert result == "INV-202603-0013"
+
+
+# ---------------------------------------------------------------------------
+# generate_invoice — company not found
+# ---------------------------------------------------------------------------
+
+
+def test_generate_invoice_company_not_found(monkeypatch):
+    async def fake_get_company(company_id):
+        return None
+
+    monkeypatch.setattr(
+        invoice_generator.company_repo, "get_company_by_id", fake_get_company
+    )
+
+    result = asyncio.run(invoice_generator.generate_invoice(99))
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "Company not found"
+    assert result["company_id"] == 99
+
+
+# ---------------------------------------------------------------------------
+# generate_invoice — no line items → skipped
+# ---------------------------------------------------------------------------
+
+
+def test_generate_invoice_no_line_items(monkeypatch):
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_tickets",
+        AsyncMock(return_value=[]),
+    )
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "skipped"
+    assert "No active recurring invoice items" in result["reason"]
+
+
+# ---------------------------------------------------------------------------
+# generate_invoice — recurring items only, no tickets
+# ---------------------------------------------------------------------------
+
+
+def test_generate_invoice_recurring_items_only(monkeypatch):
+    created_invoices: list[dict[str, Any]] = []
+    created_lines: list[dict[str, Any]] = []
+
+    async def fake_create_invoice(**kwargs):
+        inv = {"id": 101, **kwargs}
+        created_invoices.append(inv)
+        return inv
+
+    async def fake_create_line(**kwargs):
+        line = {"id": len(created_lines) + 1, **kwargs}
+        created_lines.append(line)
+        return line
+
+    async def fake_get_max_seq(prefix: str) -> int:
+        return 0
+
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={"company_name": "Test Company"}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=_make_recurring_items()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_tickets",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "create_invoice", fake_create_invoice
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", fake_get_max_seq
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo, "create_invoice_line", fake_create_line
+    )
+
+    from datetime import datetime, timezone
+
+    fixed_now = datetime(2026, 3, 18, tzinfo=timezone.utc)
+    with patch("app.services.invoice_generator.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "succeeded"
+    assert result["invoice_number"] == "INV-202603-0001"
+    # 1 * 500 + 5 * 10 = 550
+    assert result["total_amount"] == "550.00"
+    assert result["line_items"] == 2
+    assert result["recurring_items"] == 2
+    assert result["ticket_items"] == 0
+    assert result["tickets_billed"] == 0
+    assert len(created_invoices) == 1
+    assert len(created_lines) == 2
+    assert created_invoices[0]["status"] == "draft"
+    assert created_invoices[0]["company_id"] == 1
+
+
+def test_generate_invoice_passes_xero_credentials_for_recurring_price_lookup(
+    monkeypatch,
+):
+    build_recurring = AsyncMock(return_value=_make_recurring_items())
+
+    async def fake_create_invoice(**kwargs):
+        return {"id": 404, **kwargs}
+
+    async def fake_create_line(**kwargs):
+        return {"id": 1, **kwargs}
+
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service, "build_recurring_invoice_items", build_recurring
+    )
+    monkeypatch.setattr(
+        invoice_generator.modules_service,
+        "get_module",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "settings": {"tenant_id": "tenant-from-settings"},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.modules_service,
+        "get_xero_credentials",
+        AsyncMock(return_value={"tenant_id": "tenant-from-credentials"}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.modules_service,
+        "acquire_xero_access_token",
+        AsyncMock(return_value="access-token"),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo, "list_tickets", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "create_invoice", fake_create_invoice
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo, "create_invoice_line", fake_create_line
+    )
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "succeeded"
+    build_recurring.assert_awaited_once()
+    _, kwargs = build_recurring.await_args
+    assert kwargs["tenant_id"] == "tenant-from-credentials"
+    assert kwargs["access_token"] == "access-token"
+
+
+def test_generate_invoice_billable_ticket_uses_hours_and_minutes(monkeypatch):
+    monkeypatch.setenv("XERO_BILLABLE_STATUSES", "resolved")
+    created_lines: list[dict[str, Any]] = []
+
+    async def fake_create_invoice(**kwargs):
+        return {"id": 202, **kwargs}
+
+    async def fake_create_line(**kwargs):
+        created_lines.append(kwargs)
+        return {"id": len(created_lines), **kwargs}
+
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=[]),
+    )
+    list_tickets = AsyncMock(
+        return_value=[{"id": 55, "subject": "VPN help", "status": "resolved"}]
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_tickets",
+        list_tickets,
+    )
+    get_unbilled_reply_ids = AsyncMock(return_value=[1, 2])
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo,
+        "get_unbilled_reply_ids",
+        get_unbilled_reply_ids,
+    )
+    list_replies = AsyncMock(
+        return_value=[
+            {
+                "id": 1,
+                "minutes_spent": 120,
+                "is_billable": True,
+                "is_internal": True,
+                "labour_type_name": "Remote",
+                "labour_type_code": "REMOTE",
+                "labour_type_rate": "100",
+            },
+            {
+                "id": 2,
+                "minutes_spent": 30,
+                "is_billable": True,
+                "is_internal": False,
+                "labour_type_name": "Remote",
+                "labour_type_code": "REMOTE",
+                "labour_type_rate": "100",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_replies",
+        list_replies,
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "create_invoice", fake_create_invoice
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo, "create_invoice_line", fake_create_line
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo, "create_billed_time_entry", AsyncMock()
+    )
+    monkeypatch.setattr(invoice_generator.tickets_repo, "update_ticket", AsyncMock())
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "succeeded"
+    assert (
+        created_lines[0]["description"]
+        == "Ticket 55: VPN help Remote (2 Hours 30 Mins)"
+    )
+    assert created_lines[0]["quantity"] == Decimal("150")
+    list_tickets.assert_awaited_once_with(company_id=1, limit=None)
+    # Internal notes are technician work records and must be included in the
+    # generated invoice whenever their time is marked billable.
+    list_replies.assert_awaited_once_with(55, include_internal=True)
+    # Finalisation must use the reply snapshot which produced the line rather
+    # than discovering newly-added, uninvoiced work in a second query.
+    get_unbilled_reply_ids.assert_awaited_once_with(55)
+
+
+def test_generate_invoice_line_failure_does_not_consume_sources(monkeypatch):
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=_make_recurring_items()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo, "list_tickets", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo,
+        "create_invoice",
+        AsyncMock(return_value={"id": 606}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo,
+        "create_invoice_line",
+        AsyncMock(side_effect=RuntimeError("database write failed")),
+    )
+    delete_invoice = AsyncMock()
+    monkeypatch.setattr(invoice_generator.invoice_repo, "delete_invoice", delete_invoice)
+    mark_recurring = AsyncMock()
+    monkeypatch.setattr(
+        invoice_generator.recurring_items_repo,
+        "mark_recurring_invoice_items_billed",
+        mark_recurring,
+    )
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "error"
+    assert result["reason"] == "Failed to create invoice lines"
+    delete_invoice.assert_awaited_once_with(606)
+    mark_recurring.assert_not_awaited()
+
+
+def test_generate_invoice_resolves_requester_name_for_template(monkeypatch):
+    monkeypatch.setenv("XERO_BILLABLE_STATUSES", "resolved")
+    created_lines: list[dict[str, Any]] = []
+
+    async def fake_create_invoice(**kwargs):
+        return {"id": 303, **kwargs}
+
+    async def fake_create_line(**kwargs):
+        created_lines.append(kwargs)
+        return {"id": len(created_lines), **kwargs}
+
+    monkeypatch.setenv(
+        "XERO_LINE_ITEM_TEMPLATE",
+        "Ticket {ticket_id}: {ticket_subject} - {requester_name}",
+    )
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_tickets",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": 55,
+                    "subject": "VPN help",
+                    "status": "resolved",
+                    "requester_id": 99,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service.users_repo,
+        "get_user_by_id",
+        AsyncMock(
+            return_value={
+                "id": 99,
+                "first_name": "Jane",
+                "last_name": "Requester",
+                "email": "jane@example.com",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo,
+        "get_unbilled_reply_ids",
+        AsyncMock(return_value=[1]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_replies",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": 1,
+                    "minutes_spent": 60,
+                    "is_billable": True,
+                    "labour_type_name": "Remote",
+                    "labour_type_code": "REMOTE",
+                    "labour_type_rate": "100",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "create_invoice", fake_create_invoice
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo, "create_invoice_line", fake_create_line
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo, "create_billed_time_entry", AsyncMock()
+    )
+    monkeypatch.setattr(invoice_generator.tickets_repo, "update_ticket", AsyncMock())
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "succeeded"
+    assert created_lines[0]["description"] == "Ticket 55: VPN help - Jane Requester"
+
+
+def test_generate_invoice_only_includes_env_billable_statuses(monkeypatch):
+    created_lines: list[dict[str, Any]] = []
+
+    async def fake_create_invoice(**kwargs):
+        return {"id": 404, **kwargs}
+
+    async def fake_create_line(**kwargs):
+        created_lines.append(kwargs)
+        return {"id": len(created_lines), **kwargs}
+
+    monkeypatch.setenv("XERO_BILLABLE_STATUSES", "resolved")
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_tickets",
+        AsyncMock(
+            return_value=[
+                {"id": 55, "subject": "VPN help", "status": "resolved"},
+                {"id": 56, "subject": "Do not bill yet", "status": "open"},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo,
+        "get_unbilled_reply_ids",
+        AsyncMock(return_value=[1]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_replies",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": 1,
+                    "minutes_spent": 60,
+                    "is_billable": True,
+                    "labour_type_name": "Remote",
+                    "labour_type_code": "REMOTE",
+                    "labour_type_rate": "100",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "create_invoice", fake_create_invoice
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo, "create_invoice_line", fake_create_line
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo, "create_billed_time_entry", AsyncMock()
+    )
+    update_ticket = AsyncMock()
+    monkeypatch.setattr(invoice_generator.tickets_repo, "update_ticket", update_ticket)
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "succeeded"
+    update_ticket.assert_awaited_once()
+    assert update_ticket.await_args.args[0] == 55
+    assert len(created_lines) == 1
+
+
+def test_generate_invoice_expense_description_excludes_minutes_and_amount(monkeypatch):
+    monkeypatch.setenv("XERO_BILLABLE_STATUSES", "resolved")
+    created_lines: list[dict[str, Any]] = []
+
+    async def fake_create_invoice(**kwargs):
+        return {"id": 505, **kwargs}
+
+    async def fake_create_line(**kwargs):
+        created_lines.append(kwargs)
+        return {"id": len(created_lines), **kwargs}
+
+    monkeypatch.setenv(
+        "XERO_LINE_ITEM_TEMPLATE",
+        "Ticket #{ticket_id}: {ticket_subject} - {labour_name} - ({labour_duration})",
+    )
+    monkeypatch.setattr(
+        invoice_generator.company_repo,
+        "get_company_by_id",
+        AsyncMock(return_value=_make_company()),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_invoice_context",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        invoice_generator.xero_service,
+        "build_recurring_invoice_items",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_tickets",
+        AsyncMock(
+            return_value=[
+                {"id": 25136, "subject": "Expenses test 2", "status": "resolved"}
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo,
+        "get_unbilled_reply_ids",
+        AsyncMock(return_value=[1]),
+    )
+    monkeypatch.setattr(
+        invoice_generator.expenses_repo,
+        "list_expenses",
+        AsyncMock(
+            return_value=[
+                {"id": 10, "description": "Laptop return freight 2", "amount": "43.75"}
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.tickets_repo,
+        "list_replies",
+        AsyncMock(
+            return_value=[
+                {
+                    "id": 1,
+                    "minutes_spent": 10,
+                    "is_billable": True,
+                    "labour_type_name": "Remote",
+                    "labour_type_code": "REMOTE",
+                    "labour_type_rate": "100",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "create_invoice", fake_create_invoice
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_repo, "get_max_invoice_seq", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        invoice_generator.invoice_lines_repo, "create_invoice_line", fake_create_line
+    )
+    monkeypatch.setattr(
+        invoice_generator.billed_time_repo, "create_billed_time_entry", AsyncMock()
+    )
+    monkeypatch.setattr(
+        invoice_generator.expenses_repo, "mark_expenses_billed", AsyncMock()
+    )
+    monkeypatch.setattr(invoice_generator.tickets_repo, "update_ticket", AsyncMock())
+
+    result = asyncio.run(invoice_generator.generate_invoice(1))
+
+    assert result["status"] == "succeeded"
+    expense_line = next(
+        line for line in created_lines if line["unit_amount"] == Decimal("43.75")
+    )
+    assert (
+        expense_line["description"]
+        == "Ticket #25136: Expenses test 2 - Expenses - Laptop return freight 2"
+    )
+    assert "10 Mins" not in expense_line["description"]
+    assert "43.75" not in expense_line["description"]
+
+
+# ---------------------------------------------------------------------------
+# get_max_invoice_seq helper in repository
+# ---------------------------------------------------------------------------
+
+
+def test_get_max_invoice_seq_returns_zero_for_none(monkeypatch):
+    """When the DB returns a row with max_seq=None, the function returns 0."""
+    import asyncio
+
+    from app.repositories import invoices as inv_repo
+
+    async def fake_fetch_one(query, params=None):
+        return {"max_seq": None}
+
+    monkeypatch.setattr(inv_repo.db, "fetch_one", fake_fetch_one)
+
+    result = asyncio.run(inv_repo.get_max_invoice_seq("INV-202603-"))
+    assert result == 0
+
+
+def test_get_max_invoice_seq_returns_value(monkeypatch):
+    """When the DB returns a row with max_seq=7, the function returns 7."""
+    import asyncio
+
+    from app.repositories import invoices as inv_repo
+
+    async def fake_fetch_one(query, params=None):
+        return {"max_seq": 7}
+
+    monkeypatch.setattr(inv_repo.db, "fetch_one", fake_fetch_one)
+
+    result = asyncio.run(inv_repo.get_max_invoice_seq("INV-202603-"))
+    assert result == 7

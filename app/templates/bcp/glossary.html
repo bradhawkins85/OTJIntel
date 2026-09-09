@@ -1,0 +1,28 @@
+{% extends "bcp/layout.html" %}
+
+
+{% block header_title %}BCP — Glossary{% endblock %}
+{% block bcp_content %}
+<div class="bcp-page page-container">
+  <section class="card">
+    <div class="card-header">
+      <h2 class="card-title">BCP Glossary</h2>
+      <a href="/bcp" class="btn btn-secondary">Back to Overview</a>
+    </div>
+    <div class="card-body">
+      <p class="text-muted mb-4">
+        Common terms and definitions used in Business Continuity Planning.
+      </p>
+
+      <div class="glossary-list">
+        {% for term in glossary_terms %}
+        <div class="glossary-item">
+          <h3 class="glossary-term">{{ term.term }}</h3>
+          <p class="glossary-definition">{{ term.definition }}</p>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+</div>
+{% endblock %}

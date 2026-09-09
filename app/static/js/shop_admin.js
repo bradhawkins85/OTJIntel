@@ -1,0 +1,1467 @@
+(function () {
+
+  function submitOnChange(container) {
+    container.querySelectorAll('[data-submit-on-change]').forEach((input) => {
+      input.addEventListener('change', () => {
+        const form = input.closest('form');
+        if (form) {
+          form.submit();
+        }
+      });
+    });
+  }
+
+  function openModal(modal) {
+    if (!modal) {
+      return;
+    }
+    modal.hidden = false;
+    modal.classList.add('is-visible');
+  }
+
+  function closeModal(modal) {
+    if (!modal) {
+      return;
+    }
+    modal.classList.remove('is-visible');
+    modal.hidden = true;
+  }
+
+  function closeParentHeaderMenu(element) {
+    const menu = element ? element.closest('[data-header-menu]') : null;
+    if (!menu) {
+      return;
+    }
+    if (window.MyPortalHeaderMenu && typeof window.MyPortalHeaderMenu.close === 'function') {
+      window.MyPortalHeaderMenu.close(menu);
+      return;
+    }
+    menu.classList.remove('header-menu--open');
+    const toggle = menu.querySelector('[data-header-menu-toggle]');
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', 'false');
+    }
+    const panel = menu.querySelector('[data-header-menu-panel]');
+    if (panel) {
+      panel.hidden = true;
+      panel.style.position = '';
+      panel.style.top = '';
+      panel.style.left = '';
+      panel.style.right = '';
+      panel.style.zIndex = '';
+    }
+  }
+
+  function bindModalDismissal(modal) {
+    if (!modal) {
+      return;
+    }
+    const requestClose = () => {
+      const form = modal.querySelector('#product-edit-form');
+      if (form && form.dataset.dirty === 'true' && !window.confirm('Discard your unsaved changes?')) {
+        return;
+      }
+      if (form) form.dataset.dirty = 'false';
+      closeModal(modal);
+    };
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal || event.target.closest('[data-modal-close]')) requestClose();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !modal.hidden) requestClose();
+    });
+  }
+
+  function toggleFieldsBySubscriptionCategory(subscriptionCategorySelect, formContext) {
+    if (!subscriptionCategorySelect) {
+      return;
+    }
+
+    const updateFieldVisibility = () => {
+      const hasSubscriptionCategory = subscriptionCategorySelect.value && subscriptionCategorySelect.value !== '';
+      
+      // Get all standard price fields and subscription fields in the same form
+      const form = subscriptionCategorySelect.closest('form');
+      if (!form) {
+        return;
+      }
+
+      const standardPriceFields = form.querySelectorAll('[data-field-type="standard-price"]');
+      const subscriptionFields = form.querySelectorAll('[data-field-type="subscription"]');
+
+      if (hasSubscriptionCategory) {
+        // Hide standard price fields and clear their values
+        standardPriceFields.forEach((field) => {
+          field.style.display = 'none';
+          const input = field.querySelector('input');
+          if (input) {
+            // Remove required attribute when hidden without clearing entered values.
+            if (input.hasAttribute('required')) {
+              input.removeAttribute('required');
+              input.dataset.wasRequired = 'true';
+            }
+          }
+        });
+
+        // Show subscription fields
+        subscriptionFields.forEach((field) => {
+          const voiceInput = field.querySelector('[name="voice_monitor_calls_per_day"]');
+          const selectedText = subscriptionCategorySelect.options[subscriptionCategorySelect.selectedIndex]?.text || '';
+          const visible = !voiceInput || /voice\s*monitor/i.test(selectedText);
+          field.style.display = visible ? '' : 'none';
+          if (voiceInput) voiceInput.disabled = !visible;
+        });
+      } else {
+        // Show standard price fields
+        standardPriceFields.forEach((field) => {
+          field.style.display = '';
+          const input = field.querySelector('input');
+          if (input && input.dataset.wasRequired === 'true') {
+            input.setAttribute('required', '');
+            delete input.dataset.wasRequired;
+          }
+        });
+
+        // Hide conditional fields without clearing them, so expanding again preserves input.
+        subscriptionFields.forEach((field) => {
+          field.style.display = 'none';
+          const voiceInput = field.querySelector('[name="voice_monitor_calls_per_day"]');
+          if (voiceInput) voiceInput.disabled = true;
+        });
+      }
+    };
+
+    // Update on change
+    subscriptionCategorySelect.addEventListener('change', updateFieldVisibility);
+    
+    // Initial update
+    updateFieldVisibility();
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const container = document.body;
+    submitOnChange(container);
+    const productLookupCache = new Map();
+
+    async function fetchAdminProductDetails(productId) {
+      const response = await fetch(`/api/admin/shop/products/${productId}`, {
+        headers: {
+          Accept: 'application/json',
+        },
+        credentials: 'same-origin',
+      });
+      if (!response.ok) {
+        throw new Error(`Unable to load product details (${response.status})`);
+      }
+      return response.json();
+    }
+
+    async function fetchAdminProductSearch(query, limit = 10) {
+      const url = new URL('/api/admin/shop/products/search', window.location.origin);
+      url.searchParams.set('q', query);
+      url.searchParams.set('limit', String(limit));
+      const response = await fetch(url.toString(), {
+        headers: {
+          Accept: 'application/json',
+        },
+        credentials: 'same-origin',
+      });
+      if (!response.ok) {
+        throw new Error(`Unable to search products (${response.status})`);
+      }
+      return response.json();
+    }
+
+    async function fetchProductRestrictions(productId) {
+      const response = await fetch(`/api/admin/shop/products/${productId}/restrictions`, {
+        headers: {
+          Accept: 'application/json',
+        },
+        credentials: 'same-origin',
+      });
+      if (!response.ok) {
+        throw new Error(`Unable to load product restrictions (${response.status})`);
+      }
+      return response.json();
+    }
+
+    async function fetchProductFeaturedCompanies(productId) {
+      const response = await fetch(`/api/admin/shop/products/${productId}/featured-companies`, {
+        headers: {
+          Accept: 'application/json',
+        },
+        credentials: 'same-origin',
+      });
+      if (!response.ok) {
+        throw new Error(`Unable to load product featured companies (${response.status})`);
+      }
+      return response.json();
+    }
+
+    async function lookupProductBySku(sku) {
+      const cleaned = sku.trim();
+      if (!cleaned) {
+        return null;
+      }
+      const results = await fetchAdminProductSearch(cleaned, 10);
+      const target = cleaned.toLowerCase();
+      const exact = results.find((product) => String(product.sku || '').toLowerCase() === target);
+      return exact || null;
+    }
+
+    function setLoadingStatus(element, message) {
+      if (!element) {
+        return;
+      }
+      element.textContent = message || '';
+      element.hidden = !message;
+    }
+
+    function setFormLoadingState(form, isLoading) {
+      if (!form) {
+        return;
+      }
+      form.setAttribute('aria-busy', isLoading ? 'true' : 'false');
+      form.querySelectorAll('input, select, textarea, button').forEach((field) => {
+        if (field.hasAttribute('data-modal-close')) {
+          return;
+        }
+        field.disabled = Boolean(isLoading);
+      });
+    }
+
+    function debounce(fn, delay) {
+      let timer = null;
+      return (...args) => {
+        if (timer) {
+          window.clearTimeout(timer);
+        }
+        timer = window.setTimeout(() => fn(...args), delay);
+      };
+    }
+
+    function initialiseSkuTypeahead() {
+      const datalist = document.getElementById('shop-product-sku-suggestions');
+      if (!datalist) {
+        return;
+      }
+      const inputs = Array.from(document.querySelectorAll('input[data-sku-lookup="true"]'));
+      if (!inputs.length) {
+        return;
+      }
+
+      let latestQuery = '';
+      const updateSuggestions = debounce(async (value) => {
+        const query = String(value || '').trim();
+        latestQuery = query;
+        if (query.length < 2) {
+          datalist.innerHTML = '';
+          return;
+        }
+        try {
+          const results = await fetchAdminProductSearch(query, 8);
+          if (latestQuery !== query) {
+            return;
+          }
+          datalist.innerHTML = '';
+          results.forEach((product) => {
+            const option = document.createElement('option');
+            option.value = product.sku || '';
+            option.label = `${product.name || ''} (${product.sku || ''})`;
+            datalist.appendChild(option);
+            productLookupCache.set(Number(product.id), product);
+          });
+        } catch (error) {
+          console.error('Unable to fetch SKU suggestions', error);
+        }
+      }, 200);
+
+      inputs.forEach((input) => {
+        input.setAttribute('list', 'shop-product-sku-suggestions');
+        input.addEventListener('input', () => {
+          updateSuggestions(input.value);
+        });
+        input.addEventListener('focus', () => {
+          if (String(input.value || '').trim().length >= 2) {
+            updateSuggestions(input.value);
+          }
+        });
+      });
+    }
+
+    function createSkuListManager(listId, errorId, fieldName) {
+      const list = document.getElementById(listId);
+      const errorEl = document.getElementById(errorId);
+      if (!list) {
+        return null;
+      }
+
+      const selectedIds = new Set();
+
+      function showError(msg) {
+        if (errorEl) {
+          errorEl.textContent = msg;
+          errorEl.hidden = !msg;
+        }
+      }
+
+      function renderItem(product) {
+        const li = document.createElement('li');
+        li.className = 'tag';
+        li.dataset.productId = String(product.id);
+
+        const label = document.createElement('span');
+        label.textContent = `${product.name} (${product.sku})`;
+        li.appendChild(label);
+
+        // Hidden input so the product ID is submitted with the form
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = fieldName;
+        input.value = String(product.id);
+        li.appendChild(input);
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'tag__remove';
+        removeBtn.setAttribute('aria-label', `Remove ${product.name}`);
+        removeBtn.textContent = '×';
+        removeBtn.addEventListener('click', () => {
+          selectedIds.delete(Number(product.id));
+          li.remove();
+        });
+        li.appendChild(removeBtn);
+
+        list.appendChild(li);
+      }
+
+      async function addBySku(sku, excludeProductId) {
+        showError('');
+        const trimmed = sku.trim();
+        if (!trimmed) {
+          return false;
+        }
+        let product;
+        try {
+          product = await lookupProductBySku(trimmed);
+        } catch (error) {
+          console.error('Unable to search product by SKU', error);
+          showError('Unable to search products right now. Please try again.');
+          return false;
+        }
+        if (!product) {
+          showError(`No product found with SKU "${sku.trim()}"`);
+          return false;
+        }
+        if (product.archived) {
+          showError(`Product "${product.name}" is archived and cannot be added`);
+          return false;
+        }
+        if (excludeProductId != null && Number(product.id) === Number(excludeProductId)) {
+          showError('A product cannot be its own recommendation');
+          return false;
+        }
+        const numericId = Number(product.id);
+        if (selectedIds.has(numericId)) {
+          showError(`Product "${product.name}" is already in the list`);
+          return false;
+        }
+        selectedIds.add(numericId);
+        productLookupCache.set(numericId, product);
+        renderItem(product);
+        return true;
+      }
+
+      async function initFromIds(ids, excludeProductId) {
+        list.innerHTML = '';
+        selectedIds.clear();
+        showError('');
+        const identifiers = Array.isArray(ids) ? ids : [];
+        for (const id of identifiers) {
+          const numericId = Number(id);
+          if (!Number.isFinite(numericId) || numericId <= 0) {
+            continue;
+          }
+          let product = productLookupCache.get(numericId);
+          if (!product) {
+            try {
+              product = await fetchAdminProductDetails(numericId);
+              productLookupCache.set(numericId, product);
+            } catch (error) {
+              console.error('Unable to hydrate related product', numericId, error);
+              continue;
+            }
+          }
+          if (product && !product.archived) {
+            if (excludeProductId == null || numericId !== Number(excludeProductId)) {
+              selectedIds.add(numericId);
+              renderItem(product);
+            }
+          }
+        }
+      }
+
+      return { addBySku, initFromIds, showError };
+    }
+
+    // Create form SKU list managers
+    const createCrossManager = createSkuListManager(
+      'product-cross-sell-list',
+      'create-cross-sell-error',
+      'cross_sell_product_ids',
+    );
+    const createUpsellManager = createSkuListManager(
+      'product-upsell-list',
+      'create-upsell-error',
+      'upsell_product_ids',
+    );
+
+    document.querySelectorAll('[data-sku-add][data-form="create"]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const type = btn.getAttribute('data-sku-add');
+        const inputId = type === 'cross-sell' ? 'product-cross-sell-sku' : 'product-upsell-sku';
+        const manager = type === 'cross-sell' ? createCrossManager : createUpsellManager;
+        const input = document.getElementById(inputId);
+        if (!input || !manager) {
+          return;
+        }
+        if (await manager.addBySku(input.value, null)) {
+          input.value = '';
+        }
+      });
+    });
+
+    // Allow pressing Enter in the SKU input to add
+    ['product-cross-sell-sku', 'product-upsell-sku'].forEach((inputId) => {
+      const input = document.getElementById(inputId);
+      if (!input) {
+        return;
+      }
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          const addBtn = input.closest('.form-quick-add')
+            ? input.closest('.form-quick-add').querySelector('[data-sku-add]')
+            : null;
+          if (addBtn) {
+            addBtn.click();
+          }
+        }
+      });
+    });
+
+    // The compact product and subscription modals each have independent
+    // recommendation pickers, so selections never leak between forms.
+    document.querySelectorAll('[data-create-relation]').forEach((button) => {
+      const prefix = button.dataset.prefix;
+      const relation = button.dataset.createRelation;
+      const manager = createSkuListManager(
+        `${prefix}-${relation}-list`,
+        `${prefix}-${relation}-error`,
+        relation === 'cross-sell' ? 'cross_sell_product_ids' : 'upsell_product_ids',
+      );
+      const input = document.getElementById(`${prefix}-${relation}-sku`);
+      if (!manager || !input) {
+        return;
+      }
+      const add = async () => {
+        if (await manager.addBySku(input.value, null)) {
+          input.value = '';
+        }
+      };
+      button.addEventListener('click', add);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          add();
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-create-features]').forEach((editor) => {
+      const body = editor.querySelector('tbody');
+      const dataInput = editor.querySelector('[data-create-features-data]');
+      const addButton = editor.querySelector('[data-add-create-feature]');
+      if (!body || !dataInput || !addButton) {
+        return;
+      }
+      const sync = () => {
+        dataInput.value = JSON.stringify(Array.from(body.querySelectorAll('[data-feature-row]')).map((row) => ({
+          name: row.querySelector('[data-feature-name]').value.trim(),
+          value: row.querySelector('[data-feature-value]').value.trim(),
+        })));
+      };
+      addButton.addEventListener('click', () => {
+        const empty = body.querySelector('[data-empty-feature]');
+        if (empty) empty.remove();
+        const row = document.createElement('tr');
+        row.dataset.featureRow = 'true';
+        row.innerHTML = '<td><input class="form-input" data-feature-name required /></td><td><input class="form-input" data-feature-value /></td><td class="table__actions"><button type="button" class="button button--ghost button--small">Remove</button></td>';
+        row.querySelectorAll('input').forEach((input) => input.addEventListener('input', sync));
+        row.querySelector('button').addEventListener('click', () => { row.remove(); sync(); });
+        body.appendChild(row);
+        row.querySelector('input').focus();
+        sync();
+      });
+    });
+
+    initialiseSkuTypeahead();
+
+    // Initialize field visibility toggle for create form
+    const createSubscriptionCategorySelect = document.getElementById('product-subscription-category');
+    if (createSubscriptionCategorySelect) {
+      toggleFieldsBySubscriptionCategory(createSubscriptionCategorySelect, 'create');
+    }
+
+    const stockFilter = document.getElementById('stock-filter');
+    const categoryFilter = document.getElementById('category-filter');
+    const showArchivedCheckbox = document.getElementById('show-archived');
+    const productsTable = document.getElementById('admin-products-table');
+
+    // ── Column visibility ────────────────────────────────────────────────────
+    const COLUMNS_STORAGE_KEY = 'shop_admin_columns';
+    const FILTER_STATE_KEY = 'shop_admin_filter_state';
+    const COLUMN_KEYS = ['image', 'name', 'sku', 'vendor-sku', 'dbp', 'price', 'vip', 'profit', 'vip-profit', 'category', 'stock'];
+
+    function loadColumnPrefs() {
+      try {
+        const raw = localStorage.getItem(COLUMNS_STORAGE_KEY);
+        if (raw) {
+          return JSON.parse(raw);
+        }
+      } catch (e) {
+        console.warn('shop_admin: could not load column preferences', e);
+      }
+      return {};
+    }
+
+    function saveColumnPrefs(prefs) {
+      try {
+        localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify(prefs));
+      } catch (e) {
+        console.warn('shop_admin: could not save column preferences', e);
+      }
+    }
+
+    function applyColumnVisibility(columnKey, visible) {
+      if (!productsTable) {
+        return;
+      }
+      productsTable.querySelectorAll(`[data-column="${columnKey}"]`).forEach((cell) => {
+        cell.style.display = visible ? '' : 'none';
+      });
+    }
+
+    const columnsDropdown = document.getElementById('columns-dropdown');
+    const columnsToggle = document.getElementById('columns-toggle');
+    const columnsMenu = document.getElementById('columns-menu');
+
+    if (columnsToggle && columnsMenu && columnsDropdown) {
+      columnsToggle.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const isOpen = columnsMenu.classList.contains('dropdown__menu--open');
+        columnsMenu.classList.toggle('dropdown__menu--open', !isOpen);
+        columnsToggle.setAttribute('aria-expanded', String(!isOpen));
+      });
+
+      document.addEventListener('click', (event) => {
+        if (!columnsDropdown.contains(event.target)) {
+          columnsMenu.classList.remove('dropdown__menu--open');
+          columnsToggle.setAttribute('aria-expanded', 'false');
+        }
+      });
+    }
+
+    const columnPrefs = loadColumnPrefs();
+
+    COLUMN_KEYS.forEach((key) => {
+      const visible = columnPrefs[key] !== false;
+      applyColumnVisibility(key, visible);
+      const checkbox = columnsMenu ? columnsMenu.querySelector(`[data-column-toggle="${key}"]`) : null;
+      if (checkbox) {
+        checkbox.checked = visible;
+        checkbox.addEventListener('change', () => {
+          const prefs = loadColumnPrefs();
+          prefs[key] = checkbox.checked;
+          saveColumnPrefs(prefs);
+          applyColumnVisibility(key, checkbox.checked);
+        });
+      }
+    });
+    // ── End column visibility ─────────────────────────────────────────────────
+
+    function applyFilters() {
+      if (!productsTable) {
+        return;
+      }
+      const rows = productsTable.querySelectorAll('tbody tr');
+      const stockValue = stockFilter ? stockFilter.value : '';
+      const categoryValue = categoryFilter ? categoryFilter.value : '';
+      rows.forEach((row) => {
+        const stock = Number(row.getAttribute('data-stock') || '0');
+        const matchesStock =
+          !stockValue ||
+          (stockValue === 'in' && stock > 0) ||
+          (stockValue === 'out' && stock === 0);
+        const rowCategory = row.getAttribute('data-category') || '';
+        const matchesCategory = !categoryValue || rowCategory === categoryValue;
+        row.style.display = matchesStock && matchesCategory ? '' : 'none';
+      });
+    }
+
+    const adminProductSearch = document.querySelector('[data-admin-product-search]');
+    let adminProductSearchTimer = null;
+
+    function updateAdminProductSearch() {
+      if (!adminProductSearch) {
+        return;
+      }
+      const url = new URL(window.location.href);
+      const searchTerm = adminProductSearch.value.trim();
+      if (searchTerm) {
+        url.searchParams.set('search', searchTerm);
+      } else {
+        url.searchParams.delete('search');
+      }
+      url.searchParams.delete('page');
+      window.location.href = url.toString();
+    }
+
+    if (adminProductSearch) {
+      adminProductSearch.addEventListener('input', () => {
+        if (adminProductSearchTimer) {
+          window.clearTimeout(adminProductSearchTimer);
+        }
+        adminProductSearchTimer = window.setTimeout(updateAdminProductSearch, 450);
+      });
+      adminProductSearch.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          if (adminProductSearchTimer) {
+            window.clearTimeout(adminProductSearchTimer);
+          }
+          updateAdminProductSearch();
+        }
+      });
+    }
+
+    if (stockFilter) {
+      stockFilter.addEventListener('change', applyFilters);
+    }
+    if (categoryFilter) {
+      categoryFilter.addEventListener('change', applyFilters);
+    }
+    if (showArchivedCheckbox) {
+      showArchivedCheckbox.addEventListener('change', () => {
+        const url = new URL(window.location.href);
+        if (showArchivedCheckbox.checked) {
+          url.searchParams.set('showArchived', '1');
+        } else {
+          url.searchParams.delete('showArchived');
+        }
+        url.searchParams.delete('page');
+        window.location.href = url.toString();
+      });
+    }
+    applyFilters();
+
+    // Restore filter state saved before a save-product redirect
+    try {
+      const savedState = sessionStorage.getItem(FILTER_STATE_KEY);
+      if (savedState) {
+        const state = JSON.parse(savedState);
+        sessionStorage.removeItem(FILTER_STATE_KEY);
+        if (stockFilter && state.stock != null) {
+          stockFilter.value = state.stock;
+          stockFilter.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        if (categoryFilter && state.category != null) {
+          categoryFilter.value = state.category;
+          categoryFilter.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        const searchInput = document.querySelector('[data-admin-product-search]');
+        if (searchInput && state.search != null) {
+          searchInput.value = state.search;
+          searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        applyFilters();
+      }
+    } catch (e) {
+      // ignore sessionStorage errors
+    }
+
+    const importModal = document.getElementById('import-product-modal');
+    const createProductModal = document.getElementById('create-product-modal');
+    const createSubscriptionModal = document.getElementById('create-subscription-modal');
+    const editModal = document.getElementById('product-edit-modal');
+    const subscriptionEditModal = document.getElementById('subscription-edit-modal');
+    const editModalContent = editModal ? editModal.querySelector('.modal__content') : null;
+    const visibilityModal = document.getElementById('product-visibility-modal');
+    const featuredModal = document.getElementById('product-featured-modal');
+    const descriptionEditorModal = document.getElementById('description-editor-modal');
+    const priceHistoryModal = document.getElementById('price-history-modal');
+    const editForm = document.getElementById('product-edit-form');
+    const visibilityForm = document.getElementById('product-visibility-form');
+    const featuredForm = document.getElementById('product-featured-form');
+    const visibilityLoadingStatus = document.getElementById('product-visibility-loading-status');
+    const featuredLoadingStatus = document.getElementById('product-featured-loading-status');
+    const imageFilenameDisplay = document.getElementById('edit-product-image-filename');
+    const imagePreview = document.getElementById('edit-product-image-preview');
+    const availabilitySelect = document.getElementById('edit-product-availability');
+    const removeImageOption = document.getElementById('edit-product-remove-image-option');
+    const removeImageInput = document.getElementById('edit-product-remove-image');
+    const editLoadingStatus = document.getElementById('edit-product-loading-status');
+    const editIdField = document.getElementById('edit-product-id');
+    const featuresTable = document.getElementById('edit-product-features-table');
+    const featuresTableBody = featuresTable ? featuresTable.querySelector('tbody') : null;
+    const featuresDataInput = document.getElementById('edit-product-features-data');
+    const addFeatureButton = document.getElementById('add-product-feature');
+    const expandDescriptionButton = document.getElementById('edit-description-expand');
+    const descriptionEditorField = document.getElementById('description-editor-field');
+    const descriptionEditorApply = document.getElementById('description-editor-apply');
+    const descriptionEditorCancel = document.getElementById('description-editor-cancel');
+    const descriptionEditorClose = document.getElementById('description-editor-close');
+
+    let descriptionSunEditor = null;
+
+    function sanitizeDescriptionHtml(value) {
+      const html = String(value || '');
+      if (typeof DOMPurify !== 'undefined') {
+        return DOMPurify.sanitize(html);
+      }
+      // DOMPurify must be loaded before this script; return empty string as a
+      // safe fallback rather than inserting unsanitized HTML.
+      console.error('DOMPurify is not loaded. HTML content will not be rendered.');
+      return '';
+    }
+
+    function getOrCreateDescriptionEditor() {
+      if (descriptionSunEditor) {
+        return descriptionSunEditor;
+      }
+      if (!descriptionEditorField || typeof SUNEDITOR === 'undefined') {
+        return null;
+      }
+      descriptionSunEditor = SUNEDITOR.create(descriptionEditorField, {
+        width: '100%',
+        height: '400',
+        buttonList: [
+          ['undo', 'redo'],
+          ['bold', 'underline', 'italic', 'strike'],
+          ['fontColor', 'hiliteColor'],
+          ['outdent', 'indent'],
+          ['align', 'horizontalRule', 'list', 'lineHeight'],
+          ['link'],
+          ['removeFormat'],
+          ['codeView'],
+        ],
+      });
+      return descriptionSunEditor;
+    }
+
+    function openDescriptionEditor() {
+      const descriptionTextarea = editForm ? editForm.querySelector('#edit-product-description') : null;
+      if (!descriptionEditorModal || !descriptionTextarea) {
+        return;
+      }
+      const currentValue = descriptionTextarea.value || '';
+      const editor = getOrCreateDescriptionEditor();
+      if (editor) {
+        editor.setContents(sanitizeDescriptionHtml(currentValue));
+      } else if (descriptionEditorField) {
+        descriptionEditorField.value = currentValue;
+      }
+      descriptionEditorModal.hidden = false;
+      descriptionEditorModal.classList.add('is-visible');
+    }
+
+    function applyDescriptionEditor() {
+      const descriptionTextarea = editForm ? editForm.querySelector('#edit-product-description') : null;
+      if (!descriptionTextarea) {
+        return;
+      }
+      if (descriptionSunEditor) {
+        descriptionTextarea.value = sanitizeDescriptionHtml(descriptionSunEditor.getContents());
+      } else if (descriptionEditorField) {
+        descriptionTextarea.value = sanitizeDescriptionHtml(descriptionEditorField.value);
+      }
+      closeDescriptionEditor();
+    }
+
+    function closeDescriptionEditor() {
+      if (!descriptionEditorModal) {
+        return;
+      }
+      descriptionEditorModal.classList.remove('is-visible');
+      descriptionEditorModal.hidden = true;
+    }
+
+    if (expandDescriptionButton) {
+      expandDescriptionButton.addEventListener('click', openDescriptionEditor);
+    }
+    if (descriptionEditorApply) {
+      descriptionEditorApply.addEventListener('click', applyDescriptionEditor);
+    }
+    if (descriptionEditorCancel) {
+      descriptionEditorCancel.addEventListener('click', closeDescriptionEditor);
+    }
+    if (descriptionEditorClose) {
+      descriptionEditorClose.addEventListener('click', closeDescriptionEditor);
+    }
+    if (descriptionEditorModal) {
+      descriptionEditorModal.addEventListener('click', (event) => {
+        if (event.target === descriptionEditorModal) {
+          closeDescriptionEditor();
+        }
+      });
+    }
+
+    function dispatchFeatureTableUpdate() {
+      if (!featuresTable) {
+        return;
+      }
+      featuresTable.dispatchEvent(new CustomEvent('table:rows-updated', { bubbles: true }));
+    }
+
+    function getFeatureRows() {
+      if (!featuresTableBody) {
+        return [];
+      }
+      return Array.from(featuresTableBody.querySelectorAll('tr[data-feature-row="true"]'));
+    }
+
+    function refreshFeatureInput() {
+      if (!featuresDataInput) {
+        dispatchFeatureTableUpdate();
+        return;
+      }
+      const rows = getFeatureRows();
+      const payload = rows.map((row, index) => {
+        const nameInput = row.querySelector('input[data-feature-name]');
+        const valueInput = row.querySelector('input[data-feature-value]');
+        return {
+          name: nameInput ? nameInput.value.trim() : '',
+          value: valueInput ? valueInput.value.trim() : '',
+          position: index,
+        };
+      });
+      featuresDataInput.value = JSON.stringify(payload);
+      dispatchFeatureTableUpdate();
+    }
+
+    function clearFeatureTable() {
+      if (featuresTableBody) {
+        featuresTableBody.innerHTML = '';
+      }
+    }
+
+    function addEmptyFeatureRow() {
+      if (!featuresTableBody) {
+        return;
+      }
+      const row = document.createElement('tr');
+      row.dataset.emptyRow = 'true';
+      const cell = document.createElement('td');
+      cell.colSpan = 3;
+      cell.className = 'table__empty';
+      cell.textContent = 'No features added yet.';
+      row.appendChild(cell);
+      featuresTableBody.appendChild(row);
+      dispatchFeatureTableUpdate();
+    }
+
+    function removeEmptyFeatureRow() {
+      if (!featuresTableBody) {
+        return;
+      }
+      const emptyRow = featuresTableBody.querySelector('tr[data-empty-row="true"]');
+      if (emptyRow) {
+        emptyRow.remove();
+      }
+    }
+
+    function createFeatureRow(feature) {
+      if (!featuresTableBody) {
+        return null;
+      }
+      const safeFeature = feature && typeof feature === 'object' ? feature : {};
+      const nameValue = typeof safeFeature.name === 'string' ? safeFeature.name : '';
+      const valueValue = typeof safeFeature.value === 'string' ? safeFeature.value : '';
+
+      const row = document.createElement('tr');
+      row.dataset.featureRow = 'true';
+      if (safeFeature.id != null) {
+        row.dataset.featureId = String(safeFeature.id);
+      }
+
+      const nameCell = document.createElement('td');
+      nameCell.setAttribute('data-label', 'Feature');
+      nameCell.dataset.value = nameValue;
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.className = 'form-input';
+      nameInput.required = true;
+      nameInput.placeholder = 'Feature name';
+      nameInput.value = nameValue;
+      nameInput.setAttribute('data-feature-name', 'true');
+      nameInput.addEventListener('input', () => {
+        nameCell.dataset.value = nameInput.value.trim();
+        refreshFeatureInput();
+      });
+      nameCell.appendChild(nameInput);
+
+      const valueCell = document.createElement('td');
+      valueCell.setAttribute('data-label', 'Value');
+      valueCell.dataset.value = valueValue;
+      const valueInput = document.createElement('input');
+      valueInput.type = 'text';
+      valueInput.className = 'form-input';
+      valueInput.placeholder = 'Feature value';
+      valueInput.value = valueValue;
+      valueInput.setAttribute('data-feature-value', 'true');
+      valueInput.addEventListener('input', () => {
+        valueCell.dataset.value = valueInput.value.trim();
+        refreshFeatureInput();
+      });
+      valueCell.appendChild(valueInput);
+
+      const actionsCell = document.createElement('td');
+      actionsCell.className = 'table__actions';
+      const editButton = document.createElement('button');
+      editButton.type = 'button';
+      editButton.className = 'button button--ghost button--small';
+      editButton.textContent = 'Edit';
+      editButton.setAttribute('aria-label', `Edit ${nameValue || 'feature'}`);
+      editButton.addEventListener('click', () => nameInput.focus());
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.className = 'button button--ghost button--small button--danger';
+      removeButton.textContent = 'Remove';
+      removeButton.setAttribute('aria-label', 'Remove feature');
+      removeButton.addEventListener('click', () => {
+        row.remove();
+        if (!getFeatureRows().length) {
+          addEmptyFeatureRow();
+        }
+        refreshFeatureInput();
+      });
+      actionsCell.appendChild(editButton);
+      actionsCell.appendChild(removeButton);
+
+      row.appendChild(nameCell);
+      row.appendChild(valueCell);
+      row.appendChild(actionsCell);
+
+      return row;
+    }
+
+    function addFeatureRow(feature) {
+      if (!featuresTableBody) {
+        return;
+      }
+      removeEmptyFeatureRow();
+      const row = createFeatureRow(feature);
+      if (!row) {
+        return;
+      }
+      featuresTableBody.appendChild(row);
+      refreshFeatureInput();
+      const nameInput = row.querySelector('input[data-feature-name]');
+      if (nameInput) {
+        nameInput.focus();
+        nameInput.select();
+      }
+    }
+
+    function renderFeatureRows(features) {
+      if (!featuresTableBody) {
+        return;
+      }
+      clearFeatureTable();
+      const items = Array.isArray(features) ? features : [];
+      if (items.length) {
+        items.forEach((item) => {
+          const row = createFeatureRow(item);
+          if (row) {
+            featuresTableBody.appendChild(row);
+          }
+        });
+      } else {
+        addEmptyFeatureRow();
+      }
+      refreshFeatureInput();
+    }
+
+    bindModalDismissal(importModal);
+    bindModalDismissal(createProductModal);
+    bindModalDismissal(createSubscriptionModal);
+    bindModalDismissal(editModal);
+    bindModalDismissal(subscriptionEditModal);
+    bindModalDismissal(visibilityModal);
+    bindModalDismissal(featuredModal);
+    bindModalDismissal(priceHistoryModal);
+
+    // Edit form SKU list managers (modal)
+    let currentEditProductId = null;
+    const editCrossManager = createSkuListManager(
+      'edit-product-cross-sell-list',
+      'edit-cross-sell-error',
+      'cross_sell_product_ids',
+    );
+    const editUpsellManager = createSkuListManager(
+      'edit-product-upsell-list',
+      'edit-upsell-error',
+      'upsell_product_ids',
+    );
+
+    function renderInboundLinks(products, relation) {
+      const list = document.getElementById(`edit-product-linked-${relation}-list`);
+      const empty = document.getElementById(`edit-linked-${relation}-empty`);
+      if (!list) return;
+      list.innerHTML = '';
+      const items = Array.isArray(products) ? products : [];
+      if (empty) empty.hidden = items.length > 0;
+      items.forEach((product) => {
+        const item = document.createElement('li');
+        item.className = 'tag';
+        const label = document.createElement('span');
+        label.textContent = `${product.name} (${product.sku})${product.archived ? ' — archived' : ''}`;
+        item.appendChild(label);
+        const removeButton = document.createElement('button');
+        removeButton.type = 'button';
+        removeButton.className = 'tag__remove';
+        removeButton.setAttribute('aria-label', `Remove link from ${product.name}`);
+        removeButton.textContent = '×';
+        removeButton.addEventListener('click', () => {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = relation === 'cross-sell'
+            ? 'remove_inbound_cross_sell_product_ids'
+            : 'remove_inbound_upsell_product_ids';
+          input.value = String(product.id);
+          editForm.appendChild(input);
+          item.remove();
+          if (empty && !list.children.length) empty.hidden = false;
+        });
+        item.appendChild(removeButton);
+        list.appendChild(item);
+      });
+    }
+
+    document.querySelectorAll('[data-sku-add][data-form="edit"]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const type = btn.getAttribute('data-sku-add');
+        const inputId = type === 'cross-sell' ? 'edit-product-cross-sell-sku' : 'edit-product-upsell-sku';
+        const manager = type === 'cross-sell' ? editCrossManager : editUpsellManager;
+        const input = document.getElementById(inputId);
+        if (!input || !manager) {
+          return;
+        }
+        if (await manager.addBySku(input.value, currentEditProductId)) {
+          input.value = '';
+        }
+      });
+    });
+
+    // Allow pressing Enter in the edit SKU inputs to add
+    ['edit-product-cross-sell-sku', 'edit-product-upsell-sku'].forEach((inputId) => {
+      const input = document.getElementById(inputId);
+      if (!input) {
+        return;
+      }
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          const addBtn = input.closest('.form-quick-add')
+            ? input.closest('.form-quick-add').querySelector('[data-sku-add]')
+            : null;
+          if (addBtn) {
+            addBtn.click();
+          }
+        }
+      });
+    });
+
+    if (importModal) {
+      const importSkuInput = importModal.querySelector('#import-vendor-sku');
+      document.querySelectorAll('[data-import-product-modal-open]').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          openModal(importModal);
+          if (importSkuInput && typeof importSkuInput.focus === 'function') {
+            importSkuInput.focus();
+            importSkuInput.select();
+          }
+        });
+      });
+    }
+
+    [
+      ['[data-create-product-modal-open]', createProductModal],
+      ['[data-create-subscription-modal-open]', createSubscriptionModal],
+    ].forEach(([selector, modal]) => {
+      document.querySelectorAll(selector).forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          closeParentHeaderMenu(button);
+          openModal(modal);
+          const firstInput = modal ? modal.querySelector('input:not([type="hidden"])') : null;
+          if (firstInput) firstInput.focus();
+        });
+      });
+    });
+
+    container.querySelectorAll('[data-product-edit]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = Number(button.getAttribute('data-product-edit'));
+        if (!Number.isFinite(id) || id <= 0 || !editForm || !editIdField) {
+          return;
+        }
+        closeParentHeaderMenu(button);
+
+        setLoadingStatus(editLoadingStatus, 'Loading product details…');
+        setFormLoadingState(editForm, true);
+        let product;
+        try {
+          product = await fetchAdminProductDetails(id);
+          productLookupCache.set(id, product);
+        } catch (error) {
+          console.error('Unable to load product details', error);
+          setLoadingStatus(editLoadingStatus, 'Unable to load product details. Please try again.');
+          setFormLoadingState(editForm, false);
+          return;
+        }
+
+        editIdField.value = String(id);
+        editForm.action = `/shop/admin/product/${id}`;
+        editForm.querySelector('#edit-product-name').value = product.name || '';
+        editForm.querySelector('#edit-product-sku').value = product.sku || '';
+        editForm.querySelector('#edit-product-vendor').value = product.vendor_sku || '';
+        editForm.querySelector('#edit-product-description').value = product.description || '';
+        const productLinkField = editForm.querySelector('#edit-product-link');
+        if (productLinkField) {
+          productLinkField.value = product.product_link || '';
+        }
+        editForm.querySelector('#edit-product-price').value = product.price != null ? product.price : '';
+        editForm.querySelector('#edit-product-vip').value = product.vip_price != null ? product.vip_price : '';
+        editForm.querySelector('#edit-product-stock').value = product.stock != null ? product.stock : '';
+        const stockLabel = editForm.querySelector('#edit-product-stock-label');
+        const stockHelp = editForm.querySelector('#edit-product-stock-help');
+        const isSubscription = product.subscription_category_id != null;
+        const activeEditModal = isSubscription ? subscriptionEditModal : editModal;
+        if (activeEditModal && editModalContent && editModalContent.parentElement !== activeEditModal) {
+          activeEditModal.appendChild(editModalContent);
+        }
+        openModal(activeEditModal);
+        const editTitle = editModalContent.querySelector('#edit-product-title');
+        const editSubtitle = editModalContent.querySelector('#edit-product-subtitle');
+        const invoiceDescriptionField = editForm.querySelector('#edit-product-invoice-description-field');
+        const invoiceDescriptionInput = editForm.querySelector('#edit-product-invoice-description');
+        if (editTitle) editTitle.textContent = isSubscription ? 'Edit subscription' : 'Edit product';
+        if (editSubtitle) {
+          editSubtitle.textContent = isSubscription
+            ? 'Update this subscription and its billing options.'
+            : 'Update this catalogue product.';
+        }
+        if (invoiceDescriptionField) invoiceDescriptionField.hidden = !isSubscription;
+        if (invoiceDescriptionInput) {
+          invoiceDescriptionInput.disabled = !isSubscription;
+          invoiceDescriptionInput.value = isSubscription ? (product.invoice_description || '') : '';
+        }
+        if (stockLabel) {
+          stockLabel.textContent = isSubscription ? 'Availability' : 'Stock quantity';
+          stockLabel.htmlFor = isSubscription ? 'edit-product-availability' : 'edit-product-stock';
+        }
+        const submitButton = editForm.querySelector('#edit-product-submit');
+        if (submitButton) submitButton.textContent = isSubscription ? 'Save subscription' : 'Save product';
+        if (stockHelp) stockHelp.textContent = 'The number of physical units available.';
+        const stockInput = editForm.querySelector('#edit-product-stock');
+        if (stockInput) {
+          stockInput.hidden = isSubscription;
+          stockInput.disabled = isSubscription;
+          stockInput.max = '';
+        }
+        if (availabilitySelect) {
+          availabilitySelect.hidden = !isSubscription;
+          availabilitySelect.disabled = !isSubscription;
+          availabilitySelect.name = isSubscription ? 'stock' : '';
+          availabilitySelect.value = Number(product.stock) > 0 ? '1' : '0';
+        }
+        const categorySelect = editForm.querySelector('#edit-product-category');
+        if (categorySelect) {
+          categorySelect.value = product.category_id || '';
+        }
+        const subscriptionCategorySelect = editForm.querySelector('#edit-product-subscription-category');
+        if (subscriptionCategorySelect) {
+          subscriptionCategorySelect.value = product.subscription_category_id || '';
+          // Initialize field visibility toggle for edit modal
+          toggleFieldsBySubscriptionCategory(subscriptionCategorySelect, 'edit');
+        }
+        const commitmentTypeSelect = editForm.querySelector('#edit-product-commitment-type');
+        if (commitmentTypeSelect) {
+          commitmentTypeSelect.value = product.commitment_type || '';
+        }
+        const paymentFrequencySelect = editForm.querySelector('#edit-product-payment-frequency');
+        if (paymentFrequencySelect) {
+          paymentFrequencySelect.value = product.payment_frequency || '';
+        }
+        const priceMonthlyCommitment = editForm.querySelector('#edit-product-price-monthly-commitment');
+        if (priceMonthlyCommitment) {
+          priceMonthlyCommitment.value = product.price_monthly_commitment != null ? product.price_monthly_commitment : '';
+        }
+        const priceAnnualMonthly = editForm.querySelector('#edit-product-price-annual-monthly');
+        if (priceAnnualMonthly) {
+          priceAnnualMonthly.value = product.price_annual_monthly_payment != null ? product.price_annual_monthly_payment : '';
+        }
+        const priceAnnualAnnual = editForm.querySelector('#edit-product-price-annual-annual');
+        if (priceAnnualAnnual) {
+          priceAnnualAnnual.value = product.price_annual_annual_payment != null ? product.price_annual_annual_payment : '';
+        }
+        const voiceMonitorCallsPerDay = editForm.querySelector('#edit-product-voice-monitor-calls-per-day');
+        if (voiceMonitorCallsPerDay) {
+          voiceMonitorCallsPerDay.value = product.voice_monitor_calls_per_day != null ? product.voice_monitor_calls_per_day : '';
+        }
+        if (editCrossManager) {
+          await editCrossManager.initFromIds(product.cross_sell_product_ids || [], id);
+        }
+        if (editUpsellManager) {
+          await editUpsellManager.initFromIds(product.upsell_product_ids || [], id);
+        }
+        editForm.querySelectorAll('input[name^="remove_inbound_"]').forEach((input) => input.remove());
+        renderInboundLinks(product.linked_from_cross_sell_products, 'cross-sell');
+        renderInboundLinks(product.linked_from_upsell_products, 'upsell');
+        currentEditProductId = id;
+        if (removeImageInput) removeImageInput.checked = false;
+        if (removeImageOption) removeImageOption.hidden = !product.image_url;
+        if (imageFilenameDisplay) {
+          if (product.image_url) {
+            const filename = product.image_url.split('/').pop();
+            imageFilenameDisplay.textContent = `Current image: ${filename}`;
+            imageFilenameDisplay.hidden = false;
+            if (imagePreview) {
+              imagePreview.querySelector('img').src = product.image_url;
+              imagePreview.hidden = false;
+            }
+          } else {
+            imageFilenameDisplay.hidden = true;
+            if (imagePreview) imagePreview.hidden = true;
+          }
+        }
+        editForm.dataset.dirty = 'false';
+        renderFeatureRows(product.features || []);
+        setLoadingStatus(editLoadingStatus, '');
+        setFormLoadingState(editForm, false);
+      });
+    });
+
+    const requestedEditProductId = Number(
+      new URLSearchParams(window.location.search).get('editProduct')
+    );
+    if (Number.isInteger(requestedEditProductId) && requestedEditProductId > 0) {
+      const requestedEditButton = container.querySelector(
+        `[data-product-edit="${requestedEditProductId}"]`
+      );
+      if (requestedEditButton) {
+        requestedEditButton.click();
+      }
+    }
+
+    container.querySelectorAll('[data-product-visibility]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = Number(button.getAttribute('data-product-visibility'));
+        const form = visibilityForm;
+        if (!form) {
+          return;
+        }
+        closeParentHeaderMenu(button);
+        form.action = `/shop/admin/product/${id}/visibility`;
+        setLoadingStatus(visibilityLoadingStatus, 'Loading visibility restrictions…');
+        setFormLoadingState(form, true);
+        openModal(visibilityModal);
+
+        let restrictions = [];
+        try {
+          restrictions = await fetchProductRestrictions(id);
+        } catch (error) {
+          console.error('Unable to load product visibility restrictions', error);
+          setLoadingStatus(visibilityLoadingStatus, 'Unable to load restrictions. Please try again.');
+          setFormLoadingState(form, false);
+          return;
+        }
+
+        const selected = restrictions.map((entry) => Number(entry.company_id));
+        form.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
+          const value = Number(checkbox.value);
+          checkbox.checked = selected.includes(value);
+        });
+        setLoadingStatus(visibilityLoadingStatus, '');
+        setFormLoadingState(form, false);
+      });
+    });
+
+    container.querySelectorAll('[data-product-featured]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = Number(button.getAttribute('data-product-featured'));
+        const form = featuredForm;
+        if (!form) {
+          return;
+        }
+        closeParentHeaderMenu(button);
+        form.action = `/shop/admin/product/${id}/featured`;
+        setLoadingStatus(featuredLoadingStatus, 'Loading featured product settings…');
+        setFormLoadingState(form, true);
+        openModal(featuredModal);
+
+        let featuredCompanies = [];
+        try {
+          featuredCompanies = await fetchProductFeaturedCompanies(id);
+        } catch (error) {
+          console.error('Unable to load product featured companies', error);
+          setLoadingStatus(featuredLoadingStatus, 'Unable to load featured product settings. Please try again.');
+          setFormLoadingState(form, false);
+          return;
+        }
+
+        const selected = featuredCompanies.map((entry) => Number(entry.company_id));
+        form.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
+          const value = Number(checkbox.value);
+          checkbox.checked = selected.includes(value);
+        });
+        setLoadingStatus(featuredLoadingStatus, '');
+        setFormLoadingState(form, false);
+      });
+    });
+
+    container.querySelectorAll('[data-product-price-history]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        if (!priceHistoryModal) {
+          return;
+        }
+        closeParentHeaderMenu(button);
+        const id = Number(button.getAttribute('data-product-price-history'));
+        const sku = button.getAttribute('data-product-sku') || '';
+        const skuLabel = document.getElementById('price-history-sku-label');
+        const loadingStatus = document.getElementById('price-history-loading-status');
+        const tableWrapper = document.getElementById('price-history-table-wrapper');
+        const tbody = document.getElementById('price-history-tbody');
+        const emptyMessage = document.getElementById('price-history-empty');
+
+        if (skuLabel) skuLabel.textContent = `SKU: ${sku}`;
+        if (loadingStatus) loadingStatus.hidden = false;
+        if (tableWrapper) tableWrapper.hidden = true;
+        if (emptyMessage) emptyMessage.hidden = true;
+        if (tbody) tbody.innerHTML = '';
+        openModal(priceHistoryModal);
+
+        let history = [];
+        try {
+          const response = await fetch(`/api/admin/shop/products/${id}/price-history`, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          history = await response.json();
+        } catch (error) {
+          console.error('Unable to load price history', error);
+          if (loadingStatus) {
+            loadingStatus.textContent = 'Unable to load price history. Please try again.';
+            loadingStatus.hidden = false;
+          }
+          return;
+        }
+
+        if (loadingStatus) loadingStatus.hidden = true;
+
+        if (!history || history.length === 0) {
+          if (emptyMessage) emptyMessage.hidden = false;
+          return;
+        }
+
+        if (tbody) {
+          history.forEach((entry) => {
+            const tr = document.createElement('tr');
+            const dateTd = document.createElement('td');
+            const dbpTd = document.createElement('td');
+            dateTd.textContent = entry.recorded_at
+              ? new Date(entry.recorded_at).toLocaleString()
+              : '—';
+            dbpTd.textContent = entry.dbp !== null && entry.dbp !== undefined
+              ? `$${parseFloat(entry.dbp).toFixed(2)}`
+              : '—';
+            tr.appendChild(dateTd);
+            tr.appendChild(dbpTd);
+            tbody.appendChild(tr);
+          });
+        }
+        if (tableWrapper) tableWrapper.hidden = false;
+      });
+    });
+
+    if (addFeatureButton) {
+      addFeatureButton.addEventListener('click', () => {
+        addFeatureRow({ name: '', value: '' });
+      });
+    }
+
+    const imageInput = document.getElementById('edit-product-image');
+    if (imageInput && imagePreview) {
+      imageInput.addEventListener('change', () => {
+        const file = imageInput.files && imageInput.files[0];
+        if (!file) return;
+        if (removeImageInput) removeImageInput.checked = false;
+        imagePreview.querySelector('img').src = URL.createObjectURL(file);
+        imagePreview.hidden = false;
+        if (imageFilenameDisplay) {
+          imageFilenameDisplay.textContent = `Replacement image: ${file.name}`;
+          imageFilenameDisplay.hidden = false;
+        }
+      });
+    }
+
+    if (editForm) {
+      editForm.addEventListener('input', () => { editForm.dataset.dirty = 'true'; });
+      editForm.addEventListener('change', () => { editForm.dataset.dirty = 'true'; });
+      editForm.addEventListener('submit', () => {
+        editForm.dataset.dirty = 'false';
+        const submitButton = editForm.querySelector('#edit-product-submit');
+        if (submitButton) {
+          submitButton.disabled = true;
+          submitButton.setAttribute('aria-busy', 'true');
+        }
+        refreshFeatureInput();
+        // Append current URL params to form action so the server can redirect back to the same filtered view
+        try {
+          const actionUrl = new URL(editForm.action, window.location.href);
+          const current = new URL(window.location.href);
+          ['showArchived', 'search'].forEach((param) => {
+            const value = current.searchParams.get(param);
+            if (value !== null) {
+              actionUrl.searchParams.set(param, value);
+            }
+          });
+          editForm.action = actionUrl.toString();
+        } catch (e) {
+          // ignore URL manipulation errors
+        }
+        // Save client-side filter state for restoration after redirect
+        try {
+          const state = {};
+          if (stockFilter) {
+            state.stock = stockFilter.value;
+          }
+          if (categoryFilter) {
+            state.category = categoryFilter.value;
+          }
+          const searchInput = document.querySelector('[data-admin-product-search]');
+          if (searchInput) {
+            state.search = searchInput.value;
+          }
+          sessionStorage.setItem(FILTER_STATE_KEY, JSON.stringify(state));
+        } catch (e) {
+          // ignore sessionStorage errors
+        }
+      });
+    }
+  });
+})();

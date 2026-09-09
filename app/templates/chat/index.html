@@ -1,0 +1,380 @@
+{% extends "base.html" %}
+
+{% block header_title %}Chat{% endblock %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_actions %}
+  {% set chat_actions = [
+    {"label": "New chat", "variant": "primary", "type": "button",
+     "attrs": {"data-create-chat-modal-open": "", "aria-haspopup": "dialog", "aria-controls": "create-chat-modal"}},
+  ] %}
+  {% if is_super_admin | default(false) %}
+    {% set chat_actions = chat_actions + [{"label": "AI tag synonyms", "type": "link", "href": "/admin/chat/ai-tag-synonyms"}, {"label": "Auto-assign rules", "type": "link", "href": "/chat/auto-assign"}] %}
+  {% endif %}
+  {% if is_super_admin | default(false) %}
+    {% set chat_actions = chat_actions + [{"label": "Delete selected", "variant": "danger", "type": "button", "attrs": {"id": "bulk-delete-chats", "disabled": "disabled"}}] %}
+  {% endif %}
+  {{ page_header_actions(chat_actions) }}
+{% endblock %}
+
+{% block content %}
+<section class="card card--panel">
+  {% if csrf_token %}<input type="hidden" id="chat-csrf-token" value="{{ csrf_token }}" />{% endif %}
+  <header class="card__header">
+    <div class="card__controls">
+      <form method="get" autocomplete="off" class="tickets-toolbar__form" id="chat-filter-form">
+        <div class="tickets-toolbar__field form-field--checkbox">
+          <label class="form-checkbox" for="chat-show-closed-filter">
+            <input
+              id="chat-show-closed-filter"
+              type="checkbox"
+              name="show_closed"
+              value="1"
+              data-auto-filter
+              {% if show_closed_filter %}checked{% endif %}
+            />
+            <span>Show Closed Chats</span>
+          </label>
+        </div>
+        {% if is_staff %}
+        <div class="tickets-toolbar__field">
+          <label class="form-label" for="chat-unattended-filter">Show</label>
+          <select id="chat-unattended-filter" name="unattended" class="form-input" data-auto-filter>
+            <option value="">All sessions</option>
+            <option value="1" {% if unattended_filter == '1' %}selected{% endif %}>Unattended only</option>
+          </select>
+        </div>
+        {% endif %}
+        <div class="tickets-toolbar__field">
+          <label class="form-label" for="chat-table-filter">Filter chats</label>
+          <input
+            id="chat-table-filter"
+            type="search"
+            class="form-input"
+            placeholder="Filter chats…"
+            data-table-filter="chat-rooms-table"
+          />
+        </div>
+      </form>
+      <div class="ticket-columns" data-chat-columns>
+        <button type="button" class="button button--ghost ticket-columns__toggle" data-columns-toggle aria-haspopup="true" aria-expanded="false">
+          Columns
+          <span class="ticket-columns__chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="ticket-columns__panel" data-columns-panel hidden>
+          <p class="ticket-columns__title">Toggle columns</p>
+          <div class="ticket-columns__options">
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="id" checked />
+              <span>ID</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="subject" checked disabled />
+              <span>Subject</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="device" checked />
+              <span>Device</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="company" checked />
+              <span>Company</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="console-user" checked />
+              <span>Console user</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="status" checked />
+              <span>Status</span>
+            </label>
+            {% if is_staff %}
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="assigned" checked />
+              <span>Assigned to</span>
+            </label>
+            {% endif %}
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="created" checked />
+              <span>Created</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="last-message" checked />
+              <span>Last message</span>
+            </label>
+            <label class="ticket-columns__option">
+              <input type="checkbox" class="chat-column-toggle" data-column="actions" checked />
+              <span>Actions</span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+  {% if not rooms %}
+    <div class="alert alert--info" role="status">No chats found.{% if not is_staff %} Start a new chat to begin.{% endif %}</div>
+  {% endif %}
+  <div class="table-wrapper">
+    <table class="table" id="chat-rooms-table" data-table>
+      <thead>
+        <tr>
+          {% if is_super_admin | default(false) %}
+          <th scope="col" data-column="select"><span class="sr-only">Select</span><input type="checkbox" id="select-all-chats" aria-label="Select all chats" /></th>
+          {% endif %}
+          <th scope="col" data-column="id" data-sort="int">ID</th>
+          <th scope="col" data-column="subject" data-sort="string">Subject</th>
+          <th scope="col" data-column="device" data-sort="string">Device</th>
+          <th scope="col" data-column="company" data-sort="string">Company</th>
+          <th scope="col" data-column="console-user" data-sort="string">Console user</th>
+          <th scope="col" data-column="status" data-sort="string">Status</th>
+          {% if is_staff %}
+          <th scope="col" data-column="assigned" data-sort="string">Assigned to</th>
+          {% endif %}
+          <th scope="col" data-column="created" data-sort="date">Created</th>
+          <th scope="col" data-column="last-message" data-sort="date">Last message</th>
+          <th scope="col" data-column="actions">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for room in rooms %}
+        <tr>
+          {% if is_super_admin | default(false) %}
+          <td data-column="select" data-label="Select"><input type="checkbox" class="chat-bulk-select" value="{{ room.id }}" aria-label="Select chat {{ room.id }}" /></td>
+          {% endif %}
+          <td data-column="id" data-label="ID">{{ room.id }}</td>
+          <td data-column="subject" data-label="Subject">
+            <a href="/chat/{{ room.id }}">{{ room.subject | e }}</a>
+            {% if is_staff and room.status == 'open' and (room.tech_participant_count is not defined or room.tech_participant_count == 0) %}
+              <span class="badge badge--warning" title="No technician has joined this chat">Unattended</span>
+            {% endif %}
+          </td>
+          <td data-column="device" data-label="Device">{{ room.device_name or '—' }}</td>
+          <td data-column="company" data-label="Company">{{ room.company_name or '—' }}</td>
+          <td data-column="console-user" data-label="Console user">{{ room.console_user or '—' }}</td>
+          <td data-column="status" data-label="Status">
+            <span class="badge badge--{% if room.status == 'open' %}operational{% else %}neutral{% endif %}">
+              {{ room.status | capitalize }}
+            </span>
+          </td>
+          {% if is_staff %}
+          <td data-column="assigned" data-label="Assigned to">
+            {% if room.assigned_tech_display_name %}
+              {{ room.assigned_tech_display_name | e }}
+            {% elif room.assigned_tech_user_id %}
+              Tech #{{ room.assigned_tech_user_id }}
+            {% else %}
+              <span class="text-muted">Unassigned</span>
+            {% endif %}
+          </td>
+          {% endif %}
+          <td data-column="created" data-label="Created">{{ room.created_at | default('—') }}</td>
+          <td data-column="last-message" data-label="Last message">{{ room.last_message_at | default('—') }}</td>
+          <td class="table-actions" data-column="actions" data-label="Actions">
+            <a href="/chat/{{ room.id }}" class="button button--sm">Open</a>
+            {% if is_staff and room.status == 'open' %}
+              <button class="button button--sm button--secondary btn-assign-join"
+                      data-room-id="{{ room.id }}"
+                      data-assigned="{{ room.assigned_tech_user_id | default('') }}"
+                      title="Assign to me and join">
+                {% if room.assigned_tech_user_id %}Reassign & Join{% else %}Assign & Join{% endif %}
+              </button>
+            {% endif %}
+            {% if room.status == 'open' and (is_staff or room.created_by_user_id == current_user_id) %}
+              <button type="button"
+                      class="button button--sm button--danger btn-close-chat"
+                      data-room-id="{{ room.id }}"
+                      data-room-subject="{{ room.subject | e }}">
+                Close Chat
+              </button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- Create chat modal -->
+<div id="create-chat-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="create-chat-title" hidden>
+  <div class="modal__backdrop" data-modal-close></div>
+  <div class="modal__panel">
+    <header class="modal__header">
+      <h2 id="create-chat-title" class="modal__title">New Chat</h2>
+      <button type="button" class="modal__close" data-modal-close aria-label="Close">×</button>
+    </header>
+    <form id="create-chat-form" class="modal__body" method="post">
+      {% if csrf_token %}
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+      {% endif %}
+      <div class="form-group">
+        <label class="form-label required" for="chat-subject">Subject</label>
+        <input type="text" id="chat-subject" name="subject" class="form-input" required maxlength="500" placeholder="Describe your issue…" />
+      </div>
+      <footer class="modal__footer">
+        <button type="submit" class="button button--primary" id="create-chat-submit">Start chat</button>
+        <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+      </footer>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/chat_columns.js') }}" defer></script>
+<script>
+(function () {
+  const openBtn = document.querySelector('[data-create-chat-modal-open]');
+  const modal = document.getElementById('create-chat-modal');
+  const closeBtns = modal ? modal.querySelectorAll('[data-modal-close]') : [];
+
+  function openModal() { if (modal) { modal.hidden = false; modal.querySelector('input')?.focus(); } }
+  function closeModal() { if (modal) modal.hidden = true; }
+
+  openBtn?.addEventListener('click', openModal);
+  closeBtns.forEach(b => b.addEventListener('click', closeModal));
+
+  const form = document.getElementById('create-chat-form');
+  form?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const submit = document.getElementById('create-chat-submit');
+    submit.disabled = true;
+    const subject = document.getElementById('chat-subject').value.trim();
+    const csrf = form.querySelector('[name="_csrf"]')?.value;
+    try {
+      const resp = await fetch('/api/chat/rooms', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf || ''},
+        body: JSON.stringify({subject}),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        window.location.href = '/chat/' + data.id;
+      } else {
+        const err = await resp.json();
+        alert(err.detail || 'Failed to create chat');
+        submit.disabled = false;
+      }
+    } catch(err) {
+      alert('Network error: ' + err.message);
+      submit.disabled = false;
+    }
+  });
+
+  // Auto-submit filter form on select change
+  document.querySelectorAll('[data-auto-filter]').forEach(el => {
+    el.addEventListener('change', () => document.getElementById('chat-filter-form').submit());
+  });
+
+  // Bulk delete controls for super admins
+  const csrf = document.getElementById('chat-csrf-token')?.value || document.querySelector('[name="_csrf"]')?.value || '';
+  const bulkDeleteButton = document.getElementById('bulk-delete-chats');
+  const selectAllChats = document.getElementById('select-all-chats');
+  const chatSelectBoxes = Array.from(document.querySelectorAll('.chat-bulk-select'));
+
+  function selectedChatIds() {
+    return chatSelectBoxes.filter(box => box.checked).map(box => Number(box.value));
+  }
+
+  function refreshBulkDeleteState() {
+    const selectedCount = selectedChatIds().length;
+    if (bulkDeleteButton) {
+      bulkDeleteButton.disabled = selectedCount === 0;
+      bulkDeleteButton.textContent = selectedCount ? `Delete selected (${selectedCount})` : 'Delete selected';
+    }
+    if (selectAllChats) {
+      selectAllChats.checked = selectedCount > 0 && selectedCount === chatSelectBoxes.length;
+      selectAllChats.indeterminate = selectedCount > 0 && selectedCount < chatSelectBoxes.length;
+    }
+  }
+
+  selectAllChats?.addEventListener('change', function() {
+    chatSelectBoxes.forEach(box => { box.checked = this.checked; });
+    refreshBulkDeleteState();
+  });
+
+  chatSelectBoxes.forEach(box => box.addEventListener('change', refreshBulkDeleteState));
+
+  bulkDeleteButton?.addEventListener('click', async function() {
+    const roomIds = selectedChatIds();
+    if (!roomIds.length) return;
+    const plural = roomIds.length === 1 ? 'chat' : 'chats';
+    if (!confirm(`Permanently delete ${roomIds.length} selected ${plural}? This removes messages, participants, invites, and sync links.`)) return;
+    this.disabled = true;
+    try {
+      const resp = await fetch('/api/chat/rooms', {
+        method: 'DELETE',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+        body: JSON.stringify({room_ids: roomIds}),
+      });
+      if (resp.ok) {
+        window.location.reload();
+      } else {
+        const err = await resp.json();
+        alert(err.detail || 'Failed to delete selected chats');
+        refreshBulkDeleteState();
+      }
+    } catch(err) {
+      alert('Network error: ' + err.message);
+      refreshBulkDeleteState();
+    }
+  });
+
+  refreshBulkDeleteState();
+
+  // Assign & Join buttons
+  document.querySelectorAll('.btn-assign-join').forEach(btn => {
+    btn.addEventListener('click', async function() {
+      const roomId = this.dataset.roomId;
+      const alreadyAssigned = this.dataset.assigned;
+      if (alreadyAssigned && !confirm('This room is already assigned. Reassign to yourself?')) return;
+      this.disabled = true;
+      try {
+        const assignResp = await fetch(`/api/chat/rooms/${roomId}/assign`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+          body: '{}',
+        });
+        if (!assignResp.ok) {
+          const err = await assignResp.json();
+          alert(err.detail || 'Failed to assign');
+          this.disabled = false;
+          return;
+        }
+        window.location.href = '/chat/' + roomId;
+      } catch(err) {
+        alert('Network error: ' + err.message);
+        this.disabled = false;
+      }
+    });
+  });
+
+  // Close chat buttons
+  document.querySelectorAll('.btn-close-chat').forEach(btn => {
+    btn.addEventListener('click', async function() {
+      const roomId = this.dataset.roomId;
+      const subject = this.dataset.roomSubject || `chat #${roomId}`;
+      if (!confirm(`Close “${subject}”?`)) return;
+      this.disabled = true;
+      try {
+        const resp = await fetch(`/api/chat/rooms/${roomId}/close`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+          body: '{}',
+        });
+        if (resp.ok) {
+          window.location.reload();
+        } else {
+          const err = await resp.json();
+          alert(err.detail || 'Failed to close chat');
+          this.disabled = false;
+        }
+      } catch(err) {
+        alert('Network error: ' + err.message);
+        this.disabled = false;
+      }
+    });
+  });
+})();
+</script>
+{% endblock %}

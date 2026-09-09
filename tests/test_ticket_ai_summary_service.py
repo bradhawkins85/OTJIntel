@@ -1,0 +1,364 @@
+from typing import Any
+import json
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+sys.modules.setdefault(
+    "magic",
+    SimpleNamespace(
+        Magic=lambda *args, **kwargs: None,
+        from_buffer=lambda *args, **kwargs: "application/octet-stream",
+    ),
+)
+
+from app.services import tickets as tickets_service
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def _stub_emit_ticket_updates(monkeypatch):
+    async def fake_emit_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(tickets_service, "emit_ticket_updated_event", fake_emit_event)
+
+
+@pytest.mark.anyio
+async def test_refresh_ticket_ai_summary_updates_summary(monkeypatch):
+    updates: list[dict[str, Any]] = []
+
+    async def fake_get_ticket(ticket_id):
+        return {
+            "id": ticket_id,
+            "subject": "Printer issue",
+            "description": "The printer is jammed",
+            "status": "open",
+            "priority": "high",
+            "requester_id": 7,
+            "assigned_user_id": None,
+        }
+
+    async def fake_list_replies(ticket_id, include_internal=True):
+        return [
+            {
+                "ticket_id": ticket_id,
+                "author_id": 12,
+                "body": "We replaced the toner and it works now.",
+                "is_internal": False,
+                "created_at": None,
+            }
+        ]
+
+    async def fake_get_user(user_id):
+        return {"id": user_id, "email": f"user{user_id}@example.test"}
+
+    async def fake_trigger(slug, payload, *, background=True, on_complete=None):
+        assert slug == "ollama"
+        assert "Printer issue" in payload.get("prompt", "")
+        result = {
+            "status": "succeeded",
+            "model": "llama3",
+            "response": '{"summary": "Printer fixed after toner replacement.", "resolution": "Likely Resolved"}',
+        }
+        if on_complete:
+            await on_complete(result)
+        return result
+
+    async def fake_update(ticket_id, **fields):
+        updates.append(fields)
+
+    monkeypatch.setattr(tickets_service.tickets_repo, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(tickets_service.tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_service.tickets_repo, "update_ticket", fake_update)
+    monkeypatch.setattr(tickets_service.user_repo, "get_user_by_id", fake_get_user)
+    monkeypatch.setattr(tickets_service.modules_service, "trigger_module", fake_trigger)
+
+    await tickets_service.refresh_ticket_ai_summary(5)
+
+    assert len(updates) >= 2
+    assert updates[0]["ai_summary_status"] == "queued"
+    final_update = updates[-1]
+    assert final_update["ai_summary"] == "Printer fixed after toner replacement."
+    assert final_update["ai_resolution_state"] == "likely_resolved"
+    assert final_update["ai_summary_status"] == "succeeded"
+    assert final_update["ai_summary_model"] == "llama3"
+    assert final_update["ai_summary_updated_at"] is not None
+
+
+@pytest.mark.anyio
+async def test_refresh_ticket_ai_summary_handles_missing_module(monkeypatch):
+    updates: list[dict[str, Any]] = []
+
+    async def fake_get_ticket(ticket_id):
+        return {"id": ticket_id, "subject": "Issue", "description": "", "status": "open", "priority": "normal"}
+
+    async def fake_update(ticket_id, **fields):
+        updates.append(fields)
+
+    async def fake_list_replies(*args, **kwargs):
+        return []
+
+    async def fake_get_user(_):
+        return None
+
+    monkeypatch.setattr(tickets_service.tickets_repo, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(tickets_service.tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_service.tickets_repo, "update_ticket", fake_update)
+    monkeypatch.setattr(tickets_service.user_repo, "get_user_by_id", fake_get_user)
+
+    async def fake_trigger(slug, payload, *, background=True, on_complete=None):
+        raise ValueError("module not configured")
+
+    monkeypatch.setattr(tickets_service.modules_service, "trigger_module", fake_trigger)
+
+    await tickets_service.refresh_ticket_ai_summary(9)
+
+    assert updates
+    assert updates[-1]["ai_summary_status"] == "skipped"
+    assert updates[-1]["ai_summary"] is None
+    assert updates[-1]["ai_resolution_state"] is None
+
+
+@pytest.mark.anyio
+async def test_refresh_ticket_ai_summary_handles_errors(monkeypatch):
+    updates: list[dict[str, Any]] = []
+
+    async def fake_get_ticket(ticket_id):
+        return {"id": ticket_id, "subject": "Issue", "description": "", "status": "open", "priority": "normal"}
+
+    async def fake_update(ticket_id, **fields):
+        updates.append(fields)
+
+    async def fake_list_replies(*args, **kwargs):
+        return []
+
+    async def fake_get_user(_):
+        return None
+
+    monkeypatch.setattr(tickets_service.tickets_repo, "get_ticket", fake_get_ticket)
+    monkeypatch.setattr(tickets_service.tickets_repo, "list_replies", fake_list_replies)
+    monkeypatch.setattr(tickets_service.tickets_repo, "update_ticket", fake_update)
+    monkeypatch.setattr(tickets_service.user_repo, "get_user_by_id", fake_get_user)
+
+    async def fake_trigger(slug, payload, *, background=True, on_complete=None):
+        raise RuntimeError("network error")
+
+    monkeypatch.setattr(tickets_service.modules_service, "trigger_module", fake_trigger)
+
+    await tickets_service.refresh_ticket_ai_summary(11)
+
+    assert updates
+    assert updates[-1]["ai_summary_status"] == "error"
+    assert updates[-1]["ai_summary"] is None
+    assert updates[-1]["ai_resolution_state"] is None
+
+
+def test_extract_summary_fields_from_markdown_block():
+    payload = "```json\n{\"summary\": \"Issue resolved\", \"resolution\": \"Likely Resolved\"}\n```"
+
+    summary, resolution = tickets_service._extract_summary_fields(payload)
+
+    assert summary == "Issue resolved"
+    assert resolution == "Likely Resolved"
+
+
+def test_extract_summary_fields_from_triple_quoted_block():
+    payload = '"""json\n{"summary": "Still working", "resolution": "Likely In Progress"}\n"""'
+
+    summary, resolution = tickets_service._extract_summary_fields(payload)
+
+    assert summary == "Still working"
+    assert resolution == "Likely In Progress"
+
+
+def test_extract_summary_fields_from_html_line_break_json():
+    payload = '{<br />"summary": "Executed CHKDSK verification successfully.",<br />"resolution": "Likely Resolved"<br />}'
+
+    summary, resolution = tickets_service._extract_summary_fields(payload)
+
+    assert summary == "Executed CHKDSK verification successfully."
+    assert resolution == "Likely Resolved"
+
+
+def test_extract_summary_fields_from_html_escaped_json():
+    payload = '{&lt;br /&gt;&quot;summary&quot;: &quot;Disk scan completed.&quot;,&lt;br /&gt;&quot;resolution&quot;: &quot;Likely Resolved&quot;&lt;br /&gt;}'
+
+    summary, resolution = tickets_service._extract_summary_fields(payload)
+
+    assert summary == "Disk scan completed."
+    assert resolution == "Likely Resolved"
+
+
+def test_render_prompt_ignores_signatures_and_reply_markers():
+    ticket = {
+        "id": 1,
+        "subject": "Email outage",
+        "description": (
+            "Users cannot send emails.\n"
+            "--- Reply ABOVE THIS LINE to add a comment ---\n"
+            "Thanks,\n"
+            "Admin Team\n"
+            "CONFIDENTIALITY NOTICE: This message may contain information"
+        ),
+        "status": "open",
+        "priority": "high",
+    }
+    replies = [
+        {
+            "ticket_id": 1,
+            "author_id": 4,
+            "body": (
+                "Investigating SMTP queue delay.\n"
+                "Sent from my iPhone\n"
+                "--- Reply ABOVE THIS LINE to add a comment ---\n"
+                "Unauthorized viewing prohibited."
+            ),
+            "is_internal": False,
+            "created_at": None,
+        }
+    ]
+
+    prompt = tickets_service._render_prompt(ticket, replies, {})
+
+    assert "Investigating SMTP queue delay." in prompt
+    assert "Users cannot send emails." in prompt
+    assert "Reply ABOVE THIS LINE" not in prompt
+    assert "Sent from my iPhone" not in prompt
+    assert "CONFIDENTIALITY NOTICE" not in prompt
+    assert "Unauthorized viewing prohibited." not in prompt
+
+
+def test_render_prompt_discards_content_below_latest_reply_marker():
+    ticket = {
+        "id": 2,
+        "subject": "Firewall alert",
+        "description": "<p>Multiple blocked connections detected.</p>",
+        "status": "open",
+        "priority": "high",
+    }
+    replies = [
+        {
+            "ticket_id": 2,
+            "author_id": 5,
+            "body": (
+                "<div>Latest escalation shared with networking.</div>"
+                "<div>--- Reply ABOVE THIS LINE to add a comment ---</div>"
+                "<div>Investigating possible outage.</div>"
+                "<div>&gt; --- Reply ABOVE THIS LINE to add a comment ---</div>"
+                "<div>&gt; Historical context should be ignored.</div>"
+            ),
+            "is_internal": False,
+            "created_at": None,
+        }
+    ]
+
+    prompt = tickets_service._render_prompt(ticket, replies, {})
+
+    assert "Latest escalation shared with networking." in prompt
+    assert "Investigating possible outage." not in prompt
+    assert "Historical context should be ignored." not in prompt
+    assert "Reply ABOVE THIS LINE" not in prompt
+
+
+def test_strip_conversation_noise_removes_email_headers():
+    text = (
+        "Subject: Weekly Update\n"
+        "From: someone@example.com\n"
+        "Reply-To: reply@example.com\n"
+        "Date: Tue, 1 Jan 2024 10:00:00 +0000\n"
+        "Actual message body line one.\n"
+        "Another line."
+    )
+
+    cleaned = tickets_service._strip_conversation_noise(text)
+
+    assert "Subject:" not in cleaned
+    assert "From:" not in cleaned
+    assert "Reply-To:" not in cleaned
+    assert "Date:" not in cleaned
+    assert "Actual message body line one." in cleaned
+    assert "Another line." in cleaned
+
+
+def test_extract_summary_fields_from_openai_chat_completion_json_string():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "```json\n{\"summary\": \"CHKDSK found errors on BJP-DC-02.\", \"resolution\": \"Likely In Progress\"}\n```",
+                }
+            }
+        ],
+        "model": "gemma4:e2b",
+    }
+
+    summary, resolution = tickets_service._extract_summary_fields(json.dumps(payload))
+
+    assert summary == "CHKDSK found errors on BJP-DC-02."
+    assert resolution == "Likely In Progress"
+
+
+@pytest.mark.parametrize(
+    ("renderer", "final_instruction"),
+    [
+        (tickets_service._render_prompt, '"resolution": "Likely In Progress"'),
+        (tickets_service._render_tags_prompt, "Return JSON containing a 'tags' array"),
+    ],
+)
+def test_ai_ticket_prompts_limit_long_bodies(renderer, final_instruction):
+    ticket = {
+        "id": 27,
+        "subject": "vzdump backup status",
+        "description": "backup log entry 102: completed successfully\n" * 5_000,
+        "status": "new",
+        "priority": "normal",
+        "category": "Email",
+        "module_slug": "m365-mail",
+    }
+    replies = [
+        {
+            "ticket_id": 27,
+            "author_id": None,
+            "body": "Newest customer context remains available.",
+            "is_internal": False,
+            "created_at": None,
+        }
+    ]
+
+    prompt = renderer(ticket, replies, {})
+
+    assert len(prompt) <= tickets_service._MAX_AI_PROMPT_CHARS
+    assert "Ticket subject: vzdump backup status" in prompt
+    assert "Older ticket content truncated" in prompt
+    assert "Newest customer context remains available." in prompt
+    assert final_instruction in prompt
+
+
+@pytest.mark.anyio
+async def test_extract_tags_from_openai_chat_completion_json_string(monkeypatch):
+    async def fake_excluded_tags():
+        return set()
+
+    monkeypatch.setattr(tickets_service, "get_all_excluded_tags", fake_excluded_tags)
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "```json\n{\"tags\": [\"disk-verification\", \"chkdsk-scan\", \"server-health\"]}\n```",
+                }
+            }
+        ],
+        "model": "gemma4:e2b",
+    }
+
+    tags = await tickets_service._extract_tags(json.dumps(payload), {"subject": "BJPSC - Verify"}, [])
+
+    assert tags[:3] == ["disk-verification", "chkdsk-scan", "server-health"]

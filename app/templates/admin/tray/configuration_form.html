@@ -1,0 +1,630 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_title %}<span class="header__title-text">{{ heading }}</span>{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "Back to configurations", "type": "link", "variant": "ghost", "href": "/admin/tray/configurations"}
+  ]) }}
+{% endblock %}
+
+{% block content %}
+<div class="admin-grid">
+  <section class="card card--panel">
+    <header class="card__header">
+      <p class="card__lede">Build the menu tree using the form below. Add rows and use Move up/Move down to reorder them, or use the JSON view as a fallback for advanced edits.</p>
+    </header>
+    <div class="card__body">
+      <form method="post" action="{{ form_action }}" class="form-stack" id="tray-config-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+
+        <div class="form-row">
+          <div class="form-field">
+            <label class="form-label" for="config-name">Name</label>
+            <input class="form-input" id="config-name" name="name" required maxlength="150" value="{{ config.name or '' }}" />
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="config-scope">Scope</label>
+            <select class="form-input" id="config-scope" name="scope">
+              {% for scope in ['global', 'company', 'tag', 'device'] %}
+                <option value="{{ scope }}" {% if config.scope == scope %}selected{% endif %}>{{ scope|capitalize }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="config-scope-ref">Scope target ID</label>
+            <input class="form-input" id="config-scope-ref" name="scope_ref_id" type="number" value="{{ config.scope_ref_id or '' }}" placeholder="Company / Asset / Tag ID" />
+          </div>
+          <div class="form-field form-field--checkbox">
+            <label>
+              <input type="checkbox" name="enabled" {% if config.enabled %}checked{% endif %} value="1" />
+              Enabled
+            </label>
+          </div>
+        </div>
+
+        <div class="form-field">
+          <label class="form-label" for="config-display-text">Display text (rich)</label>
+          <textarea class="form-input" id="config-display-text" name="display_text" rows="4">{{ config.display_text or '' }}</textarea>
+          <p class="form-help">Shown when a "Display text" menu node is clicked. HTML is sanitised server-side.</p>
+        </div>
+
+        <div class="form-field">
+          <label class="form-label" for="config-env-allowlist">Environment variable allowlist (comma separated)</label>
+          <input class="form-input" id="config-env-allowlist" name="env_allowlist" value="{{ config.env_allowlist_csv or '' }}" placeholder="e.g. USERDOMAIN,USERNAME,COMPUTERNAME" />
+          <p class="form-help">Only variables listed here may be requested by an "Env var" menu node. Values are read by the tray client and never persisted on the server.</p>
+        </div>
+
+        <div class="form-field">
+          <label class="form-label" for="config-branding">Branding icon URL</label>
+          <input class="form-input" id="config-branding" name="branding_icon_url" type="url" value="{{ config.branding_icon_url or '' }}" placeholder="https://…" />
+        </div>
+
+        <div class="form-field" data-menu-node-builder>
+          <label class="form-label">Menu nodes</label>
+          <div class="form-stack" id="menu-node-list" aria-live="polite"></div>
+          <div class="form-actions" style="justify-content:flex-start; gap:0.5rem; margin-top:0.5rem;">
+            <button type="button" class="button button--ghost" id="menu-node-add" aria-label="Add menu node">Add node</button>
+            <button type="button" class="button button--ghost" id="menu-node-toggle-json" aria-label="Toggle advanced JSON editor" aria-expanded="false">Advanced JSON</button>
+          </div>
+          <div id="menu-node-json-panel" hidden style="margin-top:0.5rem;">
+            <label class="form-label" for="config-payload">Menu nodes (JSON)</label>
+            <textarea class="form-input form-input--code" id="config-payload" name="payload_json" rows="14" required>{{ config.payload_json or '[]' }}</textarea>
+            <div class="form-actions" style="justify-content:flex-start; gap:0.5rem; margin-top:0.5rem;">
+              <button type="button" class="button button--ghost" id="menu-node-apply-json">Apply JSON to list</button>
+            </div>
+          </div>
+          <p class="form-help" id="menu-node-error" hidden></p>
+          {% if trmm_scripts_error %}
+            <p class="form-help">Tactical RMM scripts could not be loaded: {{ trmm_scripts_error }}</p>
+          {% elif trmm_scripts %}
+            <p class="form-help">Tactical RMM scripts are loaded from the configured TRMM API and can be selected with the <code>TRMM_Script</code> node type.</p>
+          {% else %}
+            <p class="form-help">No Tactical RMM scripts were returned by the configured TRMM API.</p>
+          {% endif %}
+          <p class="form-help">
+            Configure each row with the fields you need. Types: <code>label</code>, <code>app_version</code>, <code>link</code>, <code>submenu</code>,
+            <code>display_text</code>, <code>env_var</code>, <code>open_chat</code>, <code>submit_ticket</code>, <code>submit_syncro_ticket</code>,
+            <code>TRMM_Script</code>, <code>scan_network</code>, <code>refresh_config</code>, <code>separator</code>, <code>quit</code>.
+            Use <code>Level</code> to place nodes under the nearest preceding submenu. Add company visibility conditions to show a node only for selected company IDs or hide it from selected company IDs.
+          </p>
+          <p class="form-help">
+            See <a href="/docs/tray_app">docs/tray_app</a> for the schema.
+          </p>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="button button--primary">Save configuration</button>
+          <a href="/admin/tray/configurations" class="button button--ghost">Cancel</a>
+        </div>
+      </form>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script>
+    (function () {
+      const builder = document.querySelector('[data-menu-node-builder]');
+      if (!builder) return;
+
+      const listEl = document.getElementById('menu-node-list');
+      const addBtn = document.getElementById('menu-node-add');
+      const jsonToggleBtn = document.getElementById('menu-node-toggle-json');
+      const jsonPanel = document.getElementById('menu-node-json-panel');
+      const jsonInput = document.getElementById('config-payload');
+      const applyJsonBtn = document.getElementById('menu-node-apply-json');
+      const errorEl = document.getElementById('menu-node-error');
+      const MAX_LEVEL = 6;
+      // These align with app.schemas.tray.TrayMenuNode Field(max_length=...).
+      const LABEL_MAX = 200;
+      const URL_MAX = 500;
+      const NAME_MAX = 128;
+      const COLOR_MAX = 32;
+      const DEFAULT_MENU_LABEL = 'Menu';
+      const TRMM_SCRIPTS = {{ (trmm_scripts or [])|tojson }};
+      const TRAY_COMPANIES = {{ (companies or [])|tojson }};
+
+      const NODE_TYPES = [
+        'label',
+        'app_version',
+        'link',
+        'submenu',
+        'display_text',
+        'env_var',
+        'open_chat',
+        'submit_ticket',
+        'submit_syncro_ticket',
+        'TRMM_Script',
+        'scan_network',
+        'refresh_config',
+        'separator',
+        'quit'
+      ];
+
+      function escapeHtml(value) {
+        return String(value || '').replace(/[&<>"']/g, (char) => ({
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;'
+        }[char]));
+      }
+
+      function getSelectedScript(row) {
+        const scriptID = Number(row.querySelector('[data-node-script-id]').value) || 0;
+        return TRMM_SCRIPTS.find((script) => Number(script.id) === scriptID) || null;
+      }
+
+      function parseCompanyIDs(value) {
+        const seen = new Set();
+        return String(value || '')
+          .split(',')
+          .map((part) => Number.parseInt(part.trim(), 10))
+          .filter((id) => {
+            if (!Number.isInteger(id) || id <= 0 || seen.has(id)) return false;
+            seen.add(id);
+            return true;
+          });
+      }
+
+      function getCompanyName(companyID) {
+        const company = TRAY_COMPANIES.find((candidate) => Number(candidate.id) === Number(companyID));
+        return company ? String(company.name || `Company #${companyID}`) : `Unknown company #${companyID}`;
+      }
+
+      function createCompanySelectOptions(selectedCompanyIDs = []) {
+        const selectedValue = Array.isArray(selectedCompanyIDs) ? selectedCompanyIDs.join(',') : selectedCompanyIDs;
+        const selectedSet = new Set(parseCompanyIDs(selectedValue));
+        const knownIDs = new Set(TRAY_COMPANIES.map((company) => Number(company.id)));
+        const options = TRAY_COMPANIES.map((company) => {
+          const id = Number(company.id);
+          const label = escapeHtml(String(company.name || `Company #${id}`));
+          const selected = selectedSet.has(id) ? ' selected' : '';
+          return `<option value="${id}"${selected}>${label}</option>`;
+        });
+
+        selectedSet.forEach((id) => {
+          if (knownIDs.has(id)) return;
+          options.push(`<option value="${id}" selected>${escapeHtml(getCompanyName(id))}</option>`);
+        });
+
+        return options.join('');
+      }
+
+      function getSelectedCompanyIDs(selectEl) {
+        return parseCompanyIDs(Array.from(selectEl.selectedOptions).map((option) => option.value).join(','));
+      }
+
+      function setSelectedCompanyIDs(selectEl, companyIDs) {
+        const selectedIDs = parseCompanyIDs(Array.isArray(companyIDs) ? companyIDs.join(',') : companyIDs);
+        selectEl.innerHTML = createCompanySelectOptions(selectedIDs);
+      }
+
+      function showError(message) {
+        if (!errorEl) return;
+        if (!message) {
+          errorEl.hidden = true;
+          errorEl.textContent = '';
+          return;
+        }
+        errorEl.hidden = false;
+        errorEl.textContent = message;
+      }
+
+      let syncScheduled = false;
+      let rowCounter = 0;
+
+      function scheduleSyncJsonFromRows() {
+        if (syncScheduled) return;
+        syncScheduled = true;
+        window.requestAnimationFrame(() => {
+          syncScheduled = false;
+          syncJsonFromRows();
+        });
+      }
+
+      function setFieldVisibility(row) {
+        const type = row.querySelector('[data-node-type]').value;
+        row.querySelector('[data-wrap-url]').hidden = type !== 'link';
+        row.querySelector('[data-wrap-name]').hidden = type !== 'env_var';
+        row.querySelector('[data-wrap-text]').hidden = type !== 'display_text';
+        row.querySelector('[data-wrap-script]').hidden = type !== 'TRMM_Script';
+        row.querySelector('[data-wrap-color]').hidden = type === 'separator';
+      }
+
+      function getSummaryText(row) {
+        const type = row.querySelector('[data-node-type]').value;
+        if (type === 'separator') return '— separator —';
+        if (type === 'app_version') {
+          const label = row.querySelector('[data-node-label]').value.trim();
+          return label ? `${label} (app version)` : 'Version (app version)';
+        }
+        if (type === 'env_var') {
+          const name = row.querySelector('[data-node-name]').value.trim();
+          return name || '(no name)';
+        }
+        if (type === 'TRMM_Script') {
+          const script = getSelectedScript(row);
+          return script ? script.name : '(no TRMM script selected)';
+        }
+        const label = row.querySelector('[data-node-label]').value.trim();
+        return label || '(no label)';
+      }
+
+      function updateSummary(row) {
+        const summaryEl = row.querySelector('[data-node-summary]');
+        const badgeEl = row.querySelector('[data-node-type-badge]');
+        if (summaryEl) summaryEl.textContent = getSummaryText(row);
+        if (badgeEl) badgeEl.textContent = row.querySelector('[data-node-type]').value;
+      }
+
+      function getRowLevel(row) {
+        return Math.max(0, Math.min(MAX_LEVEL, Number(row.querySelector('[data-node-level]').value) || 0));
+      }
+
+      function updateRowIndent(row) {
+        const level = getRowLevel(row);
+        row.dataset.nodeLevel = String(level);
+        row.style.marginInlineStart = level ? `calc(${level} * 1.5rem)` : '0';
+        row.style.borderInlineStart = level ? '3px solid var(--color-primary, #2563eb)' : '';
+        row.style.width = level ? `calc(100% - (${level} * 1.5rem))` : '100%';
+        const levelBadge = row.querySelector('[data-node-level-badge]');
+        if (levelBadge) levelBadge.textContent = `Level ${level}`;
+      }
+
+      function updateAllRowIndents() {
+        Array.from(listEl.children).forEach(updateRowIndent);
+      }
+
+      function createRow(node = {}, level = 0, expanded = false) {
+        const rowId = `menu-node-${rowCounter++}`;
+        const row = document.createElement('div');
+        row.className = 'card card--panel';
+        row.style.padding = '0.75rem';
+        row.style.transition = 'margin-inline-start 0.16s ease, width 0.16s ease';
+        row.innerHTML = `
+          <div data-node-header style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; user-select:none;">
+            <button type="button" class="button button--ghost" data-collapse-toggle aria-expanded="${expanded}" aria-label="${expanded ? 'Collapse node' : 'Expand node'}" style="padding:0.25rem 0.5rem; min-width:2rem; flex-shrink:0;">${expanded ? '▼' : '▶'}</button>
+            <span data-node-summary style="font-weight:500; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+            <span data-node-level-badge style="font-size:0.75em; opacity:0.65; flex-shrink:0;"></span>
+            <span data-node-type-badge style="font-size:0.75em; opacity:0.6; flex-shrink:0;"></span>
+          </div>
+          <div data-node-body ${expanded ? '' : 'hidden'}>
+            <div class="form-row" style="margin-top:0.5rem;">
+              <div class="form-field" style="max-width:8rem;">
+                <label class="form-label" for="${rowId}-level">Level</label>
+                <input class="form-input" id="${rowId}-level" data-node-level type="number" min="0" max="${MAX_LEVEL}" value="${Math.max(0, Math.min(MAX_LEVEL, Number(level) || 0))}" />
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="${rowId}-type">Type</label>
+                <select class="form-input" id="${rowId}-type" data-node-type>
+                  ${NODE_TYPES.map((type) => `<option value="${type}">${type}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="${rowId}-label">Label</label>
+                <input class="form-input" id="${rowId}-label" data-node-label maxlength="${LABEL_MAX}" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-field" data-wrap-url>
+                <label class="form-label" for="${rowId}-url">URL</label>
+                <input class="form-input" id="${rowId}-url" data-node-url maxlength="${URL_MAX}" placeholder="https://..." />
+              </div>
+              <div class="form-field" data-wrap-name>
+                <label class="form-label" for="${rowId}-name">Env var name</label>
+                <input class="form-input" id="${rowId}-name" data-node-name maxlength="${NAME_MAX}" placeholder="USERNAME" />
+              </div>
+              <div class="form-field" data-wrap-text>
+                <label class="form-label" for="${rowId}-text">Display text (HTML)</label>
+                <textarea class="form-input" id="${rowId}-text" data-node-text rows="2"></textarea>
+              </div>
+              <div class="form-field" data-wrap-script>
+                <label class="form-label" for="${rowId}-script">Tactical RMM script</label>
+                <select class="form-input" id="${rowId}-script" data-node-script-id>
+                  <option value="">Select a TRMM script…</option>
+                  ${TRMM_SCRIPTS.map((script) => `<option value="${script.id}">${escapeHtml(script.name || ('Script #' + script.id))}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-field">
+                <label class="form-label" for="${rowId}-visible-companies">Show only for companies</label>
+                <select class="form-input" id="${rowId}-visible-companies" data-node-visible-company-ids multiple size="6"></select>
+                <p class="form-help">Leave empty to show for every company unless hidden below. Hold Ctrl (Windows) or Cmd (Mac) to select multiple companies.</p>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="${rowId}-hidden-companies">Hide for companies</label>
+                <select class="form-input" id="${rowId}-hidden-companies" data-node-hidden-company-ids multiple size="6"></select>
+                <p class="form-help">Select companies where this menu item should be suppressed.</p>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-field" data-wrap-color style="max-width:12rem;">
+                <label class="form-label" for="${rowId}-color">Text color</label>
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <input type="color" id="${rowId}-color" data-node-color style="width:3rem; height:2rem; padding:0.1rem; border:1px solid var(--color-border, #ccc); border-radius:4px; cursor:pointer;" />
+                  <button type="button" class="button button--ghost" data-action-clear-color style="padding:0.25rem 0.5rem; font-size:0.8em;">Clear</button>
+                  <span data-node-color-preview style="font-size:0.8em; opacity:0.7;"></span>
+                </div>
+              </div>
+            </div>
+            <div class="form-actions" style="justify-content:flex-start; gap:0.5rem;">
+              <button type="button" class="button button--ghost" data-action-up aria-label="Move this node up">Move up</button>
+              <button type="button" class="button button--ghost" data-action-down aria-label="Move this node down">Move down</button>
+              <button type="button" class="button button--ghost" data-action-clone aria-label="Clone this node">Clone</button>
+              <button type="button" class="button button--danger" data-action-remove aria-label="Remove this node">Remove</button>
+            </div>
+          </div>
+        `;
+
+        const typeEl = row.querySelector('[data-node-type]');
+        typeEl.value = NODE_TYPES.includes(node.type) ? node.type : 'label';
+        row.querySelector('[data-node-label]').value = node.label || '';
+        row.querySelector('[data-node-url]').value = node.url || '';
+        row.querySelector('[data-node-name]').value = node.name || '';
+        row.querySelector('[data-node-text]').value = node.text || '';
+        row.querySelector('[data-node-script-id]').value = node.script_id || '';
+        setSelectedCompanyIDs(row.querySelector('[data-node-visible-company-ids]'), node.visible_company_ids);
+        setSelectedCompanyIDs(row.querySelector('[data-node-hidden-company-ids]'), node.hidden_company_ids);
+
+        const colorEl = row.querySelector('[data-node-color]');
+        const colorPreview = row.querySelector('[data-node-color-preview]');
+        // data-node-color tracks whether a color has been explicitly set.
+        // An empty string means "no color" (use OS default).
+        colorEl.dataset.active = node.color ? '1' : '0';
+        if (node.color) {
+          colorEl.value = node.color;
+          colorPreview.textContent = node.color;
+        } else {
+          colorPreview.textContent = '(default)';
+        }
+
+        function updateColorPreview() {
+          if (colorEl.dataset.active === '1') {
+            colorPreview.textContent = colorEl.value;
+          } else {
+            colorPreview.textContent = '(default)';
+          }
+        }
+
+        colorEl.addEventListener('input', () => {
+          colorEl.dataset.active = '1';
+          updateColorPreview();
+          scheduleSyncJsonFromRows();
+        });
+
+        row.querySelector('[data-action-clear-color]').addEventListener('click', (e) => {
+          e.stopPropagation();
+          colorEl.dataset.active = '0';
+          updateColorPreview();
+          scheduleSyncJsonFromRows();
+        });
+
+        updateSummary(row);
+        updateRowIndent(row);
+
+        const toggleBtn = row.querySelector('[data-collapse-toggle]');
+        const body = row.querySelector('[data-node-body]');
+        const header = row.querySelector('[data-node-header]');
+
+        function toggleCollapse() {
+          const isExpanded = !body.hidden;
+          body.hidden = isExpanded;
+          toggleBtn.setAttribute('aria-expanded', String(!isExpanded));
+          toggleBtn.setAttribute('aria-label', isExpanded ? 'Expand node' : 'Collapse node');
+          toggleBtn.textContent = isExpanded ? '▶' : '▼';
+        }
+
+        toggleBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          toggleCollapse();
+        });
+        header.addEventListener('click', () => toggleCollapse());
+
+        row.addEventListener('input', () => {
+          setFieldVisibility(row);
+          updateSummary(row);
+          updateRowIndent(row);
+          scheduleSyncJsonFromRows();
+        });
+        row.addEventListener('change', () => {
+          setFieldVisibility(row);
+          updateSummary(row);
+          updateRowIndent(row);
+          scheduleSyncJsonFromRows();
+        });
+        row.querySelector('[data-action-remove]').addEventListener('click', (e) => {
+          e.stopPropagation();
+          row.remove();
+          updateMoveButtons();
+          syncJsonFromRows();
+        });
+        row.querySelector('[data-action-up]').addEventListener('click', (e) => {
+          e.stopPropagation();
+          const prev = row.previousElementSibling;
+          if (prev) listEl.insertBefore(row, prev);
+          updateMoveButtons();
+          syncJsonFromRows();
+        });
+        row.querySelector('[data-action-down]').addEventListener('click', (e) => {
+          e.stopPropagation();
+          const next = row.nextElementSibling;
+          if (next) listEl.insertBefore(next, row);
+          updateMoveButtons();
+          syncJsonFromRows();
+        });
+        row.querySelector('[data-action-clone]').addEventListener('click', (e) => {
+          e.stopPropagation();
+          const cloneData = readRow(row);
+          const clone = createRow(cloneData, cloneData.level, true);
+          row.insertAdjacentElement('afterend', clone);
+          updateMoveButtons();
+          syncJsonFromRows();
+        });
+
+        setFieldVisibility(row);
+        return row;
+      }
+
+      function flattenNodes(nodes, level = 0, rows = []) {
+        (Array.isArray(nodes) ? nodes : []).forEach((node) => {
+          const candidate = (node && typeof node === 'object') ? node : {};
+          const type = (typeof candidate.type === 'string' && NODE_TYPES.includes(candidate.type)) ? candidate.type : 'label';
+          const rest = {
+            type,
+            label: typeof candidate.label === 'string' ? candidate.label : '',
+            url: typeof candidate.url === 'string' ? candidate.url : '',
+            name: typeof candidate.name === 'string' ? candidate.name : '',
+            text: typeof candidate.text === 'string' ? candidate.text : '',
+            color: typeof candidate.color === 'string' ? candidate.color : '',
+            script_id: Number(candidate.script_id) || 0,
+            script_name: typeof candidate.script_name === 'string' ? candidate.script_name : '',
+            visible_company_ids: parseCompanyIDs(candidate.visible_company_ids),
+            hidden_company_ids: parseCompanyIDs(candidate.hidden_company_ids)
+          };
+          rows.push({ node: rest, level });
+          const children = Array.isArray(candidate.children) ? candidate.children : [];
+          if (children.length) {
+            flattenNodes(children, level + 1, rows);
+          }
+        });
+        return rows;
+      }
+
+      function updateMoveButtons() {
+        const rows = Array.from(listEl.children);
+        rows.forEach((row, index) => {
+          const upBtn = row.querySelector('[data-action-up]');
+          const downBtn = row.querySelector('[data-action-down]');
+          if (upBtn) upBtn.disabled = index === 0;
+          if (downBtn) downBtn.disabled = index === rows.length - 1;
+        });
+        updateAllRowIndents();
+      }
+
+      function appendDefaultRow() {
+        listEl.appendChild(createRow({ type: 'label', label: DEFAULT_MENU_LABEL }, 0, true));
+        updateMoveButtons();
+      }
+
+      function readRow(row) {
+        const colorEl = row.querySelector('[data-node-color]');
+        return {
+          level: getRowLevel(row),
+          type: row.querySelector('[data-node-type]').value,
+          label: row.querySelector('[data-node-label]').value.trim(),
+          url: row.querySelector('[data-node-url]').value.trim(),
+          name: row.querySelector('[data-node-name]').value.trim(),
+          text: row.querySelector('[data-node-text]').value.trim(),
+          color: (colorEl && colorEl.dataset.active === '1') ? colorEl.value.trim() : '',
+          script_id: Number(row.querySelector('[data-node-script-id]').value) || 0,
+          visible_company_ids: getSelectedCompanyIDs(row.querySelector('[data-node-visible-company-ids]')),
+          hidden_company_ids: getSelectedCompanyIDs(row.querySelector('[data-node-hidden-company-ids]'))
+        };
+      }
+
+      function readRows() {
+        return Array.from(listEl.children).map(readRow);
+      }
+
+      function buildNodesFromRows(rows) {
+        const roots = [];
+        const lastAtLevel = [];
+        let missingParentCount = 0;
+        rows.forEach((row) => {
+          const node = { type: row.type };
+          if (row.label) node.label = row.label;
+          if (row.url) node.url = row.url;
+          if (row.name) node.name = row.name;
+          if (row.text) node.text = row.text;
+          if (row.color) node.color = row.color;
+          if (row.visible_company_ids.length) node.visible_company_ids = row.visible_company_ids;
+          if (row.hidden_company_ids.length) node.hidden_company_ids = row.hidden_company_ids;
+          if (row.type === 'TRMM_Script') {
+            if (row.script_id) node.script_id = row.script_id;
+            const script = TRMM_SCRIPTS.find((candidate) => Number(candidate.id) === Number(row.script_id));
+            if (script && script.name) node.script_name = String(script.name).slice(0, LABEL_MAX);
+          }
+          let parent = null;
+          for (let level = row.level - 1; level >= 0; level -= 1) {
+            const candidate = lastAtLevel[level];
+            if (candidate && candidate.type === 'submenu') {
+              parent = candidate;
+              break;
+            }
+          }
+          if (parent) {
+            if (!Array.isArray(parent.children)) parent.children = [];
+            parent.children.push(node);
+          } else {
+            if (row.level > 0) missingParentCount += 1;
+            roots.push(node);
+          }
+          lastAtLevel[row.level] = node;
+          lastAtLevel.length = row.level + 1;
+        });
+        if (missingParentCount > 0) {
+          showError(`Warning: ${missingParentCount} node(s) have level > 0 but no preceding submenu parent. They will appear at the top level.`);
+        }
+        return roots;
+      }
+
+      function syncJsonFromRows() {
+        showError('');
+        const payload = buildNodesFromRows(readRows());
+        jsonInput.value = JSON.stringify(payload, null, 2);
+      }
+
+      function loadJsonIntoRows(rawJson) {
+        let parsed;
+        try {
+          parsed = JSON.parse(rawJson || '[]');
+          if (!Array.isArray(parsed)) {
+            throw new Error('Menu nodes must be a JSON array.');
+          }
+        } catch (err) {
+          showError(err.message || 'Invalid JSON.');
+          return false;
+        }
+
+        listEl.innerHTML = '';
+        const flattened = flattenNodes(parsed);
+        if (!flattened.length) {
+          appendDefaultRow();
+        } else {
+          flattened.forEach((entry) => listEl.appendChild(createRow(entry.node, entry.level)));
+          updateMoveButtons();
+        }
+        syncJsonFromRows();
+        return true;
+      }
+
+      addBtn.addEventListener('click', () => {
+        listEl.appendChild(createRow({ type: 'label' }, 0, true));
+        updateMoveButtons();
+        syncJsonFromRows();
+      });
+
+      jsonToggleBtn.addEventListener('click', () => {
+        const isOpen = !jsonPanel.hidden;
+        jsonPanel.hidden = isOpen;
+        jsonToggleBtn.setAttribute('aria-expanded', String(!isOpen));
+      });
+
+      applyJsonBtn.addEventListener('click', () => {
+        loadJsonIntoRows(jsonInput.value);
+      });
+
+      if (!loadJsonIntoRows(jsonInput.value)) {
+        appendDefaultRow();
+        syncJsonFromRows();
+      }
+    })();
+  </script>
+{% endblock %}

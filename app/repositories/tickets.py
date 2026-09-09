@@ -1,0 +1,2374 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import date, datetime, timezone
+from typing import Any, Iterable, Sequence
+
+from app.core.database import db
+from app.core.logging import log_debug, log_error, log_info
+from app.repositories import site_settings as site_settings_repo
+
+TicketRecord = dict[str, Any]
+
+_UNSET = object()
+_FULLTEXT_MIN_SEARCH_LENGTH = 3
+_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+async def _get_default_labour_type_id() -> int | None:
+    row = await db.fetch_one(
+        """
+        SELECT id
+        FROM ticket_labour_types
+        WHERE is_default = 1
+        LIMIT 1
+        """,
+        (),
+    )
+    if not row:
+        return None
+    try:
+        return int(row.get("id"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+async def _default_labour_type_for_time_entry(
+    minutes_spent: int | None,
+    labour_type_id: int | None,
+) -> int | None:
+    if labour_type_id is not None:
+        return labour_type_id
+    if minutes_spent is None or minutes_spent <= 0:
+        return None
+    return await _get_default_labour_type_id()
+
+
+def _prepare_ticket_search_term(search: str | None) -> tuple[str | None, str | None]:
+    term = (search or "").strip()
+    if not term:
+        return None, None
+
+    if len(term) < _FULLTEXT_MIN_SEARCH_LENGTH:
+        return "like", f"%{term}%"
+
+    is_sqlite_backend = bool(getattr(db, "is_sqlite", lambda: False)())
+    if is_sqlite_backend:
+        return "like", f"%{term}%"
+
+    tokens = [segment.strip() for segment in re.split(r"\s+", term) if segment.strip()]
+    boolean_tokens: list[str] = []
+    for token in tokens:
+        cleaned = re.sub(r"[^0-9A-Za-z]", "", token)
+        if len(cleaned) < _FULLTEXT_MIN_SEARCH_LENGTH:
+            continue
+        boolean_tokens.append(f"+{cleaned}*")
+
+    if boolean_tokens:
+        return "fulltext", " ".join(boolean_tokens)
+    return "like", f"%{term}%"
+
+
+def _append_ticket_search_filter(
+    where: list[str],
+    params: list[Any],
+    *,
+    search: str | None,
+    column_prefix: str = "",
+    include_external_reference: bool = True,
+) -> None:
+    mode, value = _prepare_ticket_search_term(search)
+    if not mode or value is None:
+        return
+
+    prefixed_subject = f"{column_prefix}subject"
+    prefixed_description = f"{column_prefix}description"
+    prefixed_external_reference = f"{column_prefix}external_reference"
+
+    if mode == "fulltext":
+        searchable_columns = [prefixed_subject, prefixed_description]
+        if include_external_reference:
+            searchable_columns.append(prefixed_external_reference)
+        where.append(
+            f"MATCH ({', '.join(searchable_columns)}) AGAINST (%s IN BOOLEAN MODE)"
+        )
+        params.append(value)
+        return
+
+    like_clause = [
+        f"LOWER({prefixed_subject}) LIKE LOWER(%s)",
+        f"LOWER(COALESCE({prefixed_description}, '')) LIKE LOWER(%s)",
+    ]
+    like_params: list[Any] = [value, value]
+    if include_external_reference:
+        like_clause.append(
+            f"LOWER(COALESCE({prefixed_external_reference}, '')) LIKE LOWER(%s)"
+        )
+        like_params.append(value)
+    where.append(f"({' OR '.join(like_clause)})")
+    params.extend(like_params)
+
+
+def _append_ticket_cursor_filter(
+    where: list[str],
+    params: list[Any],
+    *,
+    cursor_updated_at: datetime | None,
+    cursor_id: int | None,
+    column_prefix: str = "",
+) -> None:
+    if cursor_updated_at is None or cursor_id is None:
+        return
+    updated_column = f"{column_prefix}updated_at"
+    id_column = f"{column_prefix}id"
+    where.append(
+        f"({updated_column} < %s OR ({updated_column} = %s AND {id_column} < %s))"
+    )
+    params.extend([cursor_updated_at, cursor_updated_at, int(cursor_id)])
+
+
+def _build_ticket_search_clause(
+    *,
+    search: str | None,
+    column_prefix: str = "",
+    include_external_reference: bool = True,
+) -> tuple[str, list[Any]]:
+    where: list[str] = []
+    params: list[Any] = []
+    _append_ticket_search_filter(
+        where,
+        params,
+        search=search,
+        column_prefix=column_prefix,
+        include_external_reference=include_external_reference,
+    )
+    if not where:
+        return "1=1", []
+    return " AND ".join(where), params
+
+
+def _deserialise_tags(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parts = [
+                segment.strip()
+                for segment in re.split(r"[,\n;]+", text)
+                if segment.strip()
+            ]
+            return parts
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        if isinstance(parsed, str):
+            single = parsed.strip()
+            return [single] if single else []
+        if isinstance(parsed, dict):
+            candidate = parsed.get("tags") or parsed.get("keywords")
+            if candidate:
+                return _deserialise_tags(candidate)
+    return []
+
+
+def _serialise_tags(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        return json.dumps([cleaned], ensure_ascii=False)
+    iterable: Iterable[Any]
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+        iterable = value
+    else:
+        return None
+    tags: list[str] = []
+    for item in iterable:
+        text = str(item).strip()
+        if not text:
+            continue
+        if text not in tags:
+            tags.append(text)
+    return json.dumps(tags, ensure_ascii=False) if tags else None
+
+
+def _make_aware(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return None
+
+
+def _normalise_ticket(row: dict[str, Any]) -> TicketRecord:
+    record = dict(row)
+    for key in (
+        "id",
+        "company_id",
+        "requester_id",
+        "requester_staff_id",
+        "assigned_user_id",
+        "merged_into_ticket_id",
+        "split_from_ticket_id",
+    ):
+        if key in record and record[key] is not None:
+            record[key] = int(record[key])
+    if "review_date" in record:
+        review_date = record.get("review_date")
+        if isinstance(review_date, datetime):
+            record["review_date"] = review_date.date()
+        elif isinstance(review_date, str) and review_date.strip():
+            try:
+                record["review_date"] = date.fromisoformat(review_date.strip()[:10])
+            except ValueError:
+                record["review_date"] = None
+    for key in (
+        "created_at",
+        "updated_at",
+        "closed_at",
+        "status_changed_at",
+        "ai_summary_updated_at",
+        "syncro_updated_at",
+    ):
+        if key in record:
+            record[key] = _make_aware(record.get(key))
+    record["ai_tags"] = _deserialise_tags(record.get("ai_tags"))
+    record["ai_tags_updated_at"] = _make_aware(record.get("ai_tags_updated_at"))
+    return record
+
+
+def _normalise_reply(row: dict[str, Any]) -> TicketRecord:
+    record = dict(row)
+    for key in ("id", "ticket_id", "author_id", "minutes_spent", "labour_type_id"):
+        if key in record and record[key] is not None:
+            record[key] = int(record[key])
+    record["created_at"] = _make_aware(record.get("created_at"))
+    # Normalise email tracking datetime fields
+    for key in (
+        "email_sent_at",
+        "email_opened_at",
+        "email_delivered_at",
+        "email_bounced_at",
+    ):
+        record[key] = _make_aware(record.get(key))
+    if "is_billable" in record:
+        record["is_billable"] = bool(record.get("is_billable"))
+    if not record.get("kind"):
+        record["kind"] = (
+            "internal_note" if bool(record.get("is_internal")) else "message"
+        )
+    labour_name = record.get("labour_type_name")
+    if labour_name is not None:
+        record["labour_type_name"] = str(labour_name)
+    labour_code = record.get("labour_type_code")
+    if labour_code is not None:
+        record["labour_type_code"] = str(labour_code)
+    return record
+
+
+def _normalise_watcher(row: dict[str, Any]) -> TicketRecord:
+    record = dict(row)
+    for key in ("id", "ticket_id", "user_id"):
+        if key in record and record[key] is not None:
+            record[key] = int(record[key])
+    record["created_at"] = _make_aware(record.get("created_at"))
+    if "email" in record and record["email"]:
+        record["email"] = str(record["email"]).strip()
+    return record
+
+
+async def create_ticket(
+    *,
+    subject: str,
+    description: str | None,
+    requester_id: int | None,
+    company_id: int | None,
+    requester_staff_id: int | None = None,
+    assigned_user_id: int | None,
+    priority: str,
+    status: str,
+    category: str | None,
+    module_slug: str | None,
+    external_reference: str | None,
+    ticket_number: str | None = None,
+    id: int | None = None,
+) -> TicketRecord:
+    log_info(
+        "Creating ticket",
+        subject=subject,
+        company_id=company_id,
+        requester_id=requester_id,
+        requester_staff_id=requester_staff_id,
+        assigned_user_id=assigned_user_id,
+        status=status,
+        priority=priority,
+        explicit_id=id,
+    )
+
+    configured_next_ticket_number: int | None = None
+    if id is None:
+        configured_next_ticket_number = (
+            await site_settings_repo.get_next_ticket_number()
+        )
+        if configured_next_ticket_number is not None:
+            max_id_row = await db.fetch_one("SELECT MAX(id) as max_id FROM tickets")
+            max_id_value = max_id_row.get("max_id") if max_id_row else None
+            try:
+                max_id = int(max_id_value) if max_id_value is not None else 0
+            except (TypeError, ValueError):
+                max_id = 0
+            if max_id < configured_next_ticket_number:
+                id = configured_next_ticket_number
+
+    # If an explicit ID is provided, insert with that ID
+    if id is not None:
+        ticket_id = await db.execute_returning_lastrowid(
+            """
+            INSERT INTO tickets
+                (id, company_id, requester_id, requester_staff_id, assigned_user_id, subject, description, status, priority, category, module_slug, external_reference, ticket_number)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                id,
+                company_id,
+                requester_id,
+                requester_staff_id,
+                assigned_user_id,
+                subject,
+                description,
+                status,
+                priority,
+                category,
+                module_slug,
+                external_reference,
+                ticket_number,
+            ),
+        )
+        # Ensure AUTO_INCREMENT is updated to be higher than the explicit ID
+        # This ensures app-generated tickets will use IDs higher than Syncro tickets
+        try:
+            # Get the current maximum ID
+            max_id_row = await db.fetch_one("SELECT MAX(id) as max_id FROM tickets")
+            max_id = max_id_row.get("max_id") if max_id_row else id
+            if max_id is not None:
+                # Update AUTO_INCREMENT to be one more than the maximum ID
+                await db.execute(
+                    f"ALTER TABLE tickets AUTO_INCREMENT = {int(max_id) + 1}"
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            log_debug(
+                "Failed to update AUTO_INCREMENT after explicit ID insert",
+                error=str(exc),
+            )
+        if (
+            configured_next_ticket_number is not None
+            and ticket_id >= configured_next_ticket_number
+        ):
+            await site_settings_repo.set_next_ticket_number(ticket_id + 1)
+    else:
+        # Use normal auto-increment behavior
+        ticket_id = await db.execute_returning_lastrowid(
+            """
+            INSERT INTO tickets
+                (company_id, requester_id, requester_staff_id, assigned_user_id, subject, description, status, priority, category, module_slug, external_reference, ticket_number)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                company_id,
+                requester_id,
+                requester_staff_id,
+                assigned_user_id,
+                subject,
+                description,
+                status,
+                priority,
+                category,
+                module_slug,
+                external_reference,
+                ticket_number,
+            ),
+        )
+        if (
+            configured_next_ticket_number is not None
+            and ticket_id >= configured_next_ticket_number
+        ):
+            await site_settings_repo.set_next_ticket_number(ticket_id + 1)
+    if ticket_id:
+        log_info("Ticket created successfully", ticket_id=ticket_id)
+        row = await db.fetch_one("SELECT * FROM tickets WHERE id = %s", (ticket_id,))
+        if row:
+            return _normalise_ticket(row)
+    fallback_row: dict[str, Any] = {
+        "id": ticket_id,
+        "company_id": company_id,
+        "requester_id": requester_id,
+        "requester_staff_id": requester_staff_id,
+        "assigned_user_id": assigned_user_id,
+        "subject": subject,
+        "description": description,
+        "status": status,
+        "priority": priority,
+        "category": category,
+        "module_slug": module_slug,
+        "external_reference": external_reference,
+        "ticket_number": ticket_number,
+        "review_date": None,
+        "ai_summary": None,
+        "ai_summary_status": None,
+        "ai_summary_model": None,
+        "ai_resolution_state": None,
+        "ai_summary_updated_at": None,
+        "ai_tags": [],
+        "ai_tags_status": None,
+        "ai_tags_model": None,
+        "ai_tags_updated_at": None,
+        "created_at": None,
+        "updated_at": None,
+        "syncro_updated_at": None,
+        "closed_at": None,
+    }
+    return _normalise_ticket(fallback_row)
+
+
+async def list_tickets(
+    *,
+    status: str | Sequence[str] | None = None,
+    module_slug: str | None = None,
+    company_id: int | None = None,
+    assigned_user_id: int | None = None,
+    search: str | None = None,
+    limit: int | None = 50,
+    offset: int = 0,
+    requester_id: int | None = None,
+    requester_staff_id: int | None = None,
+    cursor_updated_at: datetime | None = None,
+    cursor_id: int | None = None,
+) -> list[TicketRecord]:
+    log_debug(
+        "Listing tickets",
+        status=status,
+        module_slug=module_slug,
+        company_id=company_id,
+        assigned_user_id=assigned_user_id,
+        requester_id=requester_id,
+        requester_staff_id=requester_staff_id,
+        limit=limit,
+        offset=offset,
+    )
+    where: list[str] = ["merged_into_ticket_id IS NULL"]
+    params: list[Any] = []
+    status_filters = _prepare_status_filters(status)
+    if status_filters:
+        if len(status_filters) == 1:
+            where.append("status = %s")
+            params.append(status_filters[0])
+        else:
+            placeholders = ", ".join(["%s"] * len(status_filters))
+            where.append(f"status IN ({placeholders})")
+            params.extend(status_filters)
+    if module_slug:
+        where.append("module_slug = %s")
+        params.append(module_slug)
+    if company_id is not None:
+        where.append("company_id = %s")
+        params.append(company_id)
+    if assigned_user_id is not None:
+        where.append("assigned_user_id = %s")
+        params.append(assigned_user_id)
+    if requester_id is not None:
+        where.append("requester_id = %s")
+        params.append(requester_id)
+    if requester_staff_id is not None:
+        where.append("requester_staff_id = %s")
+        params.append(requester_staff_id)
+    _append_ticket_search_filter(where, params, search=search)
+    _append_ticket_cursor_filter(
+        where,
+        params,
+        cursor_updated_at=cursor_updated_at,
+        cursor_id=cursor_id,
+    )
+    where_clause = " WHERE " + " AND ".join(where) if where else ""
+    if cursor_updated_at is not None and cursor_id is not None:
+        query_parts = [
+            "SELECT *",
+            "FROM tickets",
+            where_clause,
+            "ORDER BY updated_at DESC, id DESC",
+        ]
+        if limit is not None:
+            params.append(limit)
+            query_parts.append("LIMIT %s")
+        query = "\n".join(query_parts)
+        rows = await db.fetch_all(query, tuple(params))
+    elif limit is None:
+        query = "\n".join(
+            [
+                "SELECT *",
+                "FROM tickets",
+                where_clause,
+                "ORDER BY updated_at DESC, id DESC",
+            ]
+        )
+        rows = await db.fetch_all(query, tuple(params))
+    else:
+        params.extend([limit, offset])
+        query = "\n".join(
+            [
+                "SELECT *",
+                "FROM tickets",
+                where_clause,
+                "ORDER BY updated_at DESC, id DESC",
+                "LIMIT %s OFFSET %s",
+            ]
+        )
+        rows = await db.fetch_all(query, tuple(params))
+    log_debug("Tickets query returned", count=len(rows))
+    return [_normalise_ticket(row) for row in rows]
+
+
+async def list_billable_time_entries(
+    *,
+    company_id: int | None = None,
+    limit: int | None = 1000,
+    offset: int = 0,
+) -> list[TicketRecord]:
+    """Return billable ticket replies with positive tracked time.
+
+    This query scans time entries directly instead of paging through tickets so
+    bulk un-billing catches entries on closed, billed, or otherwise filtered
+    tickets that still contribute to billable-time reports.
+    """
+    where = [
+        "tr.is_billable = 1",
+        "tr.minutes_spent IS NOT NULL",
+        "tr.minutes_spent > 0",
+    ]
+    params: list[Any] = []
+    if company_id is not None:
+        where.append("t.company_id = %s")
+        params.append(int(company_id))
+    query_parts = [
+        "SELECT tr.*, t.ticket_number, t.subject, t.company_id, lt.name AS labour_type_name, lt.code AS labour_type_code",
+        "FROM ticket_replies tr",
+        "INNER JOIN tickets t ON t.id = tr.ticket_id",
+        "LEFT JOIN ticket_labour_types lt ON lt.id = tr.labour_type_id",
+        "WHERE " + " AND ".join(where),
+        "ORDER BY tr.created_at ASC, tr.id ASC",
+    ]
+    if limit is not None:
+        query_parts.append("LIMIT %s OFFSET %s")
+        params.extend([int(max(1, limit)), int(max(0, offset))])
+    rows = await db.fetch_all("\n".join(query_parts), tuple(params))
+    return [dict(row) for row in rows]
+
+
+async def mark_replies_non_billable(reply_ids: Sequence[int]) -> int:
+    """Clear the billable flag for the supplied replies and return affected rows."""
+    clean_ids = sorted({int(reply_id) for reply_id in reply_ids if reply_id})
+    if not clean_ids:
+        return 0
+    placeholders = ", ".join(["%s"] * len(clean_ids))
+    return await db.execute_rowcount(
+        f"UPDATE ticket_replies SET is_billable = 0 WHERE is_billable = 1 AND id IN ({placeholders})",
+        tuple(clean_ids),
+    )
+
+
+async def list_tickets_for_automation_scan(
+    *, limit: int = 1000, offset: int = 0
+) -> list[TicketRecord]:
+    """Return recent ticket records with reply timestamps for scheduled automations.
+
+    Scheduled automations apply their filter JSON in Python so the same nested
+    filter language used for event automations can be reused for time-based
+    ticket scans.  The query intentionally caps the batch size to avoid a
+    runaway automation reading an unbounded ticket table in one scheduler tick.
+    """
+
+    safe_limit = max(1, min(int(limit or 1000), 5000))
+    safe_offset = max(0, int(offset or 0))
+    rows = await db.fetch_all(
+        """
+        SELECT
+            t.*,
+            (
+                SELECT MAX(tr.created_at)
+                FROM ticket_replies tr
+                WHERE tr.ticket_id = t.id
+            ) AS latest_reply_at
+        FROM tickets t
+        WHERE t.merged_into_ticket_id IS NULL
+        ORDER BY COALESCE(t.status_changed_at, t.created_at, t.updated_at) ASC, t.updated_at ASC, t.id ASC
+        LIMIT %s OFFSET %s
+        """,
+        (safe_limit, safe_offset),
+    )
+    records: list[TicketRecord] = []
+    for row in rows:
+        record = _normalise_ticket(row)
+        record["latest_reply_at"] = _make_aware(row.get("latest_reply_at"))
+        records.append(record)
+    return records
+
+
+def _prepare_status_filters(status: str | Sequence[str] | None) -> list[str]:
+    if status in (None, ""):
+        return []
+    if isinstance(status, str):
+        candidates = [status]
+    else:
+        candidates = list(status)
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        text = str(candidate or "").strip().lower()
+        if not text or text in seen:
+            continue
+        if any(not (char.isalnum() or char in {"_", "-"}) for char in text):
+            continue
+        seen.add(text)
+        slugs.append(text)
+    return slugs
+
+
+def _prepare_user_ticket_scope_filters(
+    *,
+    status: str | Sequence[str] | None,
+    company_ids: Sequence[int] | None,
+    search: str | None,
+) -> tuple[str, str, str | None, str | None]:
+    status_filters = _prepare_status_filters(status)
+    status_csv = ",".join(status_filters)
+
+    company_filters = [str(int(cid)) for cid in (company_ids or []) if int(cid) > 0]
+    company_csv = ",".join(company_filters)
+
+    search_mode, search_value = _prepare_ticket_search_term(search)
+
+    return status_csv, company_csv, search_mode, search_value
+
+
+async def list_tickets_for_user(
+    user_id: int,
+    *,
+    company_ids: Sequence[int] | None = None,
+    search: str | None = None,
+    status: str | Sequence[str] | None = None,
+    limit: int = 25,
+    offset: int = 0,
+    cursor_updated_at: datetime | None = None,
+    cursor_id: int | None = None,
+) -> list[TicketRecord]:
+    """Return recent tickets requested by or watched by the specified user."""
+
+    if user_id <= 0:
+        return []
+
+    status_filters = _prepare_status_filters(status)
+    company_filters = [int(cid) for cid in (company_ids or []) if int(cid) > 0]
+    search_clause, search_params = _build_ticket_search_clause(
+        search=search,
+        column_prefix="t.",
+        include_external_reference=True,
+    )
+
+    where_clauses = ["t.merged_into_ticket_id IS NULL", f"({search_clause})", "%s > 0"]
+    if status_filters:
+        status_placeholders = ", ".join(["%s"] * len(status_filters))
+        where_clauses.append(f"t.status IN ({status_placeholders})")
+    if company_filters:
+        company_placeholders = ", ".join(["%s"] * len(company_filters))
+        where_clauses.append(f"t.company_id IN ({company_placeholders})")
+
+    params: list[Any] = [
+        user_id,
+        user_id,
+        *search_params,
+        user_id,
+        *status_filters,
+        *company_filters,
+    ]
+    _append_ticket_cursor_filter(
+        where_clauses,
+        params,
+        cursor_updated_at=cursor_updated_at,
+        cursor_id=cursor_id,
+        column_prefix="t.",
+    )
+
+    where_sql = " AND ".join(where_clauses)
+    query_lines = [
+        "SELECT t.*",
+        "FROM tickets AS t",
+        "INNER JOIN (",
+        "    SELECT t.id",
+        "    FROM tickets AS t",
+        "    WHERE t.requester_id = %s",
+        "    UNION",
+        "    SELECT t.id",
+        "    FROM tickets AS t",
+        "    WHERE EXISTS (",
+        "        SELECT 1",
+        "        FROM ticket_watchers AS tw",
+        "        WHERE tw.ticket_id = t.id AND tw.user_id = %s",
+        "    )",
+        ") AS scoped ON scoped.id = t.id",
+        "WHERE " + where_sql,
+        "ORDER BY t.updated_at DESC, t.id DESC",
+    ]
+    if cursor_updated_at is not None and cursor_id is not None:
+        query_lines.append("LIMIT %s")
+        params.append(int(max(1, limit)))
+    else:
+        query_lines.append("LIMIT %s OFFSET %s")
+        params.extend([int(max(1, limit)), int(max(0, offset))])
+    query = "\n".join(query_lines)
+
+    rows = await db.fetch_all(query, tuple(params))
+    return [_normalise_ticket(row) for row in rows]
+
+
+async def list_tickets_in_companies(
+    *,
+    company_ids: Sequence[int] | None,
+    search: str | None = None,
+    status: str | Sequence[str] | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> list[TicketRecord]:
+    """Return recent tickets for the supplied companies, or all tickets when company_ids is None."""
+
+    status_filters = _prepare_status_filters(status)
+    company_filters = [int(cid) for cid in (company_ids or []) if int(cid) > 0]
+    if company_ids is not None and not company_filters:
+        return []
+
+    search_clause, search_params = _build_ticket_search_clause(
+        search=search,
+        column_prefix="t.",
+        include_external_reference=True,
+    )
+
+    where_clauses = ["t.merged_into_ticket_id IS NULL", f"({search_clause})"]
+    if status_filters:
+        status_placeholders = ", ".join(["%s"] * len(status_filters))
+        where_clauses.append(f"t.status IN ({status_placeholders})")
+    if company_filters:
+        company_placeholders = ", ".join(["%s"] * len(company_filters))
+        where_clauses.append(f"t.company_id IN ({company_placeholders})")
+
+    query = f"""
+        SELECT
+            t.*,
+            COALESCE(requester.first_name, staff_requester.first_name) AS requester_first_name,
+            COALESCE(requester.last_name, staff_requester.last_name) AS requester_last_name,
+            COALESCE(requester.email, staff_requester.email) AS requester_email
+        FROM tickets AS t
+        LEFT JOIN users AS requester ON requester.id = t.requester_id
+        LEFT JOIN staff AS staff_requester ON staff_requester.id = t.requester_staff_id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY t.updated_at DESC, t.id DESC
+        LIMIT %s OFFSET %s
+    """
+    params: list[Any] = [
+        *search_params,
+        *status_filters,
+        *company_filters,
+        int(max(1, limit)),
+        int(max(0, offset)),
+    ]
+    rows = await db.fetch_all(query, tuple(params))
+    return [_normalise_ticket(row) for row in rows]
+
+
+async def count_tickets_in_companies(
+    *,
+    company_ids: Sequence[int] | None,
+    search: str | None = None,
+    status: str | Sequence[str] | None = None,
+) -> int:
+    """Return the number of tickets for the supplied companies, or all tickets when company_ids is None."""
+
+    status_filters = _prepare_status_filters(status)
+    company_filters = [int(cid) for cid in (company_ids or []) if int(cid) > 0]
+    if company_ids is not None and not company_filters:
+        return 0
+
+    search_clause, search_params = _build_ticket_search_clause(
+        search=search,
+        column_prefix="t.",
+        include_external_reference=True,
+    )
+
+    where_clauses = ["t.merged_into_ticket_id IS NULL", f"({search_clause})"]
+    if status_filters:
+        status_placeholders = ", ".join(["%s"] * len(status_filters))
+        where_clauses.append(f"t.status IN ({status_placeholders})")
+    if company_filters:
+        company_placeholders = ", ".join(["%s"] * len(company_filters))
+        where_clauses.append(f"t.company_id IN ({company_placeholders})")
+
+    query = f"""
+        SELECT COUNT(*) AS count
+        FROM tickets AS t
+        WHERE {' AND '.join(where_clauses)}
+    """
+    params: list[Any] = [
+        *search_params,
+        *status_filters,
+        *company_filters,
+    ]
+    row = await db.fetch_one(query, tuple(params))
+    return int(row["count"]) if row else 0
+
+
+async def count_tickets_for_user(
+    user_id: int,
+    *,
+    company_ids: Sequence[int] | None = None,
+    search: str | None = None,
+    status: str | Sequence[str] | None = None,
+) -> int:
+    """Return the number of tickets requested by or watched by the specified user."""
+
+    if user_id <= 0:
+        return 0
+
+    status_filters = _prepare_status_filters(status)
+    company_filters = [int(cid) for cid in (company_ids or []) if int(cid) > 0]
+    search_clause, search_params = _build_ticket_search_clause(
+        search=search,
+        column_prefix="t.",
+        include_external_reference=True,
+    )
+
+    where_clauses = ["t.merged_into_ticket_id IS NULL", f"({search_clause})", "%s > 0"]
+    if status_filters:
+        status_placeholders = ", ".join(["%s"] * len(status_filters))
+        where_clauses.append(f"t.status IN ({status_placeholders})")
+    if company_filters:
+        company_placeholders = ", ".join(["%s"] * len(company_filters))
+        where_clauses.append(f"t.company_id IN ({company_placeholders})")
+
+    query = f"""
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT t.id
+            FROM tickets AS t
+            WHERE t.requester_id = %s
+            UNION
+            SELECT t.id
+            FROM tickets AS t
+            WHERE EXISTS (
+                SELECT 1
+                FROM ticket_watchers AS tw
+                WHERE tw.ticket_id = t.id AND tw.user_id = %s
+            )
+        ) AS scoped
+        INNER JOIN tickets AS t ON t.id = scoped.id
+        WHERE {' AND '.join(where_clauses)}
+    """
+
+    params: list[Any] = [
+        user_id,
+        user_id,
+        *search_params,
+        user_id,
+        *status_filters,
+        *company_filters,
+    ]
+    row = await db.fetch_one(query, tuple(params))
+    return int(row["count"]) if row else 0
+
+
+async def count_tickets(
+    *,
+    status: str | Sequence[str] | None = None,
+    module_slug: str | None = None,
+    company_id: int | None = None,
+    assigned_user_id: int | None = None,
+    search: str | None = None,
+    requester_id: int | None = None,
+    requester_staff_id: int | None = None,
+) -> int:
+    where: list[str] = []
+    params: list[Any] = []
+    status_filters = _prepare_status_filters(status)
+    if status_filters:
+        if len(status_filters) == 1:
+            where.append("status = %s")
+            params.append(status_filters[0])
+        else:
+            placeholders = ", ".join(["%s"] * len(status_filters))
+            where.append(f"status IN ({placeholders})")
+            params.extend(status_filters)
+    if module_slug:
+        where.append("module_slug = %s")
+        params.append(module_slug)
+    if company_id is not None:
+        where.append("company_id = %s")
+        params.append(company_id)
+    if assigned_user_id is not None:
+        where.append("assigned_user_id = %s")
+        params.append(assigned_user_id)
+    if requester_id is not None:
+        where.append("requester_id = %s")
+        params.append(requester_id)
+    if requester_staff_id is not None:
+        where.append("requester_staff_id = %s")
+        params.append(requester_staff_id)
+    _append_ticket_search_filter(where, params, search=search)
+    where_clause = " WHERE " + " AND ".join(where) if where else ""
+    row = await db.fetch_one(
+        f"SELECT COUNT(*) AS count FROM tickets{where_clause}",
+        tuple(params) if params else None,
+    )
+    return int(row["count"]) if row else 0
+
+
+async def count_tickets_by_status() -> dict[str, int]:
+    """Return a mapping of status slug → count for all non-merged tickets."""
+    rows = await db.fetch_all(
+        "SELECT status, COUNT(*) AS count FROM tickets WHERE merged_into_ticket_id IS NULL GROUP BY status",
+        None,
+    )
+    return {str(row["status"] or ""): int(row["count"]) for row in rows}
+
+
+async def get_ticket(ticket_id: int) -> TicketRecord | None:
+    row = await db.fetch_one("SELECT * FROM tickets WHERE id = %s", (ticket_id,))
+    return _normalise_ticket(row) if row else None
+
+
+async def is_ticket_watcher(ticket_id: int, user_id: int) -> bool:
+    if ticket_id <= 0 or user_id <= 0:
+        return False
+    row = await db.fetch_one(
+        "SELECT 1 FROM ticket_watchers WHERE ticket_id = %s AND user_id = %s LIMIT 1",
+        (ticket_id, user_id),
+    )
+    return bool(row)
+
+
+async def get_ticket_by_number_or_id(ticket_number: str) -> TicketRecord | None:
+    """Return a ticket by display ticket number, falling back to numeric ID."""
+
+    value = str(ticket_number or "").strip().lstrip("#")
+    if not value:
+        return None
+    row = await db.fetch_one(
+        "SELECT * FROM tickets WHERE ticket_number = %s LIMIT 1",
+        (value,),
+    )
+    if row:
+        return _normalise_ticket(row)
+    try:
+        ticket_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ticket_id <= 0:
+        return None
+    return await get_ticket(ticket_id)
+
+
+async def get_ticket_by_external_reference(
+    external_reference: str,
+) -> TicketRecord | None:
+    row = await db.fetch_one(
+        "SELECT * FROM tickets WHERE external_reference = %s",
+        (external_reference,),
+    )
+    return _normalise_ticket(row) if row else None
+
+
+async def find_open_ticket_by_external_reference(
+    external_reference: str,
+) -> TicketRecord | None:
+    """Return the first non-closed ticket with the given external_reference, or None."""
+    row = await db.fetch_one(
+        "SELECT * FROM tickets WHERE external_reference = %s AND closed_at IS NULL LIMIT 1",
+        (external_reference,),
+    )
+    return _normalise_ticket(row) if row else None
+
+
+async def list_tickets_by_requester_phone(
+    phone_number: str,
+    limit: int = 100,
+    *,
+    user_id: int | None = None,
+    company_ids: Sequence[int] | None = None,
+) -> list[TicketRecord]:
+    """
+    Search for tickets by the requester's phone number.
+    Searches both users.mobile_phone and staff.mobile_phone tables.
+    Returns tickets ordered by most recently updated first.
+    """
+    if not phone_number or not phone_number.strip():
+        return []
+
+    # Normalize phone number by removing common formatting characters
+    normalized_phone = re.sub(r"[\s\-\(\)\+]", "", phone_number.strip())
+
+    where_clauses = [
+        "("
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.mobile_phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') LIKE %s "
+        "OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(s.mobile_phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') LIKE %s"
+        ")"
+    ]
+    params: list[Any] = [f"%{normalized_phone}%", f"%{normalized_phone}%"]
+
+    if user_id is not None and int(user_id) > 0:
+        where_clauses.append(
+            "(t.requester_id = %s OR EXISTS ("
+            "SELECT 1 FROM ticket_watchers AS tw WHERE tw.ticket_id = t.id AND tw.user_id = %s"
+            "))"
+        )
+        params.extend([int(user_id), int(user_id)])
+
+    company_filters = [int(cid) for cid in (company_ids or []) if int(cid) > 0]
+    if company_filters:
+        company_placeholders = ", ".join(["%s"] * len(company_filters))
+        where_clauses.append(f"t.company_id IN ({company_placeholders})")
+        params.extend(company_filters)
+
+    params.append(int(max(1, limit)))
+    query = "\n".join(
+        [
+            "SELECT t.*",
+            "FROM tickets AS t",
+            "INNER JOIN users AS u ON u.id = t.requester_id",
+            "LEFT JOIN staff AS s ON s.email = u.email AND s.company_id = u.company_id",
+            "WHERE " + " AND ".join(where_clauses),
+            "ORDER BY t.updated_at DESC",
+            "LIMIT %s",
+        ]
+    )
+    rows = await db.fetch_all(query, tuple(params))
+    return [_normalise_ticket(row) for row in rows]
+
+
+async def list_ticket_assets(ticket_id: int) -> list[dict[str, Any]]:
+    rows = await db.fetch_all(
+        """
+        SELECT
+            ta.asset_id,
+            ta.created_at,
+            a.name,
+            a.serial_number,
+            a.status,
+            a.type,
+            a.os_name,
+            a.tactical_asset_id,
+            (
+                SELECT td.device_uid
+                FROM tray_devices AS td
+                WHERE td.status = 'active'
+                  AND td.company_id = a.company_id
+                  AND (
+                    td.asset_id = ta.asset_id
+                    OR (
+                      (td.asset_id IS NULL OR td.asset_id = 0)
+                      AND (
+                        (a.serial_number IS NOT NULL AND a.serial_number <> '' AND LOWER(td.serial_number) = LOWER(a.serial_number))
+                        OR (a.name IS NOT NULL AND a.name <> '' AND LOWER(td.hostname) = LOWER(a.name))
+                      )
+                    )
+                  )
+                ORDER BY
+                    CASE WHEN td.asset_id = ta.asset_id THEN 0 ELSE 1 END,
+                    td.last_seen_utc DESC, td.updated_at DESC, td.id DESC
+                LIMIT 1
+            ) AS tray_device_uid
+        FROM ticket_assets AS ta
+        INNER JOIN assets AS a ON a.id = ta.asset_id
+        WHERE ta.ticket_id = %s
+        ORDER BY a.name ASC, ta.asset_id ASC
+        """,
+        (ticket_id,),
+    )
+    assets: list[dict[str, Any]] = []
+    for row in rows or []:
+        asset_id = row.get("asset_id")
+        try:
+            asset_id_int = int(asset_id)
+        except (TypeError, ValueError):
+            continue
+        asset = {
+            "asset_id": asset_id_int,
+            "name": str(row.get("name") or "").strip() or f"Asset {asset_id_int}",
+            "serial_number": str(row.get("serial_number") or "").strip() or None,
+            "status": str(row.get("status") or "").strip() or None,
+            "type": str(row.get("type") or "").strip() or None,
+            "os_name": str(row.get("os_name") or "").strip() or None,
+            "tactical_asset_id": str(row.get("tactical_asset_id") or "").strip()
+            or None,
+            "tray_device_uid": str(row.get("tray_device_uid") or "").strip() or None,
+            "linked_at": _make_aware(row.get("created_at")),
+        }
+        assets.append(asset)
+    return assets
+
+
+async def list_ticket_suggested_assets(ticket_id: int) -> list[dict[str, Any]]:
+    """Return unconfirmed asset suggestions for a ticket."""
+    rows = await db.fetch_all(
+        """
+        SELECT tsa.asset_id, tsa.matched_username, tsa.created_at, a.name,
+               a.status, a.tactical_asset_id
+        FROM ticket_suggested_assets tsa
+        INNER JOIN assets a ON a.id = tsa.asset_id
+        LEFT JOIN ticket_assets ta
+          ON ta.ticket_id = tsa.ticket_id AND ta.asset_id = tsa.asset_id
+        WHERE tsa.ticket_id = %s AND ta.asset_id IS NULL
+        ORDER BY a.name, tsa.asset_id
+        """,
+        (ticket_id,),
+    )
+    return [dict(row) for row in (rows or [])]
+
+
+async def replace_ticket_suggested_assets(
+    ticket_id: int, suggestions: Iterable[tuple[int, str]]
+) -> None:
+    await db.execute("DELETE FROM ticket_suggested_assets WHERE ticket_id = %s", (ticket_id,))
+    for asset_id, username in suggestions:
+        await db.execute(
+            "INSERT INTO ticket_suggested_assets (ticket_id, asset_id, matched_username) VALUES (%s, %s, %s)",
+            (ticket_id, asset_id, username),
+        )
+
+
+async def confirm_ticket_suggested_asset(ticket_id: int, asset_id: int) -> bool:
+    row = await db.fetch_one(
+        "SELECT asset_id FROM ticket_suggested_assets WHERE ticket_id = %s AND asset_id = %s",
+        (ticket_id, asset_id),
+    )
+    if not row:
+        return False
+    await db.execute(
+        "INSERT IGNORE INTO ticket_assets (ticket_id, asset_id) VALUES (%s, %s)",
+        (ticket_id, asset_id),
+    )
+    await db.execute(
+        "DELETE FROM ticket_suggested_assets WHERE ticket_id = %s AND asset_id = %s",
+        (ticket_id, asset_id),
+    )
+    return True
+
+
+async def replace_ticket_assets(
+    ticket_id: int, asset_ids: Iterable[int]
+) -> list[dict[str, Any]]:
+    normalised_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_id in asset_ids:
+        try:
+            candidate = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if candidate <= 0 or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalised_ids.append(candidate)
+
+    existing_rows = await db.fetch_all(
+        "SELECT asset_id FROM ticket_assets WHERE ticket_id = %s",
+        (ticket_id,),
+    )
+    existing_ids: set[int] = set()
+    for row in existing_rows or []:
+        asset_id = row.get("asset_id")
+        try:
+            existing_ids.add(int(asset_id))
+        except (TypeError, ValueError):
+            continue
+
+    new_ids = set(normalised_ids)
+    to_remove = existing_ids - new_ids
+    to_add = new_ids - existing_ids
+
+    if to_remove:
+        placeholders = ", ".join(["%s"] * len(to_remove))
+        params: list[Any] = [ticket_id, *sorted(to_remove)]
+        await db.execute(
+            f"DELETE FROM ticket_assets WHERE ticket_id = %s AND asset_id IN ({placeholders})",
+            tuple(params),
+        )
+
+    for asset_id in sorted(to_add):
+        await db.execute(
+            "INSERT INTO ticket_assets (ticket_id, asset_id) VALUES (%s, %s)",
+            (ticket_id, asset_id),
+        )
+
+    return await list_ticket_assets(ticket_id)
+
+
+async def list_billed_tickets_older_than(
+    cutoff: datetime, *, limit: int = 1000, offset: int = 0
+) -> list[TicketRecord]:
+    """Return tickets with billing markers created before the supplied UTC cutoff."""
+    rows = await db.fetch_all(
+        """
+        SELECT *
+        FROM tickets
+        WHERE created_at < %s
+          AND (
+              billed_at IS NOT NULL
+              OR COALESCE(TRIM(xero_invoice_number), '') <> ''
+              OR EXISTS (
+                  SELECT 1
+                  FROM ticket_billed_time_entries bte
+                  WHERE bte.ticket_id = tickets.id
+              )
+          )
+        ORDER BY created_at ASC, id ASC
+        LIMIT %s OFFSET %s
+        """,
+        (cutoff, int(max(1, limit)), int(max(0, offset))),
+    )
+    return [_normalise_ticket(row) for row in rows]
+
+
+async def clear_ticket_billing_fields(ticket_ids: list[int]) -> int:
+    """Clear ticket-level billing markers for the supplied tickets."""
+    clean_ids = sorted({int(ticket_id) for ticket_id in ticket_ids if ticket_id})
+    if not clean_ids:
+        return 0
+    placeholders = ", ".join(["%s"] * len(clean_ids))
+    return await db.execute_rowcount(
+        f"""
+        UPDATE tickets
+        SET xero_invoice_number = NULL,
+            billed_at = NULL,
+            updated_at = %s
+        WHERE id IN ({placeholders})
+        """,
+        (datetime.now(timezone.utc), *clean_ids),
+    )
+
+
+async def _disable_shipment_watch(ticket_id: int) -> None:
+    await db.execute(
+        "UPDATE ticket_shipment_watches SET active = 0 WHERE ticket_id = %s",
+        (ticket_id,),
+    )
+
+
+async def update_ticket(ticket_id: int, **fields: Any) -> TicketRecord | None:
+    if not fields:
+        return await get_ticket(ticket_id)
+    log_info("Updating ticket", ticket_id=ticket_id, fields=list(fields.keys()))
+    previous_status = None
+    if "status" in fields:
+        previous_status = await db.fetch_one(
+            "SELECT status,COALESCE(status_changed_at,created_at) AS started_at FROM tickets WHERE id=%s",
+            (ticket_id,),
+        )
+    assignments: list[str] = []
+    params: list[Any] = []
+    override_updated_at = None
+    if "updated_at" in fields:
+        override_updated_at = fields.pop("updated_at")
+    for key, value in fields.items():
+        if not _SQL_IDENTIFIER_RE.match(key):
+            raise ValueError(f"Invalid ticket field name: {key}")
+        if key == "status" and "status_changed_at" not in fields:
+            assignments.append(
+                "status_changed_at = CASE WHEN status <> %s "
+                "THEN UTC_TIMESTAMP(6) ELSE COALESCE(status_changed_at, created_at) END"
+            )
+            params.append(value)
+        if key == "ai_tags":
+            assignments.append(f"{key} = %s")
+            params.append(_serialise_tags(value))
+            continue
+        assignments.append(f"{key} = %s")
+        params.append(value)
+    if override_updated_at is not None:
+        assignments.append("updated_at = %s")
+        params.append(override_updated_at)
+    else:
+        assignments.append("updated_at = UTC_TIMESTAMP(6)")
+    query = f"UPDATE tickets SET {', '.join(assignments)} WHERE id = %s"
+    params.append(ticket_id)
+    await db.execute(query, tuple(params))
+    if (
+        previous_status
+        and str(previous_status.get("status") or "").casefold()
+        != str(fields.get("status") or "").casefold()
+    ):
+        await db.execute(
+            """INSERT INTO ticket_status_history (ticket_id,status,started_at,ended_at)
+               VALUES (%s,%s,%s,%s)""",
+            (ticket_id, previous_status.get("status"), previous_status.get("started_at"), datetime.now(timezone.utc)),
+        )
+    if (
+        str(fields.get("status") or "").casefold() == "closed"
+        or fields.get("closed_at") is not None
+    ):
+        await _disable_shipment_watch(ticket_id)
+    log_info("Ticket updated successfully", ticket_id=ticket_id)
+    return await get_ticket(ticket_id)
+
+
+async def rename_xero_invoice_number(
+    company_id: int,
+    old_invoice_number: str,
+    new_invoice_number: str,
+) -> None:
+    """Update tickets that reference a local invoice number after Xero sync for one company."""
+    await db.execute(
+        """
+        UPDATE tickets
+        SET xero_invoice_number = %s,
+            updated_at = UTC_TIMESTAMP(6)
+        WHERE xero_invoice_number = %s
+          AND company_id = %s
+        """,
+        (new_invoice_number, old_invoice_number, company_id),
+    )
+
+
+async def set_ticket_status(
+    ticket_id: int,
+    status: str,
+    *,
+    closed_at: datetime | None = None,
+) -> TicketRecord | None:
+    fields: dict[str, Any] = {"status": status}
+    if closed_at:
+        fields["closed_at"] = closed_at
+    elif status not in {"resolved", "closed"}:
+        fields["closed_at"] = None
+    return await update_ticket(ticket_id, **fields)
+
+
+async def set_tickets_status(
+    ticket_ids: Iterable[int],
+    status: str,
+    *,
+    closed_at: datetime | None = None,
+) -> int:
+    """Set the status for multiple tickets and return the number of rows changed."""
+
+    normalised_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_id in ticket_ids:
+        try:
+            identifier = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if identifier <= 0 or identifier in seen:
+            continue
+        seen.add(identifier)
+        normalised_ids.append(identifier)
+
+    if not normalised_ids:
+        return 0
+
+    placeholders = ", ".join(["%s"] * len(normalised_ids))
+    previous_rows = await db.fetch_all(
+        f"""SELECT id,status,COALESCE(status_changed_at,created_at) AS started_at
+            FROM tickets WHERE id IN ({placeholders}) AND LOWER(status) <> LOWER(%s)""",
+        (*normalised_ids, status),
+    )
+    params: list[Any] = [status, status]
+    closed_clause = "closed_at = NULL,"
+    if closed_at is not None:
+        closed_clause = "closed_at = %s,"
+        params.append(closed_at)
+    elif status in {"resolved", "closed"}:
+        closed_clause = "closed_at = COALESCE(closed_at, UTC_TIMESTAMP(6)),"
+
+    params.extend(normalised_ids)
+    affected = await db.execute_rowcount(
+        f"""
+        UPDATE tickets
+        SET status_changed_at = CASE WHEN status <> %s
+                THEN UTC_TIMESTAMP(6) ELSE COALESCE(status_changed_at, created_at) END,
+            status = %s,
+            {closed_clause}
+            updated_at = UTC_TIMESTAMP(6)
+        WHERE id IN ({placeholders})
+        """,
+        tuple(params),
+    )
+    ended_at = datetime.now(timezone.utc)
+    for previous in previous_rows:
+        await db.execute(
+            """INSERT INTO ticket_status_history (ticket_id,status,started_at,ended_at)
+               VALUES (%s,%s,%s,%s)""",
+            (previous["id"], previous["status"], previous["started_at"], ended_at),
+        )
+    if status.casefold() == "closed" or closed_at is not None:
+        await db.execute(
+            f"UPDATE ticket_shipment_watches SET active = 0 WHERE ticket_id IN ({placeholders})",
+            tuple(normalised_ids),
+        )
+    return affected
+
+
+async def delete_ticket(ticket_id: int) -> None:
+    log_info("Deleting ticket", ticket_id=ticket_id)
+    await db.execute("DELETE FROM tickets WHERE id = %s", (ticket_id,))
+    log_info("Ticket deleted successfully", ticket_id=ticket_id)
+
+
+async def delete_tickets(ticket_ids: Iterable[int]) -> int:
+    """Delete multiple tickets by their identifiers.
+
+    Returns the number of tickets that were removed. Invalid identifiers are
+    ignored so callers can pass raw form values safely.
+    """
+
+    normalised_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_id in ticket_ids:
+        try:
+            identifier = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if identifier <= 0 or identifier in seen:
+            continue
+        seen.add(identifier)
+        normalised_ids.append(identifier)
+
+    if not normalised_ids:
+        return 0
+
+    placeholders = ", ".join(["%s"] * len(normalised_ids))
+    params = tuple(normalised_ids)
+
+    existing = await db.fetch_one(
+        f"SELECT COUNT(*) AS total FROM tickets WHERE id IN ({placeholders})",
+        params,
+    )
+    await db.execute(
+        f"DELETE FROM tickets WHERE id IN ({placeholders})",
+        params,
+    )
+    if not existing:
+        return 0
+    try:
+        return int(existing.get("total") or 0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return 0
+
+
+async def create_reply(
+    *,
+    ticket_id: int,
+    author_id: int | None,
+    body: str,
+    is_internal: bool = False,
+    minutes_spent: int | None = None,
+    is_billable: bool = False,
+    external_reference: str | None = None,
+    created_at: datetime | None = None,
+    labour_type_id: int | None = None,
+    author_email: str | None = None,
+    author_display_name: str | None = None,
+) -> TicketRecord:
+    labour_type_id = await _default_labour_type_for_time_entry(
+        minutes_spent, labour_type_id
+    )
+
+    log_info(
+        "Creating ticket reply",
+        ticket_id=ticket_id,
+        author_id=author_id,
+        is_internal=is_internal,
+        minutes_spent=minutes_spent,
+        is_billable=is_billable,
+    )
+    columns = ["ticket_id", "author_id", "body", "is_internal", "is_billable"]
+    params: list[Any] = [
+        ticket_id,
+        author_id,
+        body,
+        1 if is_internal else 0,
+        1 if is_billable else 0,
+    ]
+    clean_author_email = str(author_email or "").strip() or None
+    clean_author_display_name = str(author_display_name or "").strip() or None
+    if clean_author_email is not None:
+        columns.append("author_email")
+        params.append(clean_author_email[:255])
+    if clean_author_display_name is not None:
+        columns.append("author_display_name")
+        params.append(clean_author_display_name[:255])
+    if minutes_spent is not None:
+        columns.append("minutes_spent")
+        params.append(minutes_spent)
+    if labour_type_id is not None:
+        columns.append("labour_type_id")
+        params.append(labour_type_id)
+    if external_reference is not None:
+        columns.append("external_reference")
+        params.append(external_reference)
+    if created_at is not None:
+        columns.append("created_at")
+        params.append(created_at)
+    placeholders = ", ".join(["%s"] * len(columns))
+    reply_id = await db.execute_returning_lastrowid(
+        f"""
+        INSERT INTO ticket_replies ({', '.join(columns)})
+        VALUES ({placeholders})
+        """,
+        tuple(params),
+    )
+    if reply_id:
+        log_info(
+            "Ticket reply created successfully", reply_id=reply_id, ticket_id=ticket_id
+        )
+        row = await db.fetch_one(
+            """
+            SELECT tr.*, lt.name AS labour_type_name, lt.code AS labour_type_code
+            FROM ticket_replies tr
+            LEFT JOIN ticket_labour_types lt ON tr.labour_type_id = lt.id
+            WHERE tr.id = %s
+            """,
+            (reply_id,),
+        )
+        if row:
+            normalised = _normalise_reply(row)
+            reply_external = str(normalised.get("external_reference") or "")
+            if not normalised.get("is_internal") and not reply_external.startswith(
+                "chat:"
+            ):
+                try:
+                    from app.services import chat_ticket_sync
+
+                    await chat_ticket_sync.sync_ticket_reply_to_chat(
+                        ticket_id=ticket_id,
+                        reply=normalised,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    log_error(
+                        "Failed to sync public ticket reply to linked chat",
+                        ticket_id=ticket_id,
+                        reply_id=normalised.get("id"),
+                        error=str(exc),
+                    )
+            return normalised
+    fallback_row: dict[str, Any] = {
+        "id": reply_id,
+        "ticket_id": ticket_id,
+        "author_id": author_id,
+        "body": body,
+        "is_internal": 1 if is_internal else 0,
+        "minutes_spent": minutes_spent,
+        "is_billable": 1 if is_billable else 0,
+        "external_reference": external_reference,
+        "created_at": created_at,
+        "labour_type_id": labour_type_id,
+        "author_email": clean_author_email,
+        "author_display_name": clean_author_display_name,
+    }
+    return _normalise_reply(fallback_row)
+
+
+async def list_replies(
+    ticket_id: int, *, include_internal: bool = True
+) -> list[TicketRecord]:
+    where = "ticket_id = %s"
+    params: list[Any] = [ticket_id]
+    if not include_internal:
+        where += " AND is_internal = 0"
+    rows = await db.fetch_all(
+        f"""
+        SELECT tr.*, lt.name AS labour_type_name, lt.code AS labour_type_code, lt.rate AS labour_type_rate
+        FROM ticket_replies tr
+        LEFT JOIN ticket_labour_types lt ON tr.labour_type_id = lt.id
+        WHERE {where}
+        ORDER BY tr.created_at ASC
+        """,
+        tuple(params),
+    )
+    return [_normalise_reply(row) for row in rows]
+
+
+async def count_time_entries(ticket_id: int) -> int:
+    """Count the number of time entries (replies with minutes_spent > 0) for a ticket."""
+    row = await db.fetch_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM ticket_replies
+        WHERE ticket_id = %s AND minutes_spent IS NOT NULL AND minutes_spent > 0
+        """,
+        (ticket_id,),
+    )
+    return int(row["count"]) if row else 0
+
+
+async def get_time_totals_by_ticket_ids(
+    ticket_ids: list[int],
+) -> dict[int, dict[str, int]]:
+    """Return billable and non-billable minute totals keyed by ticket ID."""
+    if not ticket_ids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(ticket_ids))
+    rows = await db.fetch_all(
+        f"""
+        SELECT
+            ticket_id,
+            SUM(CASE WHEN is_billable = 1 AND minutes_spent IS NOT NULL THEN minutes_spent ELSE 0 END) AS billable_minutes,
+            SUM(CASE WHEN is_billable = 0 AND minutes_spent IS NOT NULL THEN minutes_spent ELSE 0 END) AS non_billable_minutes
+        FROM ticket_replies
+        WHERE ticket_id IN ({placeholders}) AND minutes_spent IS NOT NULL AND minutes_spent > 0
+        GROUP BY ticket_id
+        """,
+        tuple(ticket_ids),
+    )
+    result: dict[int, dict[str, int]] = {}
+    for row in rows:
+        tid = int(row["ticket_id"])
+        result[tid] = {
+            "billable_minutes": int(row["billable_minutes"] or 0),
+            "non_billable_minutes": int(row["non_billable_minutes"] or 0),
+        }
+    return result
+
+
+async def get_automation_filter_context(ticket_id: int) -> dict[str, int | bool]:
+    """Return aggregate ticket values used by automation filter matching."""
+
+    time_row = await db.fetch_one(
+        """
+        SELECT
+            SUM(CASE WHEN is_billable = 1 AND minutes_spent IS NOT NULL THEN minutes_spent ELSE 0 END) AS billable_minutes,
+            SUM(CASE WHEN is_billable = 0 AND minutes_spent IS NOT NULL THEN minutes_spent ELSE 0 END) AS non_billable_minutes
+        FROM ticket_replies
+        WHERE ticket_id = %s AND minutes_spent IS NOT NULL AND minutes_spent > 0
+        """,
+        (ticket_id,),
+    )
+    attachment_row = await db.fetch_one(
+        "SELECT COUNT(*) AS attachment_count FROM ticket_attachments WHERE ticket_id = %s",
+        (ticket_id,),
+    )
+    expense_row = await db.fetch_one(
+        "SELECT COALESCE(SUM(amount), 0) AS expense_total, COUNT(*) AS expense_count FROM ticket_expenses WHERE ticket_id = %s AND billed_at IS NULL",
+        (ticket_id,),
+    )
+    task_row = await db.fetch_one(
+        """
+        SELECT
+            COUNT(*) AS task_count,
+            SUM(CASE WHEN is_completed = 0 THEN 1 ELSE 0 END) AS open_task_count
+        FROM ticket_tasks
+        WHERE ticket_id = %s
+        """,
+        (ticket_id,),
+    )
+    linked_asset_row = await db.fetch_one(
+        "SELECT COUNT(*) AS linked_asset_count FROM ticket_assets WHERE ticket_id = %s",
+        (ticket_id,),
+    )
+    suggested_asset_row = await db.fetch_one(
+        "SELECT COUNT(*) AS suggested_asset_count FROM ticket_suggested_assets WHERE ticket_id = %s",
+        (ticket_id,),
+    )
+
+    attachment_count = int((attachment_row or {}).get("attachment_count") or 0)
+    task_count = int((task_row or {}).get("task_count") or 0)
+    open_task_count = int((task_row or {}).get("open_task_count") or 0)
+    linked_asset_count = int(
+        (linked_asset_row or {}).get("linked_asset_count") or 0
+    )
+    suggested_asset_count = int(
+        (suggested_asset_row or {}).get("suggested_asset_count") or 0
+    )
+    return {
+        "billable_minutes": int((time_row or {}).get("billable_minutes") or 0),
+        "non_billable_minutes": int((time_row or {}).get("non_billable_minutes") or 0),
+        "attachment_count": attachment_count,
+        "has_attachments": attachment_count > 0,
+        "expense_total": float((expense_row or {}).get("expense_total") or 0),
+        "expense_count": int((expense_row or {}).get("expense_count") or 0),
+        "has_expenses": int((expense_row or {}).get("expense_count") or 0) > 0,
+        "task_count": task_count,
+        "has_tasks": task_count > 0,
+        "open_task_count": open_task_count,
+        "has_open_tasks": open_task_count > 0,
+        "linked_asset_count": linked_asset_count,
+        "suggested_asset_count": suggested_asset_count,
+    }
+
+
+async def get_automation_filter_context_by_ticket_ids(
+    ticket_ids: list[int],
+) -> dict[int, dict[str, Any]]:
+    """Return automation filter helper values keyed by ticket ID for ticket lists."""
+
+    parsed_ids: set[int] = set()
+    for ticket_id in ticket_ids:
+        try:
+            parsed_id = int(ticket_id)
+        except (TypeError, ValueError):
+            continue
+        if parsed_id > 0:
+            parsed_ids.add(parsed_id)
+    unique_ids = sorted(parsed_ids)
+    if not unique_ids:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(unique_ids))
+    result: dict[int, dict[str, Any]] = {
+        ticket_id: {
+            "billable_minutes": 0,
+            "non_billable_minutes": 0,
+            "attachment_count": 0,
+            "has_attachments": False,
+            "expense_total": 0.0,
+            "expense_count": 0,
+            "has_expenses": False,
+            "task_count": 0,
+            "has_tasks": False,
+            "open_task_count": 0,
+            "has_open_tasks": False,
+            "linked_asset_count": 0,
+            "suggested_asset_count": 0,
+            "latest_reply_id": None,
+            "latest_reply_at": None,
+            "latest_reply_is_internal": None,
+            "latest_reply_kind": None,
+            "latest_public_reply_email_status": None,
+            "ticket_update_actor_type": None,
+        }
+        for ticket_id in unique_ids
+    }
+
+    time_rows = await db.fetch_all(
+        f"""
+        SELECT
+            ticket_id,
+            SUM(CASE WHEN is_billable = 1 AND minutes_spent IS NOT NULL THEN minutes_spent ELSE 0 END) AS billable_minutes,
+            SUM(CASE WHEN is_billable = 0 AND minutes_spent IS NOT NULL THEN minutes_spent ELSE 0 END) AS non_billable_minutes
+        FROM ticket_replies
+        WHERE ticket_id IN ({placeholders}) AND minutes_spent IS NOT NULL AND minutes_spent > 0
+        GROUP BY ticket_id
+        """,
+        tuple(unique_ids),
+    )
+    for row in time_rows:
+        ticket_id = int(row["ticket_id"])
+        result[ticket_id]["billable_minutes"] = int(row.get("billable_minutes") or 0)
+        result[ticket_id]["non_billable_minutes"] = int(
+            row.get("non_billable_minutes") or 0
+        )
+
+    attachment_rows = await db.fetch_all(
+        f"""
+        SELECT ticket_id, COUNT(*) AS attachment_count
+        FROM ticket_attachments
+        WHERE ticket_id IN ({placeholders})
+        GROUP BY ticket_id
+        """,
+        tuple(unique_ids),
+    )
+    for row in attachment_rows:
+        ticket_id = int(row["ticket_id"])
+        attachment_count = int(row.get("attachment_count") or 0)
+        result[ticket_id]["attachment_count"] = attachment_count
+        result[ticket_id]["has_attachments"] = attachment_count > 0
+
+    for ticket_id in unique_ids:
+        expense_row = await db.fetch_one(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS expense_total, COUNT(*) AS expense_count
+            FROM ticket_expenses
+            WHERE ticket_id = %s AND billed_at IS NULL
+            """,
+            (ticket_id,),
+        )
+        expense_count = int((expense_row or {}).get("expense_count") or 0)
+        result[ticket_id]["expense_total"] = float(
+            (expense_row or {}).get("expense_total") or 0
+        )
+        result[ticket_id]["expense_count"] = expense_count
+        result[ticket_id]["has_expenses"] = expense_count > 0
+
+    task_rows = await db.fetch_all(
+        f"""
+        SELECT
+            ticket_id,
+            COUNT(*) AS task_count,
+            SUM(CASE WHEN is_completed = 0 THEN 1 ELSE 0 END) AS open_task_count
+        FROM ticket_tasks
+        WHERE ticket_id IN ({placeholders})
+        GROUP BY ticket_id
+        """,
+        tuple(unique_ids),
+    )
+    for row in task_rows:
+        ticket_id = int(row["ticket_id"])
+        task_count = int(row.get("task_count") or 0)
+        open_task_count = int(row.get("open_task_count") or 0)
+        result[ticket_id]["task_count"] = task_count
+        result[ticket_id]["has_tasks"] = task_count > 0
+        result[ticket_id]["open_task_count"] = open_task_count
+        result[ticket_id]["has_open_tasks"] = open_task_count > 0
+
+    linked_asset_rows = await db.fetch_all(
+        f"""
+        SELECT ticket_id, COUNT(*) AS linked_asset_count
+        FROM ticket_assets
+        WHERE ticket_id IN ({placeholders})
+        GROUP BY ticket_id
+        """,
+        tuple(unique_ids),
+    )
+    for row in linked_asset_rows:
+        ticket_id = int(row["ticket_id"])
+        result[ticket_id]["linked_asset_count"] = int(
+            row.get("linked_asset_count") or 0
+        )
+
+    suggested_asset_rows = await db.fetch_all(
+        f"""
+        SELECT ticket_id, COUNT(*) AS suggested_asset_count
+        FROM ticket_suggested_assets
+        WHERE ticket_id IN ({placeholders})
+        GROUP BY ticket_id
+        """,
+        tuple(unique_ids),
+    )
+    for row in suggested_asset_rows:
+        ticket_id = int(row["ticket_id"])
+        result[ticket_id]["suggested_asset_count"] = int(
+            row.get("suggested_asset_count") or 0
+        )
+
+    latest_reply_rows = await db.fetch_all(
+        f"""
+        SELECT
+            tr.ticket_id,
+            tr.id,
+            tr.created_at,
+            tr.is_internal,
+            CASE WHEN tr.is_internal = 1 THEN 'internal_note' ELSE 'message' END AS kind,
+            CASE
+                WHEN tr.external_reference LIKE 'shipment-watch:%%' THEN 'system'
+                WHEN tr.is_internal = 1 THEN 'technician'
+                ELSE 'requester'
+            END AS ticket_update_actor_type
+        FROM ticket_replies AS tr
+        INNER JOIN (
+            SELECT ticket_id, MAX(id) AS latest_reply_id
+            FROM ticket_replies
+            WHERE ticket_id IN ({placeholders})
+            GROUP BY ticket_id
+        ) AS latest ON latest.latest_reply_id = tr.id
+        """,
+        tuple(unique_ids),
+    )
+    for row in latest_reply_rows:
+        ticket_id = int(row["ticket_id"])
+        result[ticket_id]["latest_reply_id"] = (
+            int(row.get("id")) if row.get("id") is not None else None
+        )
+        result[ticket_id]["latest_reply_at"] = _make_aware(row.get("created_at"))
+        result[ticket_id]["latest_reply_is_internal"] = bool(row.get("is_internal"))
+        result[ticket_id]["latest_reply_kind"] = row.get("kind")
+        result[ticket_id]["ticket_update_actor_type"] = row.get(
+            "ticket_update_actor_type"
+        )
+
+    latest_public_reply_rows = await db.fetch_all(
+        f"""
+        SELECT
+            tr.ticket_id,
+            CASE
+                WHEN tr.email_bounced_at IS NOT NULL THEN 'Bounced'
+                WHEN tr.email_opened_at IS NOT NULL THEN 'Read'
+                WHEN tr.email_delivered_at IS NOT NULL THEN 'Delivered'
+                WHEN tr.email_sent_at IS NOT NULL
+                    OR tr.email_tracking_id IS NOT NULL
+                    OR tr.smtp2go_message_id IS NOT NULL THEN 'Sent'
+                ELSE NULL
+            END AS email_status
+        FROM ticket_replies AS tr
+        INNER JOIN (
+            SELECT ticket_id, MAX(id) AS latest_reply_id
+            FROM ticket_replies
+            WHERE ticket_id IN ({placeholders})
+              AND is_internal = 0
+              AND (
+                  email_sent_at IS NOT NULL
+                  OR email_tracking_id IS NOT NULL
+                  OR smtp2go_message_id IS NOT NULL
+                  OR email_delivered_at IS NOT NULL
+                  OR email_opened_at IS NOT NULL
+                  OR email_bounced_at IS NOT NULL
+              )
+            GROUP BY ticket_id
+        ) AS latest_public ON latest_public.latest_reply_id = tr.id
+        """,
+        tuple(unique_ids),
+    )
+    for row in latest_public_reply_rows:
+        ticket_id = int(row["ticket_id"])
+        result[ticket_id]["latest_public_reply_email_status"] = row.get(
+            "email_status"
+        )
+
+    return result
+
+
+async def validate_replies_belong_to_ticket(
+    reply_ids: list[int], ticket_id: int
+) -> tuple[bool, str | None]:
+    """
+    Validate that all reply IDs belong to the specified ticket.
+    Returns (is_valid, error_message).
+    """
+    if not reply_ids:
+        return False, "No reply IDs provided"
+
+    placeholders = ", ".join(["%s"] * len(reply_ids))
+    rows = await db.fetch_all(
+        f"""
+        SELECT id, ticket_id
+        FROM ticket_replies
+        WHERE id IN ({placeholders})
+        """,
+        tuple(reply_ids),
+    )
+
+    if len(rows) != len(reply_ids):
+        found_ids = {row["id"] for row in rows}
+        missing_ids = set(reply_ids) - found_ids
+        return False, f"Reply IDs not found: {', '.join(map(str, missing_ids))}"
+
+    for row in rows:
+        if row["ticket_id"] != ticket_id:
+            return False, f"Reply {row['id']} does not belong to ticket {ticket_id}"
+
+    return True, None
+
+
+async def get_reply_by_id(reply_id: int) -> TicketRecord | None:
+    row = await db.fetch_one(
+        """
+        SELECT tr.*, lt.name AS labour_type_name, lt.code AS labour_type_code, lt.rate AS labour_type_rate
+        FROM ticket_replies tr
+        LEFT JOIN ticket_labour_types lt ON tr.labour_type_id = lt.id
+        WHERE tr.id = %s
+        """,
+        (reply_id,),
+    )
+    if row:
+        return _normalise_reply(row)
+    return None
+
+
+async def update_reply(
+    reply_id: int,
+    *,
+    minutes_spent: int | None | object = _UNSET,
+    is_billable: bool | object = _UNSET,
+    labour_type_id: int | None | object = _UNSET,
+) -> TicketRecord | None:
+    updates: list[str] = []
+    params: list[Any] = []
+    if minutes_spent is not _UNSET:
+        if minutes_spent is None:
+            updates.append("minutes_spent = NULL")
+        else:
+            updates.append("minutes_spent = %s")
+            params.append(int(minutes_spent))
+    if is_billable is not _UNSET:
+        updates.append("is_billable = %s")
+        params.append(1 if bool(is_billable) else 0)
+    if labour_type_id is not _UNSET and labour_type_id is not None:
+        updates.append("labour_type_id = %s")
+        params.append(int(labour_type_id))
+    if updates:
+        effective_minutes = minutes_spent
+        effective_labour_type_id = labour_type_id
+        if effective_minutes is _UNSET or effective_labour_type_id is _UNSET:
+            current = await get_reply_by_id(reply_id)
+            if effective_minutes is _UNSET:
+                current_minutes = current.get("minutes_spent") if current else None
+                effective_minutes = (
+                    current_minutes if isinstance(current_minutes, int) else None
+                )
+            if effective_labour_type_id is _UNSET:
+                current_labour_type_id = (
+                    current.get("labour_type_id") if current else None
+                )
+                effective_labour_type_id = (
+                    current_labour_type_id
+                    if isinstance(current_labour_type_id, int)
+                    else None
+                )
+        default_labour_type_id = await _default_labour_type_for_time_entry(
+            effective_minutes if isinstance(effective_minutes, int) else None,
+            (
+                effective_labour_type_id
+                if isinstance(effective_labour_type_id, int)
+                else None
+            ),
+        )
+        if effective_labour_type_id is None:
+            if default_labour_type_id is not None:
+                updates.append("labour_type_id = %s")
+                params.append(default_labour_type_id)
+            elif labour_type_id is None:
+                updates.append("labour_type_id = NULL")
+        params.append(reply_id)
+        await db.execute(
+            f"""
+            UPDATE ticket_replies
+            SET {', '.join(updates)}
+            WHERE id = %s
+            """,
+            tuple(params),
+        )
+    return await get_reply_by_id(reply_id)
+
+
+async def add_watcher(
+    ticket_id: int, user_id: int | None = None, email: str | None = None
+) -> None:
+    """Add a watcher to a ticket by user_id or email.
+
+    At least one of user_id or email must be provided.
+    """
+    if user_id is None and not email:
+        raise ValueError("Either user_id or email must be provided")
+
+    if user_id is not None:
+        # Adding by user_id
+        await db.execute(
+            """
+            INSERT INTO ticket_watchers (ticket_id, user_id, email)
+            VALUES (%s, %s, NULL)
+            ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)
+            """,
+            (ticket_id, user_id),
+        )
+    else:
+        # Adding by email only
+        email_normalized = email.strip().lower() if email else None
+        if not email_normalized:
+            raise ValueError("Email cannot be empty")
+
+        await db.execute(
+            """
+            INSERT INTO ticket_watchers (ticket_id, user_id, email)
+            VALUES (%s, NULL, %s)
+            ON DUPLICATE KEY UPDATE email = VALUES(email)
+            """,
+            (ticket_id, email_normalized),
+        )
+
+
+async def remove_watcher(
+    ticket_id: int, user_id: int | None = None, email: str | None = None
+) -> None:
+    """Remove a watcher from a ticket by user_id or email.
+
+    At least one of user_id or email must be provided.
+    """
+    if user_id is None and not email:
+        raise ValueError("Either user_id or email must be provided")
+
+    if user_id is not None:
+        await db.execute(
+            "DELETE FROM ticket_watchers WHERE ticket_id = %s AND user_id = %s",
+            (ticket_id, user_id),
+        )
+    else:
+        email_normalized = email.strip().lower() if email else None
+        await db.execute(
+            "DELETE FROM ticket_watchers WHERE ticket_id = %s AND email = %s",
+            (ticket_id, email_normalized),
+        )
+
+
+async def list_watchers(ticket_id: int) -> list[TicketRecord]:
+    rows = await db.fetch_all(
+        """
+        SELECT *
+        FROM ticket_watchers
+        WHERE ticket_id = %s
+        ORDER BY created_at ASC
+        """,
+        (ticket_id,),
+    )
+    return [_normalise_watcher(row) for row in rows]
+
+
+async def bulk_add_watchers(ticket_id: int, user_ids: Iterable[int]) -> None:
+    values: list[tuple[int, int]] = []
+    for user_id in user_ids:
+        values.append((ticket_id, int(user_id)))
+    if not values:
+        return
+    placeholders = ",".join(["(%s, %s)"] * len(values))
+    flat_params: list[Any] = []
+    for pair in values:
+        flat_params.extend(pair)
+    await db.execute(
+        f"""
+        INSERT INTO ticket_watchers (ticket_id, user_id)
+        VALUES {placeholders}
+        ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)
+        """,
+        tuple(flat_params),
+    )
+
+
+async def replace_watchers(
+    ticket_id: int, user_ids: Iterable[int], emails: Iterable[str] | None = None
+) -> None:
+    """Replace all watchers for a ticket with new user_ids and emails."""
+    await db.execute("DELETE FROM ticket_watchers WHERE ticket_id = %s", (ticket_id,))
+    await bulk_add_watchers(ticket_id, user_ids)
+
+    if emails:
+        for email in emails:
+            email_normalized = email.strip().lower() if email else None
+            if email_normalized:
+                await add_watcher(ticket_id, email=email_normalized)
+
+
+async def move_replies_to_ticket(
+    reply_ids: Iterable[int], target_ticket_id: int
+) -> int:
+    """Move specified replies to a different ticket. Returns count of moved replies."""
+    reply_list = list(reply_ids)
+    if not reply_list:
+        return 0
+    placeholders = ", ".join(["%s"] * len(reply_list))
+    return await db.execute_rowcount(
+        f"""
+        UPDATE ticket_replies
+        SET ticket_id = %s
+        WHERE id IN ({placeholders})
+        """,
+        (target_ticket_id, *reply_list),
+    )
+
+
+async def split_ticket(
+    original_ticket_id: int,
+    reply_ids: list[int],
+    new_ticket_subject: str,
+    new_ticket_id: int | None = None,
+) -> tuple[TicketRecord | None, TicketRecord | None, int]:
+    """
+    Split a ticket by moving specified replies to a new ticket.
+    Returns (original_ticket, new_ticket, moved_reply_count)
+    """
+    # Get original ticket to copy company_id and requester_id
+    original_ticket = await get_ticket(original_ticket_id)
+    if not original_ticket:
+        return None, None, 0
+
+    # Create new ticket with same company and requester
+    new_ticket = await create_ticket(
+        id=new_ticket_id,
+        subject=new_ticket_subject,
+        description=f"Split from ticket #{original_ticket_id}",
+        requester_id=original_ticket.get("requester_id"),
+        company_id=original_ticket.get("company_id"),
+        assigned_user_id=original_ticket.get("assigned_user_id"),
+        priority=original_ticket.get("priority", "normal"),
+        status="new",
+        category=original_ticket.get("category"),
+        module_slug=original_ticket.get("module_slug"),
+        external_reference=None,
+        ticket_number=None,
+    )
+
+    # Update new ticket to mark it as split from original
+    await db.execute(
+        "UPDATE tickets SET split_from_ticket_id = %s WHERE id = %s",
+        (original_ticket_id, new_ticket["id"]),
+    )
+
+    # Copy watchers to the split ticket so the same interested parties follow it.
+    for watcher in await list_watchers(original_ticket_id):
+        await add_watcher(
+            int(new_ticket["id"]),
+            user_id=watcher.get("user_id"),
+            email=watcher.get("email"),
+        )
+
+    # Move the specified replies to the new ticket. Time entries and billed-time
+    # records are reply-based, so moving the reply removes those minutes from
+    # the original ticket's billing totals.
+    moved_count = await move_replies_to_ticket(reply_ids, new_ticket["id"])
+
+    ticket_number = new_ticket.get("ticket_number") or new_ticket.get("id")
+    await create_reply(
+        ticket_id=original_ticket_id,
+        author_id=None,
+        body=f"Conversation split to ticket #{ticket_number}.",
+        is_internal=True,
+        minutes_spent=None,
+        is_billable=False,
+        external_reference=f"split:{new_ticket['id']}",
+    )
+
+    # Refresh ticket data
+    original_ticket = await get_ticket(original_ticket_id)
+    new_ticket = await get_ticket(new_ticket["id"])
+
+    return original_ticket, new_ticket, moved_count
+
+
+async def list_split_replies_for_original(
+    original_ticket_id: int,
+) -> list[TicketRecord]:
+    """Return replies moved to child tickets split from the original ticket."""
+    rows = await db.fetch_all(
+        """
+        SELECT
+            tr.*,
+            lt.name AS labour_type_name,
+            lt.code AS labour_type_code,
+            lt.rate AS labour_type_rate,
+            t.id AS split_to_ticket_id,
+            t.ticket_number AS split_to_ticket_number
+        FROM ticket_replies tr
+        INNER JOIN tickets t ON t.id = tr.ticket_id
+        LEFT JOIN ticket_labour_types lt ON tr.labour_type_id = lt.id
+        WHERE t.split_from_ticket_id = %s
+          AND (tr.external_reference IS NULL OR tr.external_reference NOT LIKE 'split:%%')
+        ORDER BY tr.created_at ASC
+        """,
+        (original_ticket_id,),
+    )
+    replies: list[TicketRecord] = []
+    for row in rows:
+        record = _normalise_reply(row)
+        record["is_split_hidden"] = True
+        if row.get("split_to_ticket_id") is not None:
+            record["split_to_ticket_id"] = int(row["split_to_ticket_id"])
+        record["split_to_ticket_number"] = row.get("split_to_ticket_number")
+        replies.append(record)
+    return replies
+
+
+async def merge_tickets(
+    ticket_ids: list[int],
+    target_ticket_id: int,
+) -> tuple[TicketRecord | None, list[int], int]:
+    """
+    Merge multiple tickets into a target ticket.
+    Returns (merged_ticket, list_of_merged_ids, moved_reply_count)
+    """
+    if target_ticket_id not in ticket_ids:
+        raise ValueError("Target ticket ID must be in the list of ticket IDs to merge")
+
+    # Get target ticket
+    target_ticket = await get_ticket(target_ticket_id)
+    if not target_ticket:
+        return None, [], 0
+
+    # Get source ticket IDs (all except target)
+    source_ticket_ids = [tid for tid in ticket_ids if tid != target_ticket_id]
+    if not source_ticket_ids:
+        return target_ticket, [], 0
+
+    moved_count = 0
+
+    # Move watchers first so child tickets stop receiving notifications while the
+    # parent keeps all interested parties. add_watcher handles duplicates.
+    for source_id in source_ticket_ids:
+        for watcher in await list_watchers(source_id):
+            await add_watcher(
+                target_ticket_id,
+                user_id=watcher.get("user_id"),
+                email=watcher.get("email"),
+            )
+        await db.execute(
+            "DELETE FROM ticket_watchers WHERE ticket_id = %s", (source_id,)
+        )
+
+    # Move all replies from source tickets to target ticket
+    for source_id in source_ticket_ids:
+        # Get all replies for this source ticket
+        replies = await list_replies(source_id, include_internal=True)
+        reply_ids = [r["id"] for r in replies]
+        if reply_ids:
+            count = await move_replies_to_ticket(reply_ids, target_ticket_id)
+            moved_count += count
+
+    # Mark source tickets as merged into target
+    placeholders = ", ".join(["%s"] * len(source_ticket_ids))
+    await db.execute(
+        f"""
+        UPDATE tickets
+        SET merged_into_ticket_id = %s,
+            status = 'closed',
+            closed_at = NOW()
+        WHERE id IN ({placeholders})
+        """,
+        (target_ticket_id, *source_ticket_ids),
+    )
+
+    # Refresh target ticket
+    target_ticket = await get_ticket(target_ticket_id)
+
+    return target_ticket, source_ticket_ids, moved_count
+
+
+async def list_merged_child_tickets(parent_ticket_id: int) -> list[TicketRecord]:
+    """Return tickets that have been merged into the supplied parent ticket."""
+    rows = await db.fetch_all(
+        """
+        SELECT *
+        FROM tickets
+        WHERE merged_into_ticket_id = %s
+        ORDER BY id ASC
+        """,
+        (parent_ticket_id,),
+    )
+    return [_normalise_ticket(row) for row in rows]
+
+
+async def get_merged_target_ticket_id(ticket_id: int) -> int | None:
+    """
+    Get the final merged target ticket ID if this ticket has been merged.
+    Follows the chain of merged_into_ticket_id to find the final active ticket.
+    """
+    visited = set()
+    current_id = ticket_id
+
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        row = await db.fetch_one(
+            "SELECT merged_into_ticket_id FROM tickets WHERE id = %s",
+            (current_id,),
+        )
+        if not row:
+            return None
+
+        merged_into = row.get("merged_into_ticket_id")
+        if merged_into is None:
+            # This ticket is not merged, it's the final target
+            return current_id if current_id != ticket_id else None
+
+        current_id = merged_into
+
+    # Circular reference or chain too long
+    return None

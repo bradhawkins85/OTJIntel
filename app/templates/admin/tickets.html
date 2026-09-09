@@ -1,0 +1,1362 @@
+{% extends "base.html" %}
+{% from "macros/counters.html" import counter_strip %}
+{% set can_merge_tickets = is_helpdesk_technician | default(false) %}
+{% set can_bulk_edit_tickets = is_helpdesk_technician | default(false) %}
+
+{% block header_title %}
+  {% set show_ticket_automations = is_super_admin %}
+  {% set show_syncro_import = syncro_module_enabled and (is_super_admin or (is_helpdesk_technician | default(false))) %}
+  {% set show_ticket_status_editor = is_super_admin %}
+  {% set show_labour_type_editor = is_super_admin %}
+  {% set show_tag_exclusions = is_super_admin %}
+  {% set show_next_ticket_number = is_super_admin %}
+  {% set show_unbill_tickets = is_super_admin %}
+  {% set show_email_blocklist = is_super_admin %}
+  {% set show_attachment_blocklist = is_helpdesk_technician | default(false) %}
+  {% set can_create_canned_response = is_helpdesk_technician | default(false) %}
+  {% set show_ticket_tools = show_ticket_automations or show_syncro_import or show_ticket_status_editor or show_labour_type_editor or show_next_ticket_number or show_unbill_tickets or show_email_blocklist or show_attachment_blocklist or show_tag_exclusions or can_bulk_delete_tickets or can_merge_tickets or can_bulk_edit_tickets or can_create_canned_response %}
+  <div class="header-title-menu">
+    <span class="header-title-menu__label">Ticketing workspace</span>
+    <button
+      type="button"
+      class="button button--primary"
+      data-create-ticket-modal-open
+      aria-haspopup="dialog"
+      aria-controls="create-ticket-modal"
+    >
+      New ticket
+    </button>
+    {% if show_ticket_tools %}
+      <details class="header-title-menu__dropdown" data-header-menu>
+        <summary class="header-title-menu__toggle" data-header-menu-toggle aria-haspopup="true">
+          Ticket tools
+          <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" class="header-title-menu__icon">
+            <path d="M6.2 8.2a1 1 0 0 1 1.4 0L12 12.6l4.4-4.4a1 1 0 0 1 1.4 1.4l-5.1 5.1a1 1 0 0 1-1.4 0L6.2 9.6a1 1 0 0 1 0-1.4z" />
+          </svg>
+          <span class="visually-hidden">Toggle ticket tools menu</span>
+        </summary>
+        <ul class="header-title-menu__list" role="menu">
+          {% if can_create_canned_response %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-canned-response-create-open
+                aria-haspopup="dialog"
+                aria-controls="canned-response-create-modal"
+              >
+                Manage canned responses
+              </button>
+            </li>
+          {% endif %}
+          {% if show_ticket_automations %}
+            <li class="header-title-menu__item" role="none">
+              <a href="/admin/automations" class="header-title-menu__link" role="menuitem">Ticket automations</a>
+            </li>
+          {% endif %}
+          {% if show_syncro_import %}
+            <li class="header-title-menu__item" role="none">
+              <a href="/admin/tickets/syncro-import" class="header-title-menu__link" role="menuitem">Syncro ticket import</a>
+            </li>
+          {% endif %}
+          {% if show_ticket_status_editor %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-edit-ticket-statuses-open
+                aria-haspopup="dialog"
+                aria-controls="edit-ticket-statuses-modal"
+              >
+                Edit statuses
+              </button>
+            </li>
+          {% endif %}
+          {% if show_labour_type_editor %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-edit-labour-types-open
+                aria-haspopup="dialog"
+                aria-controls="edit-labour-types-modal"
+              >
+                Manage labour types
+              </button>
+            </li>
+          {% endif %}
+          {% if show_next_ticket_number %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-next-ticket-number-open
+                data-current-next-ticket-number="{{ next_ticket_number or '' }}"
+              >
+                Next ticket number
+              </button>
+            </li>
+          {% endif %}
+          {% if show_unbill_tickets %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-unbill-tickets-open
+              >
+                Un-bill tickets
+              </button>
+            </li>
+          {% endif %}
+          {% if show_email_blocklist %}
+            <li class="header-title-menu__item" role="none">
+              <a href="/admin/tickets/email-blocklist" class="header-title-menu__link" role="menuitem">Email blocklist</a>
+            </li>
+          {% endif %}
+          {% if show_attachment_blocklist %}
+            <li class="header-title-menu__item" role="none">
+              <a href="/admin/tickets/attachment-blocklist" class="header-title-menu__link" role="menuitem">Attachment blocklist</a>
+            </li>
+          {% endif %}
+          {% if show_tag_exclusions %}
+            <li class="header-title-menu__item" role="none">
+              <a href="/admin/tag-exclusions" class="header-title-menu__link" role="menuitem">AI tag exclusions</a>
+            </li>
+          {% endif %}
+          {% if can_bulk_edit_tickets %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-ticket-bulk-edit-open
+                aria-haspopup="dialog"
+                aria-controls="bulk-edit-tickets-modal"
+                disabled
+              >
+                Bulk Edit
+                <span data-ticket-bulk-edit-count hidden>(0)</span>
+              </button>
+            </li>
+          {% endif %}
+          {% if can_merge_tickets %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="button"
+                class="header-title-menu__link"
+                role="menuitem"
+                data-ticket-merge-open
+                aria-haspopup="dialog"
+                aria-controls="merge-tickets-modal"
+                disabled
+              >
+                Merge Tickets
+                <span data-ticket-merge-count hidden>(0)</span>
+              </button>
+            </li>
+          {% endif %}
+          {% if can_bulk_delete_tickets %}
+            <li class="header-title-menu__item" role="none">
+              <button
+                type="submit"
+                form="tickets-bulk-delete-form"
+                class="header-title-menu__link header-title-menu__link--danger"
+                role="menuitem"
+                data-bulk-delete-submit
+                disabled
+              >
+                Delete selected
+                <span data-bulk-delete-count hidden>(0)</span>
+              </button>
+            </li>
+          {% endif %}
+        </ul>
+      </details>
+    {% endif %}
+  </div>
+
+  {% if can_create_canned_response %}
+    <div class="modal" id="canned-response-create-modal" role="dialog" aria-modal="true" aria-labelledby="canned-response-create-title" hidden>
+      <div class="modal__content" role="document">
+        <button type="button" class="modal__close" data-modal-close aria-label="Close">×</button>
+        <h2 class="modal__title" id="canned-response-create-title">Manage canned responses</h2>
+        <details class="card" open>
+          <summary class="card__title">Add canned response</summary>
+          <form action="/admin/tickets/canned-responses" method="post" class="form">
+            {% include "partials/csrf.html" %}
+            <div class="form-field">
+              <label class="form-label required" for="canned-response-title">Title</label>
+              <input id="canned-response-title" name="title" class="form-input" maxlength="255" required />
+            </div>
+            <div class="form-field">
+              <label class="form-label required" for="canned-response-body">Reply text</label>
+              <textarea id="canned-response-body" name="body" class="form-input" rows="8" required placeholder="Use variables like {{ '{{ ticket.ticket_number }}' }}, {{ '{{ ticket.subject }}' }}, {{ '{{ requester.name }}' }}, or {{ '{{ company.name }}' }}."></textarea>
+              <p class="form-help">Variables are enriched when the canned response is inserted into a ticket reply.</p>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+              <button type="submit" class="button button--primary">Save response</button>
+            </div>
+          </form>
+        </details>
+        <div class="form-section">
+          <h3 class="form-section__title">Existing responses</h3>
+          {% for response in ticket_canned_responses %}
+            <details class="card">
+              <summary class="card__title">{{ response.title }}</summary>
+              <form action="/admin/tickets/canned-responses/{{ response.id }}" method="post" class="form">
+                {% include "partials/csrf.html" %}
+                <div class="form-field">
+                  <label class="form-label required" for="canned-response-title-{{ response.id }}">Title</label>
+                  <input id="canned-response-title-{{ response.id }}" name="title" class="form-input" maxlength="255" required value="{{ response.title }}" />
+                </div>
+                <div class="form-field">
+                  <label class="form-label required" for="canned-response-body-{{ response.id }}">Reply text</label>
+                  <textarea id="canned-response-body-{{ response.id }}" name="body" class="form-input" rows="8" required>{{ response.body }}</textarea>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="button button--primary">Update response</button>
+                  <button type="submit" class="button button--danger" formaction="/admin/tickets/canned-responses/{{ response.id }}/delete" formnovalidate onclick="return window.confirm('Delete this canned response?')">Delete response</button>
+                </div>
+              </form>
+            </details>
+          {% else %}
+            <p class="card__empty">No canned responses have been created yet.</p>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  {% if show_next_ticket_number %}
+    <form action="/admin/tickets/next-number" method="post" data-next-ticket-number-form hidden>
+      {% include "partials/csrf.html" %}
+      <input type="hidden" name="nextTicketNumber" value="" data-next-ticket-number-input />
+    </form>
+  {% endif %}
+
+
+  {% if show_unbill_tickets %}
+    <form action="/admin/tickets/unbill-older-than" method="post" data-unbill-tickets-form hidden>
+      {% include "partials/csrf.html" %}
+      <input type="hidden" name="cutoffDate" value="" data-unbill-tickets-date-input />
+    </form>
+  {% endif %}
+
+{% endblock %}
+
+{% block content %}
+  {% if can_bulk_edit_tickets %}
+    <div class="modal" id="bulk-edit-tickets-modal" data-ticket-bulk-edit-modal hidden role="dialog" aria-modal="true" aria-labelledby="bulk-edit-tickets-title">
+      <div class="modal__backdrop" data-ticket-bulk-edit-close></div>
+      <div class="modal__dialog">
+        <div class="modal__header">
+          <h2 id="bulk-edit-tickets-title">Bulk edit selected tickets</h2>
+          <button type="button" class="modal__close" data-ticket-bulk-edit-close aria-label="Close bulk edit tickets modal">×</button>
+        </div>
+        <form action="/admin/tickets/bulk-edit" method="post" data-ticket-bulk-edit-form>
+          {% include "partials/csrf.html" %}
+          <input type="hidden" name="returnUrl" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}" />
+          <div data-ticket-bulk-edit-selected></div>
+          <div class="modal__body">
+            <p>Update the status for <strong data-ticket-bulk-edit-summary>0 selected tickets</strong>. Use this to quickly close excess notification tickets during an influx.</p>
+            <div class="form-field">
+              <label class="form-label" for="bulk-edit-ticket-status">Status</label>
+              <select id="bulk-edit-ticket-status" name="status" class="form-input" required>
+                {% for status_option in ticket_status_definitions %}
+                  <option value="{{ status_option.tech_status }}">{{ status_option.tech_label }}</option>
+                {% else %}
+                  <option value="closed">Closed</option>
+                {% endfor %}
+              </select>
+            </div>
+            <p class="form-help" data-ticket-bulk-edit-error hidden></p>
+          </div>
+          <div class="modal__footer">
+            <button type="button" class="button button--ghost" data-ticket-bulk-edit-close>Cancel</button>
+            <button type="submit" class="button button--primary" data-ticket-bulk-edit-submit>Update tickets</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+  {% if can_merge_tickets %}
+    <div class="modal" id="merge-tickets-modal" data-ticket-merge-modal hidden role="dialog" aria-modal="true" aria-labelledby="merge-tickets-title">
+      <div class="modal__backdrop" data-ticket-merge-close></div>
+      <div class="modal__dialog">
+        <div class="modal__header">
+          <h2 id="merge-tickets-title">Merge selected tickets</h2>
+          <button type="button" class="modal__close" data-ticket-merge-close aria-label="Close merge tickets modal">×</button>
+        </div>
+        <div class="modal__body">
+          <p>Select which ticket should become the parent. Child tickets will stop billing and automations, and their time entries and watchers will move to the parent.</p>
+          <div data-ticket-merge-list class="ticket-merge-list"></div>
+          <p class="form-help" data-ticket-merge-error hidden></p>
+        </div>
+        <div class="modal__footer">
+          <button type="button" class="button button--ghost" data-ticket-merge-close>Cancel</button>
+          <button type="button" class="button button--primary" data-ticket-merge-submit>Merge tickets</button>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  <div class="management management--single" data-layout>
+    <section class="management__content">
+      <div class="management__body" data-ticket-view-manager>
+        <div class="ticket-dashboard__overview">
+          <!-- Filters and Controls Container -->
+          <aside class="ticket-filters-panel" data-ticket-filters-panel>
+            <div class="ticket-filters" id="ticket-filters">
+              <!-- View Management Section -->
+              <div class="ticket-filters__section">
+                <h3 class="ticket-filters__section-title">Saved Views</h3>
+                <div class="ticket-filters__view-controls">
+                  <div class="ticket-filters__view-selector">
+                    <label class="form-label" for="ticket-view-select">Select saved view</label>
+                    <select id="ticket-view-select" class="form-input" data-view-select>
+                      <option value="">Select a view...</option>
+                    </select>
+                  </div>
+                  <div class="ticket-filters__view-actions">
+                    <button type="button" class="button button--ghost button--compact" data-save-view title="Save current filters as a new view">
+                      Save View
+                    </button>
+                    <button type="button" class="button button--primary button--compact" data-update-view title="Update selected view with current filters" hidden>
+                      Update View
+                    </button>
+                    <button type="button" class="button button--ghost button--compact" data-delete-view title="Delete current view">
+                      Delete View
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Search Section -->
+              <div class="ticket-filters__section ticket-filters__section--horizontal">
+                <div class="ticket-filters__search-control">
+                  <label class="form-label" for="ticket-quick-filter">Quick search</label>
+                  <input
+                    id="ticket-quick-filter"
+                    type="search"
+                    class="form-input"
+                    placeholder="Filter tickets"
+                    aria-label="Filter tickets"
+                    data-table-filter="tickets-table" data-ticket-dashboard-search
+                  />
+                </div>
+                <div class="ticket-filters__limit-control">
+                  <label class="form-label" for="ticket-result-limit">Results</label>
+                  <select id="ticket-result-limit" class="form-input" data-ticket-dashboard-limit>
+                    <option value="50">50 tickets</option>
+                    <option value="100">100 tickets</option>
+                    <option value="200" selected>200 tickets</option>
+                    <option value="500">500 tickets</option>
+                    <option value="all">All tickets</option>
+                  </select>
+                </div>
+                <div class="management__toolbar ticket-dashboard__dropdowns">
+            {% if can_bulk_delete_tickets %}
+              {% set current_query = request.url.query %}
+              <form
+                id="tickets-bulk-delete-form"
+                action="/admin/tickets/bulk-delete"
+                method="post"
+                data-bulk-delete-form
+                hidden
+              >
+                {% if csrf_token %}
+                  <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+                {% endif %}
+                <input
+                  type="hidden"
+                  name="returnUrl"
+                  value="{{ request.url.path }}{% if current_query %}?{{ current_query }}{% endif %}"
+                />
+              </form>
+            {% endif %}
+
+            <div class="ticket-columns ticket-group-by" data-ticket-group-by>
+              <button type="button" class="button button--ghost ticket-columns__toggle" data-group-by-toggle aria-haspopup="true" aria-expanded="false">
+                <span data-group-by-label>Group By</span>
+                <span class="ticket-columns__chevron" aria-hidden="true">▾</span>
+              </button>
+              <div class="ticket-columns__panel" data-group-by-panel hidden>
+                <p class="ticket-columns__title">Group tickets by</p>
+                <p class="ticket-group-by__hint">Select multiple fields in the order they should be grouped.</p>
+                <div class="ticket-columns__options">
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-group-by-toggle" data-grouping-field="company" />
+                    <span>Company</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-group-by-toggle" data-grouping-field="assigned" />
+                    <span>Assigned user</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-group-by-toggle" data-grouping-field="status" />
+                    <span>Status</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-group-by-toggle" data-grouping-field="priority" />
+                    <span>Priority</span>
+                  </label>
+                </div>
+                <button type="button" class="button button--ghost button--compact ticket-group-by__clear" data-group-by-clear>Clear grouping</button>
+              </div>
+            </div>
+            <div class="ticket-columns" data-ticket-columns>
+              <button type="button" class="button button--ghost ticket-columns__toggle" data-columns-toggle aria-haspopup="true">
+                <span>Columns</span>
+                <span class="ticket-columns__chevron" aria-hidden="true">▾</span>
+              </button>
+              <div class="ticket-columns__panel" data-columns-panel hidden>
+                <p class="ticket-columns__title">Toggle columns</p>
+                <div class="ticket-columns__options">
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="id" checked />
+                    <span>ID</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="subject" checked disabled />
+                    <span>Subject</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="status" checked />
+                    <span>Status</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="priority" checked />
+                    <span>Priority</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="company" checked />
+                    <span>Company</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="sla" checked />
+                    <span>SLA</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="assigned" checked />
+                    <span>Assigned</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="updated" checked />
+                    <span>Updated</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="last-reply-status" checked />
+                    <span>Last Reply Status</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="review-date" />
+                    <span>Review Date</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="category" />
+                    <span>Category</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="requester" />
+                    <span>Requester</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="module" />
+                    <span>Module</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="external-ref" />
+                    <span>External Ref</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="created" />
+                    <span>Created</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="closed" />
+                    <span>Closed</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="ai-status" />
+                    <span>AI Status</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="ai-tags" />
+                    <span>AI Tags</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="billable-minutes" />
+                    <span>Billable Minutes</span>
+                  </label>
+                  <label class="ticket-columns__option">
+                    <input type="checkbox" class="ticket-column-toggle" data-column="non-billable-minutes" />
+                    <span>Non-Billable Minutes</span>
+                  </label>
+                  {% set automation_column_options = [
+                    ('requester-email', 'ticket.requester_email'),
+                    ('requester-display-name', 'ticket.requester_display_name'),
+                    ('assigned-user-email', 'ticket.assigned_user_email'),
+                    ('assigned-user-display-name', 'ticket.assigned_user_display_name'),
+                    ('company-id', 'ticket.company.id'),
+                    ('has-attachments', 'ticket.has_attachments'),
+                    ('attachment-count', 'ticket.attachment_count'),
+                    ('has-tasks', 'ticket.has_tasks'),
+                    ('task-count', 'ticket.task_count'),
+                    ('has-open-tasks', 'ticket.has_open_tasks'),
+                    ('open-task-count', 'ticket.open_task_count'),
+                    ('labels', 'ticket.labels'),
+                    ('age-days', 'ticket.age_days'),
+                    ('updated-age-hours', 'ticket.updated_age_hours'),
+                    ('in-status-hours', 'ticket.in_status_age_hours'),
+                    ('last-reply-age-hours', 'ticket.last_reply_age_hours'),
+                    ('latest-reply-internal', 'reply.is_internal'),
+                    ('latest-reply-kind', 'reply.kind'),
+                    ('ticket-update-actor-type', 'ticket_update.actor_type')
+                  ] %}
+                  {% for column_key, column_label in automation_column_options %}
+                    <label class="ticket-columns__option">
+                      <input type="checkbox" class="ticket-column-toggle" data-column="{{ column_key }}" />
+                      <span>{{ column_label }}</span>
+                    </label>
+                  {% endfor %}
+                </div>
+              </div>
+            </div>
+          </div>
+              </div>
+
+            </div>
+          </aside>
+
+          <div class="ticket-dashboard__right-column">
+            {% set ticket_stat_items = [] %}
+            {% set visible_ticket_total = namespace(value=0) %}
+            {% set ticket_stat_variants = {
+              'open': 'info',
+              'in_progress': 'warning',
+              'pending': 'maintenance',
+              'resolved': 'success',
+              'closed': 'neutral'
+            } %}
+            {% for definition in ticket_status_definitions %}
+              {% set status_count = ticket_status_counts.get(definition.tech_status, 0) %}
+              {% if status_count > 0 %}
+                {% set visible_ticket_total.value = visible_ticket_total.value + status_count %}
+              {% endif %}
+              {% set _ = ticket_stat_items.append({
+                  'label': definition.tech_label,
+                  'value': status_count,
+                  'variant': ticket_stat_variants.get(definition.tech_status, ['info', 'warning', 'success', 'neutral'][loop.index0 % 4]),
+                  'attrs': {
+                    'data-ticket-stat': definition.tech_status,
+                    'data-ticket-stat-selected': 'true' if status_count > 0 else 'false',
+                    'hidden': status_count <= 0,
+                  }
+                }) %}
+            {% endfor %}
+            <div class="ticket-dashboard__stats" data-ticket-stats>
+              <div class="ticket-stat-controls ticket-columns" data-ticket-stat-controls>
+                <button
+                  type="button"
+                  class="button button--ghost button--compact ticket-columns__toggle"
+                  data-ticket-stats-toggle
+                  aria-haspopup="true"
+                  aria-expanded="false"
+                >
+                  <span>Stats</span>
+                  <span class="ticket-columns__chevron" aria-hidden="true">▾</span>
+                </button>
+                <div class="ticket-columns__panel ticket-stat-controls__panel" data-ticket-stats-panel hidden>
+                  <p class="ticket-columns__title">Show ticket stats</p>
+                  <div class="ticket-columns__options">
+                    {% for definition in ticket_status_definitions %}
+                      {% set status_count = ticket_status_counts.get(definition.tech_status, 0) %}
+                      <label class="ticket-columns__option">
+                        <input
+                          type="checkbox"
+                          class="ticket-stat-toggle"
+                          data-ticket-stat-toggle="{{ definition.tech_status }}"
+                          {% if status_count > 0 %}checked{% endif %}
+                        />
+                        <span>{{ definition.tech_label }}</span>
+                      </label>
+                    {% endfor %}
+                  </div>
+                </div>
+              </div>
+              {{ counter_strip(
+                ticket_stat_items,
+                total=visible_ticket_total.value,
+                total_label='All tickets',
+                total_attrs={'data-ticket-stat': 'total'},
+                class='ticket-dashboard__stats-strip',
+              ) }}
+            </div>
+
+
+
+          <div class="management__toolbar-info">
+            <span data-table-info>Showing {{ tickets|length }} tickets</span>
+          </div>
+
+          <div class="table-wrapper">
+          <table
+            class="table tickets-table"
+            id="tickets-table"
+            data-table data-table-id="tickets"
+            data-bulk-delete-table
+            data-table-refresh-url="{{ ticket_dashboard_endpoint or '' }}"
+            data-table-refresh-topics="{{ (ticket_refresh_topics or []) | join(',') }}"
+            data-table-refresh-handler="tickets"
+            data-table-refresh-success="Tickets updated."
+            data-table-refresh-error="Unable to refresh tickets automatically."
+            data-ticket-status-options='{{ ticket_status_definitions | tojson }}'
+            data-csrf-token="{{ csrf_token or '' }}"
+            data-can-bulk-delete="{{ 'true' if can_bulk_delete_tickets else 'false' }}"
+            data-can-merge-tickets="{{ 'true' if can_merge_tickets else 'false' }}"
+            data-can-bulk-edit-tickets="{{ 'true' if can_bulk_edit_tickets else 'false' }}"
+            data-bulk-delete-form-id="tickets-bulk-delete-form"
+            data-table-empty-label="No tickets found for the selected filters."
+            {% if ticket_autoload %}data-table-autoload{% endif %}
+          >
+            <thead>
+              <tr>
+                {% if can_bulk_delete_tickets or can_merge_tickets or can_bulk_edit_tickets %}
+                  <th scope="col" class="table__select tickets-table__column tickets-table__column--select">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all tickets"
+                      data-bulk-select-all
+                      form="tickets-bulk-delete-form"
+                    />
+                  </th>
+                {% endif %}
+                <th scope="col" data-sort="int" data-column="id" class="tickets-table__column tickets-table__column--id">ID</th>
+                <th
+                  scope="col"
+                  data-sort="string"
+                  data-column="subject"
+                  data-mobile-priority="essential"
+                  class="tickets-table__column tickets-table__column--subject"
+                >
+                  Subject
+                </th>
+                <th scope="col" data-sort="string" data-column="status" class="tickets-table__column tickets-table__column--status">
+                  <span class="ticket-status-filter" data-ticket-status-filter-menu>
+                    <span>Status</span>
+                    <button
+                      type="button"
+                      class="ticket-status-filter__toggle"
+                      data-ticket-status-filter-toggle
+                      aria-label="Filter tickets by status"
+                      aria-haspopup="true"
+                      aria-expanded="false"
+                      aria-controls="ticket-status-filter-options"
+                      title="Filter by status"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <path d="M3.5 5.25A1.25 1.25 0 0 1 4.75 4h14.5a1.25 1.25 0 0 1 .96 2.05L14.5 12.9v5.35a1.25 1.25 0 0 1-.69 1.12l-2.5 1.25a1.25 1.25 0 0 1-1.81-1.12v-6.6L3.79 6.05a1.25 1.25 0 0 1-.29-.8Z" />
+                      </svg>
+                    </button>
+                    <span class="ticket-status-filter__panel" id="ticket-status-filter-options" data-ticket-status-filter-panel hidden>
+                      <span class="ticket-status-filter__title">Filter by status</span>
+                      {% for status_option in ticket_filter_status_definitions | default(ticket_status_definitions) %}
+                        <label class="ticket-status-filter__option">
+                          <input type="checkbox" value="{{ status_option.tech_status }}" data-status-filter checked />
+                          <span>{{ status_option.tech_label }}</span>
+                        </label>
+                      {% endfor %}
+                    </span>
+                  </span>
+                </th>
+                <th scope="col" data-sort="string" data-column="priority" class="tickets-table__column tickets-table__column--priority">Priority</th>
+                <th scope="col" data-sort="string" data-column="company" class="tickets-table__column tickets-table__column--company">Company</th>
+                <th scope="col" data-sort="string" data-column="sla" class="tickets-table__column tickets-table__column--sla">SLA</th>
+                <th scope="col" data-sort="string" data-column="assigned" class="tickets-table__column tickets-table__column--assigned">Assigned</th>
+                <th scope="col" data-sort="string" data-column="updated" class="tickets-table__column tickets-table__column--updated">Updated</th>
+                <th scope="col" data-sort="string" data-column="last-reply-status" class="tickets-table__column tickets-table__column--last-reply-status">Last Reply Status</th>
+                <th scope="col" data-sort="string" data-column="review-date" class="tickets-table__column tickets-table__column--review-date">Review Date</th>
+                <th scope="col" data-sort="string" data-column="category" class="tickets-table__column tickets-table__column--category">Category</th>
+                <th scope="col" data-sort="string" data-column="requester" class="tickets-table__column tickets-table__column--requester">Requester</th>
+                <th scope="col" data-sort="string" data-column="module" class="tickets-table__column tickets-table__column--module">Module</th>
+                <th scope="col" data-sort="string" data-column="external-ref" class="tickets-table__column tickets-table__column--external-ref">External Ref</th>
+                <th scope="col" data-sort="string" data-column="created" class="tickets-table__column tickets-table__column--created">Created</th>
+                <th scope="col" data-sort="string" data-column="closed" class="tickets-table__column tickets-table__column--closed">Closed</th>
+                <th scope="col" data-sort="string" data-column="ai-status" class="tickets-table__column tickets-table__column--ai-status">AI Status</th>
+                <th scope="col" data-sort="string" data-column="ai-tags" class="tickets-table__column tickets-table__column--ai-tags">AI Tags</th>
+                <th scope="col" data-sort="int" data-column="billable-minutes" class="tickets-table__column tickets-table__column--billable-minutes">Billable Mins</th>
+                <th scope="col" data-sort="int" data-column="non-billable-minutes" class="tickets-table__column tickets-table__column--non-billable-minutes">Non-Billable Mins</th>
+                <th scope="col" data-sort="string" data-column="requester-email" class="tickets-table__column tickets-table__column--requester-email">ticket.requester_email</th>
+                <th scope="col" data-sort="string" data-column="requester-display-name" class="tickets-table__column tickets-table__column--requester-display-name">ticket.requester_display_name</th>
+                <th scope="col" data-sort="string" data-column="assigned-user-email" class="tickets-table__column tickets-table__column--assigned-user-email">ticket.assigned_user_email</th>
+                <th scope="col" data-sort="string" data-column="assigned-user-display-name" class="tickets-table__column tickets-table__column--assigned-user-display-name">ticket.assigned_user_display_name</th>
+                <th scope="col" data-sort="int" data-column="company-id" class="tickets-table__column tickets-table__column--company-id">ticket.company.id</th>
+                <th scope="col" data-sort="string" data-column="has-attachments" class="tickets-table__column tickets-table__column--has-attachments">ticket.has_attachments</th>
+                <th scope="col" data-sort="int" data-column="attachment-count" class="tickets-table__column tickets-table__column--attachment-count">ticket.attachment_count</th>
+                <th scope="col" data-sort="string" data-column="has-tasks" class="tickets-table__column tickets-table__column--has-tasks">ticket.has_tasks</th>
+                <th scope="col" data-sort="int" data-column="task-count" class="tickets-table__column tickets-table__column--task-count">ticket.task_count</th>
+                <th scope="col" data-sort="string" data-column="has-open-tasks" class="tickets-table__column tickets-table__column--has-open-tasks">ticket.has_open_tasks</th>
+                <th scope="col" data-sort="int" data-column="open-task-count" class="tickets-table__column tickets-table__column--open-task-count">ticket.open_task_count</th>
+                <th scope="col" data-sort="string" data-column="labels" class="tickets-table__column tickets-table__column--labels">ticket.labels</th>
+                <th scope="col" data-sort="int" data-column="age-days" class="tickets-table__column tickets-table__column--age-days">ticket.age_days</th>
+                <th scope="col" data-sort="int" data-column="updated-age-hours" class="tickets-table__column tickets-table__column--updated-age-hours">ticket.updated_age_hours</th>
+                <th scope="col" data-sort="int" data-column="in-status-hours" class="tickets-table__column tickets-table__column--in-status-hours">ticket.in_status_age_hours</th>
+                <th scope="col" data-sort="int" data-column="last-reply-age-hours" class="tickets-table__column tickets-table__column--last-reply-age-hours">ticket.last_reply_age_hours</th>
+                <th scope="col" data-sort="string" data-column="latest-reply-internal" class="tickets-table__column tickets-table__column--latest-reply-internal">reply.is_internal</th>
+                <th scope="col" data-sort="string" data-column="latest-reply-kind" class="tickets-table__column tickets-table__column--latest-reply-kind">reply.kind</th>
+                <th scope="col" data-sort="string" data-column="ticket-update-actor-type" class="tickets-table__column tickets-table__column--ticket-update-actor-type">ticket_update.actor_type</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if tickets %}
+                {% set company_lookup = ticket_company_lookup or {} %}
+                {% set user_lookup = ticket_user_lookup or {} %}
+                {% set resolution_label_map = {'likely_resolved': 'Likely Resolved', 'likely_in_progress': 'Likely In Progress'} %}
+                {% for ticket in tickets %}
+                  {% set company = company_lookup.get(ticket.company_id) %}
+                  {% set assigned = user_lookup.get(ticket.assigned_user_id) %}
+                  {% set assigned_name = ([assigned.first_name, assigned.last_name] | select | join(' ')) | trim if assigned else '' %}
+                  {% set assigned_label = assigned_name or (assigned.email if assigned else '—') %}
+                  <tr>
+                    {% if can_bulk_delete_tickets or can_merge_tickets or can_bulk_edit_tickets %}
+                      <td data-label="Select" class="table__select tickets-table__cell tickets-table__cell--select">
+                        <input
+                          type="checkbox"
+                          name="ticketIds"
+                          value="{{ ticket.id }}"
+                          aria-label="Select ticket {{ ticket.id }}"
+                          data-bulk-delete-checkbox
+                          data-ticket-select-checkbox
+                          {% if can_bulk_delete_tickets %}form="tickets-bulk-delete-form"{% endif %}
+                        />
+                      </td>
+                    {% endif %}
+                    <td data-label="ID" data-column="id" class="tickets-table__cell tickets-table__cell--id">{{ ticket.id }}</td>
+                    <td
+                      data-label="Subject"
+                      data-column="subject"
+                      data-mobile-priority="essential"
+                      class="tickets-table__cell tickets-table__cell--subject"
+                    >
+                      <a href="/admin/tickets/{{ ticket.id }}">{{ ticket.subject }}</a>
+                    </td>
+                    {% set ticket_status = (ticket.status or 'open') %}
+                    {% set status_label = ticket_status_label_map.get(ticket_status, ticket_status.replace('_', ' ').title()) %}
+                    {% set status_badge_map = {
+                      'open': 'badge--warning',
+                      'in_progress': 'badge--warning',
+                      'pending': 'badge--warning',
+                      'resolved': 'badge--success',
+                      'closed': 'badge--muted'
+                    } %}
+                    <td data-label="Status" data-column="status" data-value="{{ ticket_status }}" class="tickets-table__cell tickets-table__cell--status">
+                      <span class="ticket-status__text">{{ status_label }}</span>
+                    </td>
+                    <td data-label="Priority" data-column="priority" class="tickets-table__cell tickets-table__cell--priority">{{ ticket.priority or 'normal' }}</td>
+                    <td data-label="Company" data-column="company" class="tickets-table__cell tickets-table__cell--company">{{ company.name if company else (ticket.company_id or '—') }}</td>
+                    {% set sla = (ticket_sla_lookup or {}).get(ticket.id, {}) %}<td data-label="SLA" data-column="sla"><span class="status status--{{ 'danger' if sla.state == 'breached' else ('warning' if sla.state == 'at_risk' else ('success' if sla.state in ['met','on_track'] else 'neutral')) }}">{{ sla.label or 'No SLA' }}</span></td>
+                    <td data-label="Assigned" data-column="assigned" class="tickets-table__cell tickets-table__cell--assigned">{{ assigned_label }}</td>
+                    <td data-label="Updated" data-column="updated" class="tickets-table__cell tickets-table__cell--updated">{{ ticket.updated_at.astimezone().strftime('%Y-%m-%d %H:%M') if ticket.updated_at else '—' }}</td>
+                    {% set automation_data = (ticket_automation_filter_lookup or {}).get(ticket.id, {}) %}
+                    {% set last_reply_status = automation_data.get('latest_public_reply_email_status') %}
+                    {% set last_reply_status_class = {
+                      'Bounced': 'badge--danger',
+                      'Read': 'badge--success',
+                      'Delivered': 'badge--info',
+                      'Sent': 'badge--muted'
+                    }.get(last_reply_status, 'badge--muted') %}
+                    <td data-label="Last Reply Status" data-column="last-reply-status" class="tickets-table__cell tickets-table__cell--last-reply-status">
+                      {% if last_reply_status %}
+                        <span class="badge {{ last_reply_status_class }}">{{ last_reply_status }}</span>
+                      {% else %}
+                        <span class="badge badge--muted">No email status</span>
+                      {% endif %}
+                    </td>
+                    {% set review_date = ticket.review_date %}
+                    {% set review_date_class = 'ticket-review-date--past' if review_date and review_date < ticket_dashboard_now.date() else ('ticket-review-date--future' if review_date and review_date > ticket_dashboard_now.date() else '') %}
+                    <td data-label="Review Date" data-column="review-date" class="tickets-table__cell tickets-table__cell--review-date {{ review_date_class }}">{{ review_date.isoformat() if review_date else '—' }}</td>
+                    <td data-label="Category" data-column="category" class="tickets-table__cell tickets-table__cell--category">{{ ticket.category or '—' }}</td>
+                    {% set requester = user_lookup.get(ticket.requester_id) %}
+                    {% set requester_name = ([requester.first_name, requester.last_name] | select | join(' ')) | trim if requester else '' %}
+                    {% set requester_label = ticket.requester_label or requester_name or (requester.email if requester else '—') %}
+                    <td data-label="Requester" data-column="requester" class="tickets-table__cell tickets-table__cell--requester">{{ requester_label }}</td>
+                    <td data-label="Module" data-column="module" class="tickets-table__cell tickets-table__cell--module">{{ ticket.module_slug or '—' }}</td>
+                    <td data-label="External Ref" data-column="external-ref" class="tickets-table__cell tickets-table__cell--external-ref">{{ ticket.external_reference or '—' }}</td>
+                    <td data-label="Created" data-column="created" class="tickets-table__cell tickets-table__cell--created">{{ ticket.created_at.astimezone().strftime('%Y-%m-%d %H:%M') if ticket.created_at else '—' }}</td>
+                    <td data-label="Closed" data-column="closed" class="tickets-table__cell tickets-table__cell--closed">{{ ticket.closed_at.astimezone().strftime('%Y-%m-%d %H:%M') if ticket.closed_at else '—' }}</td>
+                    {% set ai_status_label = resolution_label_map.get(ticket.ai_resolution_state) or (ticket.ai_resolution_state.replace('_', ' ').title() if ticket.ai_resolution_state else '—') %}
+                    <td data-label="AI Status" data-column="ai-status" class="tickets-table__cell tickets-table__cell--ai-status">{{ ai_status_label }}</td>
+                    <td data-label="AI Tags" data-column="ai-tags" class="tickets-table__cell tickets-table__cell--ai-tags">{{ (ticket.ai_tags or []) | join(', ') or '—' }}</td>
+                    {% set time_data = (ticket_time_lookup or {}).get(ticket.id, {}) %}
+                    <td data-label="Billable Mins" data-column="billable-minutes" class="tickets-table__cell tickets-table__cell--billable-minutes">{{ time_data.get('billable_minutes', 0) }}</td>
+                    <td data-label="Non-Billable Mins" data-column="non-billable-minutes" class="tickets-table__cell tickets-table__cell--non-billable-minutes">{{ time_data.get('non_billable_minutes', 0) }}</td>
+                    {% set requester_email = ticket.requester_email or (requester.email if requester else '') %}
+                    {% set assigned_email = assigned.email if assigned else '' %}
+                    {% set created_age_days = ((ticket_dashboard_now - ticket.created_at).total_seconds() // 86400) | int if ticket.created_at else '' %}
+                    {% set updated_age_hours = ((ticket_dashboard_now - ticket.updated_at).total_seconds() // 3600) | int if ticket.updated_at else '' %}
+                    {% set status_changed_at = ticket.status_changed_at or ticket.created_at %}
+                    {% set in_status_age_hours = ((ticket_dashboard_now - status_changed_at).total_seconds() // 3600) | int if status_changed_at else '' %}
+                    {% set latest_reply_at = automation_data.get('latest_reply_at') %}
+                    {% set last_reply_age_hours = ((ticket_dashboard_now - latest_reply_at).total_seconds() // 3600) | int if latest_reply_at else '' %}
+                    <td data-label="ticket.requester_email" data-column="requester-email" class="tickets-table__cell tickets-table__cell--requester-email">{{ requester_email or '—' }}</td>
+                    <td data-label="ticket.requester_display_name" data-column="requester-display-name" class="tickets-table__cell tickets-table__cell--requester-display-name">{{ requester_label }}</td>
+                    <td data-label="ticket.assigned_user_email" data-column="assigned-user-email" class="tickets-table__cell tickets-table__cell--assigned-user-email">{{ assigned_email or '—' }}</td>
+                    <td data-label="ticket.assigned_user_display_name" data-column="assigned-user-display-name" class="tickets-table__cell tickets-table__cell--assigned-user-display-name">{{ assigned_label }}</td>
+                    <td data-label="ticket.company.id" data-column="company-id" class="tickets-table__cell tickets-table__cell--company-id">{{ ticket.company_id or '—' }}</td>
+                    <td data-label="ticket.has_attachments" data-column="has-attachments" class="tickets-table__cell tickets-table__cell--has-attachments">{{ 'true' if automation_data.get('has_attachments') else 'false' }}</td>
+                    <td data-label="ticket.attachment_count" data-column="attachment-count" class="tickets-table__cell tickets-table__cell--attachment-count">{{ automation_data.get('attachment_count', 0) }}</td>
+                    <td data-label="ticket.has_tasks" data-column="has-tasks" class="tickets-table__cell tickets-table__cell--has-tasks">{{ 'true' if automation_data.get('has_tasks') else 'false' }}</td>
+                    <td data-label="ticket.task_count" data-column="task-count" class="tickets-table__cell tickets-table__cell--task-count">{{ automation_data.get('task_count', 0) }}</td>
+                    <td data-label="ticket.has_open_tasks" data-column="has-open-tasks" class="tickets-table__cell tickets-table__cell--has-open-tasks">{{ 'true' if automation_data.get('has_open_tasks') else 'false' }}</td>
+                    <td data-label="ticket.open_task_count" data-column="open-task-count" class="tickets-table__cell tickets-table__cell--open-task-count">{{ automation_data.get('open_task_count', 0) }}</td>
+                    <td data-label="ticket.labels" data-column="labels" class="tickets-table__cell tickets-table__cell--labels">{{ (ticket.ai_tags or []) | join(', ') or '—' }}</td>
+                    <td data-label="ticket.age_days" data-column="age-days" class="tickets-table__cell tickets-table__cell--age-days">{{ created_age_days if created_age_days != '' else '—' }}</td>
+                    <td data-label="ticket.updated_age_hours" data-column="updated-age-hours" class="tickets-table__cell tickets-table__cell--updated-age-hours">{{ updated_age_hours if updated_age_hours != '' else '—' }}</td>
+                    <td data-label="ticket.in_status_age_hours" data-column="in-status-hours" class="tickets-table__cell tickets-table__cell--in-status-hours">{{ in_status_age_hours if in_status_age_hours != '' else '—' }}</td>
+                    <td data-label="ticket.last_reply_age_hours" data-column="last-reply-age-hours" class="tickets-table__cell tickets-table__cell--last-reply-age-hours">{{ last_reply_age_hours if last_reply_age_hours != '' else '—' }}</td>
+                    <td data-label="reply.is_internal" data-column="latest-reply-internal" class="tickets-table__cell tickets-table__cell--latest-reply-internal">{{ 'true' if automation_data.get('latest_reply_is_internal') else ('false' if automation_data.get('latest_reply_id') else '—') }}</td>
+                    <td data-label="reply.kind" data-column="latest-reply-kind" class="tickets-table__cell tickets-table__cell--latest-reply-kind">{{ automation_data.get('latest_reply_kind') or '—' }}</td>
+                    <td data-label="ticket_update.actor_type" data-column="ticket-update-actor-type" class="tickets-table__cell tickets-table__cell--ticket-update-actor-type">{{ automation_data.get('ticket_update_actor_type') or '—' }}</td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="{{ 39 + (1 if can_bulk_delete_tickets or can_merge_tickets or can_bulk_edit_tickets else 0) }}" class="table__empty">No tickets found for the selected filters.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+        </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div
+    class="modal"
+    id="create-ticket-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="create-ticket-title"
+    aria-hidden="true"
+    hidden
+  >
+    <div class="modal__content modal__content--create-ticket" role="document">
+      <button type="button" class="modal__close" data-modal-close>
+        <span class="visually-hidden">Close create ticket form</span>
+        &times;
+      </button>
+      <h2 class="modal__title" id="create-ticket-title">Create ticket</h2>
+      <p class="modal__subtitle">Create a ticket for a customer request or technician follow-up.</p>
+      <form action="/admin/tickets" method="post" class="form" autocomplete="off">
+        {% include "partials/csrf.html" %}
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-company">Company</label>
+          <select id="modal-ticket-company" name="companyId" class="form-input" data-ticket-company-select>
+            <option value="">Not linked</option>
+            {% for company in ticket_company_options %}
+              <option value="{{ company.id }}">{{ company.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-requester">Requester</label>
+          <select id="modal-ticket-requester" name="requesterId" class="form-input" data-ticket-requester-select>
+            <option value="">Not specified</option>
+          </select>
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label class="form-label" for="modal-ticket-priority">Priority</label>
+            <select id="modal-ticket-priority" name="priority" class="form-input">
+              <option value="urgent">Urgent</option>
+              <option value="high">High</option>
+              <option value="normal" selected>Normal</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="modal-ticket-status">Initial status</label>
+            <select id="modal-ticket-status" name="status" class="form-input">
+              {% if ticket_status_definitions %}
+                {% for status_option in ticket_status_definitions %}
+                  <option value="{{ status_option.tech_status }}" {% if status_option.is_default %}selected{% endif %}>{{ status_option.tech_label }}</option>
+                {% endfor %}
+              {% else %}
+                <option value="open" selected>Open</option>
+                <option value="in_progress">In progress</option>
+                <option value="pending">Pending</option>
+                <option value="resolved">Resolved</option>
+                <option value="closed">Closed</option>
+              {% endif %}
+            </select>
+          </div>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-subject">Subject</label>
+          <input id="modal-ticket-subject" name="subject" class="form-input" maxlength="255" required />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-description">Description</label>
+          <textarea
+            id="modal-ticket-description"
+            name="description"
+            class="form-input form-input--textarea"
+            rows="5"
+            placeholder="Include the customer request or diagnostic notes"
+          ></textarea>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button button--primary">Create ticket</button>
+          <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div
+    class="modal"
+    id="edit-ticket-statuses-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="edit-ticket-statuses-title"
+    aria-hidden="true"
+    hidden
+  >
+    <div class="modal__content" role="document">
+      <button type="button" class="modal__close" data-modal-close>
+        <span class="visually-hidden">Close ticket status editor</span>
+        &times;
+      </button>
+      <h2 class="modal__title" id="edit-ticket-statuses-title">Edit ticket statuses</h2>
+      <p class="modal__subtitle">Define the technician-facing labels and public labels for each ticket status.</p>
+      <div class="alert alert--error" role="alert" data-status-error hidden></div>
+      <form action="/admin/tickets/statuses" method="post" class="form" data-ticket-statuses-form>
+        {% include "partials/csrf.html" %}
+        <div class="table-wrapper">
+          <table class="table table--compact" data-ticket-statuses-table>
+            <thead>
+              <tr>
+                <th scope="col">Default</th>
+                <th scope="col">Tech status (technician label)</th>
+                <th scope="col">Public status (customer label)</th>
+                <th scope="col">Hide from technicians</th>
+                <th scope="col">Hide from admins</th>
+                <th scope="col" class="table__actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody data-statuses-list>
+              {% if ticket_status_configuration_definitions %}
+                {% for status_option in ticket_status_configuration_definitions %}
+                  <tr data-status-row>
+                    <td data-label="Default">
+                      <label class="visually-hidden" for="status-default-{{ loop.index0 }}">Set as default</label>
+                      <input
+                        id="status-default-{{ loop.index0 }}"
+                        type="radio"
+                        name="defaultStatus"
+                        value="{{ status_option.tech_status }}"
+                        data-status-default-radio
+                        {% if status_option.is_default %}checked{% endif %}
+                      />
+                    </td>
+                    <td data-label="Tech status">
+                      <label class="visually-hidden" for="status-tech-{{ loop.index0 }}">Tech status</label>
+                      <input
+                        id="status-tech-{{ loop.index0 }}"
+                        name="techLabel"
+                        class="form-input"
+                        maxlength="128"
+                        value="{{ status_option.tech_label }}"
+                        required
+                      />
+                      <input type="hidden" name="existingSlug" value="{{ status_option.tech_status }}" />
+                    </td>
+                    <td data-label="Public status">
+                      <label class="visually-hidden" for="status-public-{{ loop.index0 }}">Public status</label>
+                      <input
+                        id="status-public-{{ loop.index0 }}"
+                        name="publicLabel"
+                        class="form-input"
+                        maxlength="128"
+                        value="{{ status_option.public_status }}"
+                        required
+                      />
+                    </td>
+                    <td data-label="Hide from technicians">
+                      <input type="hidden" name="hideFromTechnicians" value="{% if status_option.hide_from_technicians %}1{% else %}0{% endif %}" data-status-hidden-input />
+                      <label class="checkbox">
+                        <input type="checkbox" data-status-hidden-checkbox {% if status_option.hide_from_technicians %}checked{% endif %} />
+                        <span>Hide</span>
+                      </label>
+                    </td>
+                    <td data-label="Hide from admins">
+                      <input type="hidden" name="hideFromAdmins" value="{% if status_option.hide_from_admins %}1{% else %}0{% endif %}" data-status-admin-hidden-input />
+                      <label class="checkbox">
+                        <input type="checkbox" data-status-admin-hidden-checkbox {% if status_option.hide_from_admins %}checked{% endif %} />
+                        <span>Hide</span>
+                      </label>
+                    </td>
+                    <td class="table__actions">
+                      <button
+                        type="button"
+                        class="button button--ghost"
+                        data-status-remove
+                        {% if ticket_status_configuration_definitions | length <= 1 %}disabled{% endif %}
+                      >
+                        Remove
+                      </button>
+                    </td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr data-status-row>
+                  <td data-label="Default">
+                    <label class="visually-hidden" for="status-default-0">Set as default</label>
+                    <input
+                      id="status-default-0"
+                      type="radio"
+                      name="defaultStatus"
+                      value=""
+                      data-status-default-radio
+                      checked
+                    />
+                  </td>
+                  <td data-label="Tech status">
+                    <label class="visually-hidden" for="status-tech-0">Tech status</label>
+                    <input id="status-tech-0" name="techLabel" class="form-input" maxlength="128" required />
+                    <input type="hidden" name="existingSlug" value="" />
+                  </td>
+                  <td data-label="Public status">
+                    <label class="visually-hidden" for="status-public-0">Public status</label>
+                    <input id="status-public-0" name="publicLabel" class="form-input" maxlength="128" required />
+                  </td>
+                  <td data-label="Hide from technicians">
+                    <input type="hidden" name="hideFromTechnicians" value="0" data-status-hidden-input />
+                    <label class="checkbox">
+                      <input type="checkbox" data-status-hidden-checkbox />
+                      <span>Hide</span>
+                    </label>
+                  </td>
+                  <td data-label="Hide from admins">
+                    <input type="hidden" name="hideFromAdmins" value="0" data-status-admin-hidden-input />
+                    <label class="checkbox">
+                      <input type="checkbox" data-status-admin-hidden-checkbox />
+                      <span>Hide</span>
+                    </label>
+                  </td>
+                  <td class="table__actions">
+                    <button type="button" class="button button--ghost" data-status-remove disabled>Remove</button>
+                  </td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+        <div class="form-actions form-actions--secondary">
+          <button type="button" class="button button--ghost" data-add-status>Add status</button>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button button--primary">Save changes</button>
+          <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+        </div>
+  </form>
+  <template id="ticket-status-row-template">
+    <tr data-status-row>
+      <td data-label="Default">
+        <label class="visually-hidden">Set as default</label>
+        <input type="radio" name="defaultStatus" value="" data-status-default-radio />
+      </td>
+      <td data-label="Tech status">
+        <label class="visually-hidden">Tech status</label>
+        <input name="techLabel" class="form-input" maxlength="128" required />
+        <input type="hidden" name="existingSlug" value="" />
+      </td>
+      <td data-label="Public status">
+        <label class="visually-hidden">Public status</label>
+        <input name="publicLabel" class="form-input" maxlength="128" required />
+      </td>
+      <td data-label="Hide from technicians">
+        <input type="hidden" name="hideFromTechnicians" value="0" data-status-hidden-input />
+        <label class="checkbox">
+          <input type="checkbox" data-status-hidden-checkbox />
+          <span>Hide</span>
+        </label>
+      </td>
+      <td data-label="Hide from admins">
+        <input type="hidden" name="hideFromAdmins" value="0" data-status-admin-hidden-input />
+        <label class="checkbox">
+          <input type="checkbox" data-status-admin-hidden-checkbox />
+          <span>Hide</span>
+        </label>
+      </td>
+      <td class="table__actions">
+        <button type="button" class="button button--ghost" data-status-remove>Remove</button>
+      </td>
+    </tr>
+  </template>
+</div>
+
+</div>
+
+<div
+  class="modal"
+  id="edit-labour-types-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="edit-labour-types-title"
+  aria-hidden="true"
+  hidden
+>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close labour types editor</span>
+      &times;
+    </button>
+    <h2 class="modal__title" id="edit-labour-types-title">Manage labour types</h2>
+    <p class="modal__subtitle">Link technician time entries to Xero products by defining reusable labour codes.</p>
+    <div class="alert alert--error" role="alert" data-labour-error hidden></div>
+    <form action="/admin/tickets/labour-types" method="post" class="form" data-labour-types-form>
+      {% include "partials/csrf.html" %}
+      <div class="table-wrapper">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th scope="col">Default</th>
+              <th scope="col">Code</th>
+              <th scope="col">Name</th>
+              <th scope="col">Rate ($/min)</th>
+              <th scope="col" class="table__actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody data-labour-list>
+            {% if ticket_labour_types %}
+              {% for labour_type in ticket_labour_types %}
+                <tr data-labour-row>
+                  <td data-label="Default" style="text-align: center;">
+                    <label class="visually-hidden" for="labour-default-{{ loop.index0 }}">Default</label>
+                    <input
+                      id="labour-default-{{ loop.index0 }}"
+                      name="defaultLabourType"
+                      type="radio"
+                      value="{{ labour_type.id }}"
+                      {% if labour_type.is_default %}checked{% endif %}
+                      required
+                      data-labour-default
+                    />
+                  </td>
+                  <td data-label="Code">
+                    <label class="visually-hidden" for="labour-code-{{ loop.index0 }}">Code</label>
+                    <input
+                      id="labour-code-{{ loop.index0 }}"
+                      name="labourCode"
+                      class="form-input"
+                      maxlength="64"
+                      value="{{ labour_type.code }}"
+                      required
+                    />
+                    <input type="hidden" name="labourId" value="{{ labour_type.id }}" />
+                  </td>
+                  <td data-label="Name">
+                    <label class="visually-hidden" for="labour-name-{{ loop.index0 }}">Name</label>
+                    <input
+                      id="labour-name-{{ loop.index0 }}"
+                      name="labourName"
+                      class="form-input"
+                      maxlength="128"
+                      value="{{ labour_type.name }}"
+                      required
+                    />
+                  </td>
+                  <td data-label="Rate ($/min)">
+                    <label class="visually-hidden" for="labour-rate-{{ loop.index0 }}">Rate</label>
+                    <input
+                      id="labour-rate-{{ loop.index0 }}"
+                      name="labourRate"
+                      class="form-input"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value="{{ labour_type.rate if labour_type.rate is not none else '' }}"
+                      placeholder="0.00"
+                    />
+                  </td>
+                  <td class="table__actions">
+                    <button type="button" class="button button--ghost" data-labour-remove>Remove</button>
+                  </td>
+                </tr>
+              {% endfor %}
+            {% else %}
+              <tr data-labour-row>
+                <td data-label="Default" style="text-align: center;">
+                  <label class="visually-hidden" for="labour-default-0">Default</label>
+                  <input id="labour-default-0" name="defaultLabourType" type="radio" value="new-0" checked required data-labour-default />
+                </td>
+                <td data-label="Code">
+                  <label class="visually-hidden" for="labour-code-0">Code</label>
+                  <input id="labour-code-0" name="labourCode" class="form-input" maxlength="64" required />
+                  <input type="hidden" name="labourId" value="" />
+                </td>
+                <td data-label="Name">
+                  <label class="visually-hidden" for="labour-name-0">Name</label>
+                  <input id="labour-name-0" name="labourName" class="form-input" maxlength="128" required />
+                </td>
+                <td data-label="Rate ($/min)">
+                  <label class="visually-hidden" for="labour-rate-0">Rate</label>
+                  <input id="labour-rate-0" name="labourRate" class="form-input" type="number" step="0.01" min="0" placeholder="0.00" />
+                </td>
+                <td class="table__actions">
+                  <button type="button" class="button button--ghost" data-labour-remove disabled>Remove</button>
+                </td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+      <div class="form-actions form-actions--secondary">
+        <button type="button" class="button button--ghost" data-add-labour>Add labour type</button>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="button button--primary">Save changes</button>
+        <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+    <template id="labour-type-row-template">
+      <tr data-labour-row>
+        <td data-label="Default" style="text-align: center;">
+          <label class="visually-hidden">Default</label>
+          <input name="defaultLabourType" type="radio" value="" required data-labour-default />
+        </td>
+        <td data-label="Code">
+          <label class="visually-hidden">Code</label>
+          <input name="labourCode" class="form-input" maxlength="64" required />
+          <input type="hidden" name="labourId" value="" />
+        </td>
+        <td data-label="Name">
+          <label class="visually-hidden">Name</label>
+          <input name="labourName" class="form-input" maxlength="128" required />
+        </td>
+        <td data-label="Rate ($/min)">
+          <label class="visually-hidden">Rate</label>
+          <input name="labourRate" class="form-input" type="number" step="0.01" min="0" placeholder="0.00" />
+        </td>
+        <td class="table__actions">
+          <button type="button" class="button button--ghost" data-labour-remove>Remove</button>
+        </td>
+      </tr>
+    </template>
+  </div>
+</div>
+
+  <!-- Save View Modal -->
+  <div
+    class="modal"
+    id="save-view-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="save-view-title"
+    aria-hidden="true"
+    hidden
+  >
+    <div class="modal__content" role="document">
+      <button type="button" class="modal__close" data-modal-close>
+        <span class="visually-hidden">Close save view form</span>
+        &times;
+      </button>
+      <h2 class="modal__title" id="save-view-title">Save Ticket View</h2>
+      <p class="modal__subtitle">Save the current filter and grouping settings for quick access later.</p>
+      <form id="save-view-form" class="form" data-save-view-form>
+        <div class="form-field">
+          <label class="form-label" for="view-name">View Name</label>
+          <input 
+            id="view-name" 
+            name="name" 
+            class="form-input" 
+            maxlength="128" 
+            required 
+            placeholder="e.g., My Open Tickets"
+          />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="view-description">Description (optional)</label>
+          <textarea
+            id="view-description"
+            name="description"
+            class="form-input form-input--textarea"
+            rows="3"
+            placeholder="Add notes about when to use this view"
+          ></textarea>
+        </div>
+        <div class="form-field">
+          <label class="form-checkbox">
+            <input type="checkbox" name="is_default" />
+            <span>Set as default view</span>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button button--primary">Save View</button>
+          <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_views.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_columns.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_stats.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/admin.js') }}" defer></script>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const button = document.querySelector('[data-next-ticket-number-open]');
+      const form = document.querySelector('[data-next-ticket-number-form]');
+      const input = document.querySelector('[data-next-ticket-number-input]');
+      if (!button || !form || !input) return;
+      button.addEventListener('click', () => {
+        const currentValue = button.getAttribute('data-current-next-ticket-number') || '';
+        const value = window.prompt('Enter the next ticket number to use for newly-created tickets.', currentValue);
+        if (value === null) return;
+        const cleaned = value.trim();
+        if (!/^\d+$/.test(cleaned) || Number(cleaned) <= 0) {
+          window.alert('Enter a positive whole number.');
+          return;
+        }
+        input.value = cleaned;
+        form.requestSubmit();
+      });
+    });
+
+    document.addEventListener('DOMContentLoaded', () => {
+      const button = document.querySelector('[data-unbill-tickets-open]');
+      const form = document.querySelector('[data-unbill-tickets-form]');
+      const input = document.querySelector('[data-unbill-tickets-date-input]');
+      if (!button || !form || !input) return;
+      button.addEventListener('click', () => {
+        const value = window.prompt('Enter the cutoff date in yyyyMMdd format. Billed tickets created before this UTC date will be un-billed.');
+        if (value === null) return;
+        const cleaned = value.trim();
+        if (!/^\d{8}$/.test(cleaned)) {
+          window.alert('Enter the date in yyyyMMdd format, for example 20240131.');
+          return;
+        }
+        const confirmed = window.confirm(`Un-bill billed tickets created before ${cleaned}? This removes ticket billing markers and billed time-entry records.`);
+        if (!confirmed) return;
+        input.value = cleaned;
+        form.requestSubmit();
+      });
+    });
+  </script>
+{% endblock %}

@@ -1,0 +1,674 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_title %}<span class="header__title-text">{{ title | default('API credentials') }}</span>{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "Create key", "type": "button", "variant": "primary", "attrs": {"data-create-api-key-modal-open": "", "aria-haspopup": "dialog", "aria-controls": "create-api-key-modal"}},
+    {"label": "Swagger UI", "type": "link", "variant": "ghost", "href": "/docs"}
+  ]) }}
+{% endblock %}
+
+{% block content %}
+<div class="admin-grid admin-grid--columns">
+  <section class="card card--panel admin-grid__full">
+    <header class="card__header card__header--stacked">
+      <div class="stats-grid">
+        <div class="stat">
+          <span class="stat__label">Active</span>
+          <span class="stat__value">{{ api_key_stats.active }}</span>
+        </div>
+        <div class="stat">
+          <span class="stat__label">Disabled</span>
+          <span class="stat__value">{{ api_key_stats.disabled }}</span>
+        </div>
+        <div class="stat">
+          <span class="stat__label">Expired</span>
+          <span class="stat__value">{{ api_key_stats.expired }}</span>
+        </div>
+        <div class="stat">
+          <span class="stat__label">Total</span>
+          <span class="stat__value">{{ api_key_stats.total }}</span>
+        </div>
+      </div>
+      <form method="get" class="filter-grid">
+        <div class="form-field">
+          <label class="form-label" for="filter-search">Search</label>
+          <input
+            class="form-input"
+            type="search"
+            id="filter-search"
+            name="search"
+            value="{{ filters.search }}"
+            placeholder="Description or prefix"
+          />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="filter-order">Sort by</label>
+          <select class="form-input" id="filter-order" name="order_by">
+            {% for option in order_options %}
+              <option value="{{ option.value }}" {% if option.value == filters.order_by %}selected{% endif %}>
+                {{ option.label }}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="filter-direction">Direction</label>
+          <select class="form-input" id="filter-direction" name="order_direction">
+            {% for option in direction_options %}
+              <option value="{{ option.value }}" {% if option.value == filters.order_direction %}selected{% endif %}>
+                {{ option.label }}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-field form-field--checkbox">
+          <label class="form-checkbox" for="filter-include-expired">
+            <input
+              type="checkbox"
+              id="filter-include-expired"
+              name="include_expired"
+              value="1"
+              {% if filters.include_expired %}checked{% endif %}
+            />
+            <span>Include expired keys</span>
+          </label>
+        </div>
+        <div class="form-actions form-actions--inline">
+          <button type="submit" class="button">Apply</button>
+          <a class="button button--ghost" href="/admin/api-keys">Reset</a>
+        </div>
+      </form>
+    </header>
+
+    {% if new_api_key %}
+      <section class="secret-card">
+        <header class="secret-card__header">
+          <div>
+            <h3 class="secret-card__title">New API key issued</h3>
+            <p class="secret-card__subtitle">
+              Key preview {{ new_api_key.key_preview }}.
+              {% if new_api_key.expiry_iso %}Expires <span data-utc="{{ new_api_key.expiry_iso }}"></span>.{% endif %}
+            </p>
+          </div>
+          <button type="button" class="button button--ghost" data-copy-api-key="{{ new_api_key.value }}">
+            Copy
+          </button>
+        </header>
+        <div class="secret-card__body">
+          <code class="secret-card__value">{{ new_api_key.value }}</code>
+          <p class="secret-card__hint">
+            This value is only shown once. Update downstream services before rotating again.
+          </p>
+          <p class="secret-card__hint">
+            Access scope: {{ new_api_key.access_summary or 'All endpoints' }}.
+          </p>
+          <p class="secret-card__hint">
+            Source IPs: {{ new_api_key.ip_summary or 'Any IP address' }}.
+          </p>
+          {% if not new_api_key.is_enabled %}
+            <p class="secret-card__hint">Status: Disabled until manually enabled.</p>
+          {% endif %}
+          {% if new_api_key.permissions %}
+            <div class="tag-list">
+              {% for permission in new_api_key.permissions %}
+                <span class="tag">{{ permission.methods | join(', ') }} {{ permission.path }}</span>
+              {% endfor %}
+            </div>
+          {% endif %}
+          {% if new_api_key.ip_restrictions %}
+            <div class="tag-list">
+              {% for restriction in new_api_key.ip_restrictions %}
+                <span class="tag">{{ restriction.label }}</span>
+              {% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      </section>
+    {% endif %}
+
+    <div class="table-toolbar">
+      <input
+        type="search"
+        class="form-input"
+        placeholder="Quick filter rows"
+        aria-label="Filter API keys"
+        data-table-filter="api-keys-table"
+      />
+    </div>
+
+    <div class="table-wrapper">
+      <table class="table" id="api-keys-table" data-table data-table-id="api-keys">
+        <thead>
+          <tr>
+            <th scope="col" data-sort="string" data-column-key="description">Description</th>
+            <th scope="col" data-sort="string" data-column-key="preview">Preview</th>
+            <th scope="col" data-sort="string" data-column-key="access_scope">Access scope</th>
+            <th scope="col" data-sort="date" data-column-key="created">Created</th>
+            <th scope="col" data-sort="date" data-column-key="expiry">Expiry</th>
+            <th scope="col" data-sort="date" data-column-key="last_seen">Last seen</th>
+            <th scope="col" data-sort="number" data-column-key="usage">Usage</th>
+            <th scope="col" class="table__actions" data-column-key="actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if api_keys %}
+            {% for key in api_keys %}
+              <tr>
+                <td data-label="Description" data-column-key="description">
+                  {% if key.description %}
+                    {{ key.description }}
+                  {% else %}
+                    <span class="text-muted">—</span>
+                  {% endif %}
+                  {% if not key.is_enabled %}
+                    <span class="badge badge--warning">Disabled</span>
+                  {% endif %}
+                </td>
+                <td data-label="Preview" data-column-key="preview">{{ key.key_preview }}</td>
+                <td data-label="Access scope" data-value="{{ key.access_summary }}" data-column-key="access_scope">
+                  <div>{{ key.endpoint_summary or 'All endpoints' }}</div>
+                  <div class="text-muted">IPs: {{ key.ip_summary or 'Any IP address' }}</div>
+                  {% if not key.is_restricted %}
+                    <span class="badge badge--muted">Unrestricted</span>
+                  {% endif %}
+                </td>
+                <td data-label="Created" data-utc="{{ key.created_iso or '' }}" data-value="{{ key.created_iso or '' }}" data-column-key="created">
+                  {{ key.created_iso or '—' }}
+                </td>
+                <td data-label="Expiry" data-value="{{ key.expiry_iso or '' }}" data-column-key="expiry">
+                  {% if key.expiry_iso %}
+                    <span data-utc="{{ key.expiry_iso }}"></span>
+                    {% if key.is_expired %}
+                      <span class="badge badge--danger">Expired</span>
+                    {% endif %}
+                  {% else %}
+                    <span class="badge badge--muted">No expiry</span>
+                  {% endif %}
+                </td>
+                <td data-label="Last seen" data-value="{{ key.last_seen_iso or '' }}" data-column-key="last_seen">
+                  {% if key.last_seen_iso %}
+                    <span data-utc="{{ key.last_seen_iso }}"></span>
+                  {% else %}
+                    <span class="text-muted">Never</span>
+                  {% endif %}
+                </td>
+                <td data-label="Usage" data-value="{{ key.usage_count }}" data-column-key="usage">{{ key.usage_count }}</td>
+                <td class="table__actions" data-column-key="actions">
+                  {% set modal_payload = {
+                    "id": key.id,
+                    "description": key.description or "",
+                    "key_preview": key.key_preview,
+                    "created_iso": key.created_iso,
+                    "expiry_iso": key.expiry_iso,
+                    "last_seen_iso": key.last_seen_iso,
+                    "usage_count": key.usage_count,
+                    "usage": key.usage or [],
+                    "is_expired": key.is_expired,
+                    "permissions": key.permissions or [],
+                    "permissions_text": key.permissions_text or "",
+                    "ip_restrictions": key.ip_restrictions or [],
+                    "ip_restrictions_text": key.ip_restrictions_text or "",
+                    "access_summary": key.access_summary,
+                    "endpoint_summary": key.endpoint_summary,
+                    "ip_summary": key.ip_summary,
+                    "is_restricted": key.is_restricted,
+                    "is_enabled": key.is_enabled
+                  } %}
+                  <div class="table__action-buttons">
+                    <button
+                      type="button"
+                      class="button button--ghost"
+                      data-edit-api-key-modal-open
+                      data-api-key='{{ modal_payload | tojson | e }}'
+                    >
+                      Edit
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr>
+              <td colspan="7" class="table__empty">No API keys found. Create one to begin issuing credentials.</td>
+            </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <details class="card card--panel card-collapsible admin-grid__full" data-correlation-panel>
+    <summary class="card__header card__header--collapsible">
+      <div>
+        <h2 class="card__title">Cross-service audit correlations</h2>
+        <p class="card__subtitle">
+          Correlate privileged activity across services to trace credential usage and follow-on automation.
+        </p>
+      </div>
+      <div class="card__collapsible-meta">
+        <span class="card__toggle-icon" aria-hidden="true"></span>
+      </div>
+    </summary>
+
+    <div class="card-collapsible__content">
+      <header class="card__header card__header--stacked">
+        <form method="get" class="filter-grid">
+          <input type="hidden" name="search" value="{{ filters.search }}" />
+          <input type="hidden" name="order_by" value="{{ filters.order_by }}" />
+          <input type="hidden" name="order_direction" value="{{ filters.order_direction }}" />
+          {% if filters.include_expired %}
+            <input type="hidden" name="include_expired" value="1" />
+          {% endif %}
+          <div class="form-field">
+            <label class="form-label" for="correlation-search">Search correlations</label>
+            <input
+              class="form-input"
+              id="correlation-search"
+              name="correlation_search"
+              value="{{ filters.correlation_search }}"
+              placeholder="Key fingerprint, company, or task"
+            />
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="correlation-service">Service filter</label>
+            <select class="form-input" id="correlation-service" name="service_filter">
+              <option value="">All services</option>
+              {% for option in service_options %}
+                <option value="{{ option.value }}" {% if option.value == filters.service_filter %}selected{% endif %}>
+                  {{ option.label }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-actions form-actions--inline">
+            <button type="submit" class="button">Filter correlations</button>
+          </div>
+        </form>
+      </header>
+
+      <div class="table-wrapper">
+        <table class="table" id="correlations-table" data-table data-table-id="correlations">
+        <thead>
+          <tr>
+            <th scope="col" data-sort="string">Signal</th>
+            <th scope="col" data-sort="string">Services</th>
+            <th scope="col" data-sort="number">Events</th>
+            <th scope="col" data-sort="date">Last activity</th>
+            <th scope="col">Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if correlations %}
+            {% for correlation in correlations %}
+              <tr>
+                <td data-label="Signal">{{ correlation.label }}</td>
+                <td data-label="Services">
+                  <div class="tag-list">
+                    {% for service in correlation.services %}
+                      <span class="tag">{{ service.replace('_', ' ') }}</span>
+                    {% endfor %}
+                  </div>
+                </td>
+                <td data-label="Events" data-value="{{ correlation.event_count }}">{{ correlation.event_count }}</td>
+                <td data-label="Last activity" data-value="{{ correlation.latest_iso or '' }}">
+                  {% if correlation.latest_iso %}
+                    <span data-utc="{{ correlation.latest_iso }}"></span>
+                  {% else %}
+                    <span class="text-muted">Unknown</span>
+                  {% endif %}
+                </td>
+                <td data-label="Details">
+                  <details class="details">
+                    <summary>View events</summary>
+                    <div class="timeline">
+                      {% for event in correlation.events %}
+                        <article class="timeline__event">
+                          <header class="timeline__header">
+                            <span class="timeline__timestamp">
+                              {% if event.created_at_iso %}
+                                <span data-utc="{{ event.created_at_iso }}"></span>
+                              {% else %}
+                                Unknown
+                              {% endif %}
+                            </span>
+                            <span class="timeline__action">{{ event.action }}</span>
+                          </header>
+                          <div class="timeline__body">
+                            <p>
+                              <strong>Entity:</strong> {{ event.entity_label }}<br />
+                              <strong>Service:</strong> {{ event.service }}<br />
+                              {% if event.user_email %}
+                                <strong>User:</strong> {{ event.user_email }}
+                              {% elif event.user_id %}
+                                <strong>User:</strong> #{{ event.user_id }}
+                              {% else %}
+                                <strong>User:</strong> System
+                              {% endif %}
+                              {% if event.ip_address %}<br /><strong>IP:</strong> {{ event.ip_address }}{% endif %}
+                            </p>
+                            {% if event.metadata %}
+                              <div class="code-block">
+                                <strong>Metadata</strong>
+                                <pre>{{ event.metadata | tojson(indent=2) }}</pre>
+                              </div>
+                            {% endif %}
+                          </div>
+                        </article>
+                      {% endfor %}
+                    </div>
+                  </details>
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr>
+              <td colspan="5" class="table__empty">No correlated audit activity recorded for the selected filters.</td>
+            </tr>
+          {% endif %}
+        </tbody>
+        </table>
+      </div>
+    </div>
+  </details>
+</div>
+
+<div
+  class="modal"
+  id="edit-api-key-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="edit-api-key-title"
+  aria-hidden="true"
+  hidden
+>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close edit API key</span>
+      &times;
+    </button>
+    <h2 class="modal__title" id="edit-api-key-title">Edit API key</h2>
+    <div class="modal__body">
+      <p class="modal__subtitle">
+        Manage usage, rotation, and revocation for <span data-api-key-description-text>this credential</span>.
+      </p>
+      <dl class="definition-list">
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Description</dt>
+          <dd class="definition-list__value" data-api-key-description>—</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Preview</dt>
+          <dd class="definition-list__value" data-api-key-preview>—</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Created</dt>
+          <dd class="definition-list__value" data-api-key-created>—</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Expiry</dt>
+          <dd class="definition-list__value" data-api-key-expiry>—</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Last seen</dt>
+          <dd class="definition-list__value" data-api-key-last-seen>—</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Usage count</dt>
+          <dd class="definition-list__value" data-api-key-usage-count>0</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Status</dt>
+          <dd class="definition-list__value" data-api-key-status>Enabled</dd>
+        </div>
+        <div class="definition-list__item">
+          <dt class="definition-list__label">Access scope</dt>
+          <dd class="definition-list__value" data-api-key-access>All endpoints</dd>
+        </div>
+      </dl>
+
+      <section aria-labelledby="api-key-usage-heading">
+        <h3 id="api-key-usage-heading">Recent usage</h3>
+        <p class="text-muted" data-api-key-usage-empty>No recorded usage yet.</p>
+        <ul class="usage-list" data-api-key-usage-list hidden></ul>
+      </section>
+
+      <section aria-labelledby="api-key-permissions-heading">
+        <h3 id="api-key-permissions-heading">Endpoint access</h3>
+        <p class="text-muted" data-api-key-permissions-empty>All endpoints permitted.</p>
+        <ul class="usage-list" data-api-key-permissions-list hidden></ul>
+      </section>
+
+      <section aria-labelledby="api-key-ips-heading">
+        <h3 id="api-key-ips-heading">Source IP restrictions</h3>
+        <p class="text-muted" data-api-key-ips-empty>Any IP address permitted.</p>
+        <ul class="usage-list" data-api-key-ips-list hidden></ul>
+      </section>
+
+      <form
+        method="post"
+        action="/admin/api-keys/update"
+        class="form"
+        data-api-key-rotate-form
+        autocomplete="off"
+      >
+        {% include "partials/csrf.html" %}
+        {% for name, value in filter_state.items() %}
+          <input type="hidden" name="{{ name }}" value="{{ value }}" />
+        {% endfor %}
+        <input type="hidden" name="api_key_id" value="" data-api-key-rotate-id />
+        <input type="hidden" name="is_enabled_present" value="1" />
+        <div class="form-grid">
+          <div class="form-field">
+            <label class="form-label" for="modal-rotate-description">New description</label>
+            <input
+              class="form-input"
+              id="modal-rotate-description"
+              name="description"
+              maxlength="255"
+              placeholder="Leave blank to keep current"
+            />
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="modal-rotate-expiry">New expiry</label>
+            <input
+              class="form-input"
+              id="modal-rotate-expiry"
+              name="expiry_date"
+              type="date"
+              placeholder="YYYY-MM-DD"
+            />
+            <p class="form-help">Defaults to the existing expiry.</p>
+          </div>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-rotate-permissions">Endpoint permissions</label>
+          <textarea
+            class="form-input"
+            id="modal-rotate-permissions"
+            name="permissions"
+            rows="4"
+            placeholder="Example: GET /api/orders"
+            data-api-key-rotate-permissions
+          ></textarea>
+          <p class="form-help">
+            One entry per line using "METHOD /path" (methods: {{ allowed_methods | join(', ') }}).
+            Leave blank to keep unrestricted access.
+          </p>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-rotate-ips">Source IP allow list</label>
+          <textarea
+            class="form-input"
+            id="modal-rotate-ips"
+            name="allowed_ips"
+            rows="3"
+            placeholder="203.0.113.10 or 203.0.113.0/24"
+            data-api-key-rotate-ips
+          ></textarea>
+          <p class="form-help">
+            One IP address or CIDR range per line. Leave blank to allow any IP address.
+          </p>
+        </div>
+        <div class="form-field form-field--checkbox">
+          <label class="form-checkbox" for="modal-rotate-enabled">
+            <input
+              type="checkbox"
+              id="modal-rotate-enabled"
+              name="is_enabled"
+              value="1"
+              data-api-key-enabled
+              checked
+            />
+            <span>Key is enabled</span>
+          </label>
+          <p class="form-help">Disable to pause access without revoking the credential.</p>
+        </div>
+        <div class="form-field form-field--checkbox">
+          <label class="form-checkbox" for="modal-rotate-retire">
+            <input
+              type="checkbox"
+              id="modal-rotate-retire"
+              name="retire_previous"
+              value="1"
+              checked
+            />
+            <span>Retire previous key after rotation</span>
+          </label>
+        </div>
+        <div class="form-actions form-actions--inline">
+          <button type="submit" class="button button--primary">Save changes</button>
+          <button type="button" class="button button--ghost" data-modal-close>Close</button>
+        </div>
+        <p class="form-help">Immediately retire the previous key.</p>
+        <div class="form-actions">
+          <button type="submit" class="button" formaction="/admin/api-keys/rotate">Rotate key</button>
+        </div>
+      </form>
+
+      <form
+        method="post"
+        action="/admin/api-keys/delete"
+        class="form"
+        data-api-key-revoke-form
+      >
+        {% include "partials/csrf.html" %}
+        {% for name, value in filter_state.items() %}
+          <input type="hidden" name="{{ name }}" value="{{ value }}" />
+        {% endfor %}
+        <input type="hidden" name="api_key_id" value="" data-api-key-revoke-id />
+        <div class="form-actions">
+          <button
+            type="submit"
+            class="button button--danger"
+            data-confirm="Revoke this API key? Downstream services using it will lose access."
+          >
+            Revoke key
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div
+  class="modal"
+  id="create-api-key-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="create-api-key-title"
+  aria-hidden="true"
+  hidden
+>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close create API key form</span>
+      &times;
+    </button>
+    <h2 class="modal__title" id="create-api-key-title">Create API key</h2>
+    <p class="modal__subtitle">
+      Issue a new credential for system-to-system access. Provide an optional expiry to enforce automatic rotation.
+    </p>
+    <form method="post" action="/admin/api-keys" class="form" autocomplete="off">
+      {% include "partials/csrf.html" %}
+      {% for name, value in filter_state.items() %}
+        <input type="hidden" name="{{ name }}" value="{{ value }}" />
+      {% endfor %}
+      <input type="hidden" name="is_enabled_present" value="1" />
+      <div class="form-field">
+        <label class="form-label" for="modal-api-key-description">Description</label>
+        <input
+          class="form-input"
+          id="modal-api-key-description"
+          name="description"
+          maxlength="255"
+          placeholder="Service name, environment, or usage context"
+        />
+      </div>
+      <div class="form-field">
+        <label class="form-label" for="modal-api-key-expiry">Expiry date</label>
+        <input
+          class="form-input"
+          id="modal-api-key-expiry"
+          name="expiry_date"
+          type="date"
+          placeholder="YYYY-MM-DD"
+        />
+        <p class="form-hint">Leave blank to create a non-expiring credential.</p>
+      </div>
+      <div class="form-field">
+        <label class="form-label" for="modal-api-key-permissions">Endpoint permissions</label>
+        <textarea
+          class="form-input"
+          id="modal-api-key-permissions"
+          name="permissions"
+          rows="4"
+          placeholder="Example: GET /api/orders"
+        ></textarea>
+        <p class="form-hint">
+          One entry per line using "METHOD /path" (methods: {{ allowed_methods | join(', ') }}).
+          Leave blank to grant this key full access.
+        </p>
+      </div>
+      <div class="form-field">
+        <label class="form-label" for="modal-api-key-ips">Source IP allow list</label>
+        <textarea
+          class="form-input"
+          id="modal-api-key-ips"
+          name="allowed_ips"
+          rows="3"
+          placeholder="203.0.113.10 or 203.0.113.0/24"
+        ></textarea>
+        <p class="form-hint">
+          One IP address or CIDR range per line. Leave blank to allow requests from any IP address.
+        </p>
+      </div>
+      <div class="form-field form-field--checkbox">
+        <label class="form-checkbox" for="modal-api-key-enabled">
+          <input
+            id="modal-api-key-enabled"
+            name="is_enabled"
+            type="checkbox"
+            value="1"
+            checked
+          />
+          <span>Enable key immediately</span>
+        </label>
+        <p class="form-hint">Uncheck to issue the credential in a disabled state.</p>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="button button--primary">Create key</button>
+        <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/admin.js') }}" defer></script>
+{% endblock %}

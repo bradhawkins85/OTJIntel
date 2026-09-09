@@ -1,0 +1,326 @@
+{% extends "base.html" %}
+
+{% block header_title %}
+  <div class="header-title-menu">
+    <span class="header-title-menu__label">Webhook Monitor</span>
+    <details class="header-title-menu__dropdown" data-header-menu>
+      <summary class="header-title-menu__toggle" data-header-menu-toggle aria-haspopup="true">
+        Actions
+        <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" class="header-title-menu__icon">
+          <path d="M6.2 8.2a1 1 0 0 1 1.4 0L12 12.6l4.4-4.4a1 1 0 0 1 1.4 1.4l-5.1 5.1a1 1 0 0 1-1.4 0L6.2 9.6a1 1 0 0 1 0-1.4z" />
+        </svg>
+        <span class="visually-hidden">Toggle actions menu</span>
+      </summary>
+      <ul class="header-title-menu__list" role="menu">
+        <li class="header-title-menu__item" role="none">
+          <button
+            type="button"
+            class="header-title-menu__link header-title-menu__link--danger"
+            role="menuitem"
+            data-webhook-delete-status="failed"
+          >
+            Delete all failed
+          </button>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <button
+            type="button"
+            class="header-title-menu__link header-title-menu__link--danger"
+            role="menuitem"
+            data-webhook-delete-status="succeeded"
+          >
+            Delete all succeeded
+          </button>
+        </li>
+      </ul>
+    </details>
+  </div>
+{% endblock %}
+
+{% block content %}
+<section class="card card--panel">
+  <header class="card__header">
+    <div class="card__controls">
+      <form class="card__controls" method="get" action="/admin/webhooks">
+        <input
+          type="search"
+          class="form-input"
+          name="q"
+          value="{{ webhook_search or '' }}"
+          placeholder="Search all loaded webhook events"
+          aria-label="Search webhook event history"
+        />
+        <select class="form-input" name="event_limit" aria-label="How many webhook events to load">
+          {% for option in webhook_event_limit_options %}
+            <option value="{{ option }}" {% if option == webhook_event_limit %}selected{% endif %}>
+              Latest {{ option }} events
+            </option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="button button--primary">Search history</button>
+        {% if webhook_search %}
+          <a class="button button--ghost" href="/admin/webhooks?event_limit={{ webhook_event_limit }}">Clear</a>
+        {% endif %}
+      </form>
+      <input
+        type="search"
+        class="form-input"
+        placeholder="Filter loaded webhook events"
+        aria-label="Filter loaded webhook events"
+        data-table-filter="webhooks-table"
+      />
+      <select
+        class="form-input"
+        aria-label="Filter webhooks by direction"
+        data-table-column-filter="direction"
+        data-table-column-filter-table="webhooks-table"
+      >
+        <option value="">All directions</option>
+        <option value="incoming">Incoming</option>
+        <option value="outgoing">Outgoing</option>
+      </select>
+      <input
+        type="search"
+        class="form-input"
+        placeholder="Name"
+        aria-label="Filter webhooks by name"
+        data-table-column-filter="name"
+        data-table-column-filter-table="webhooks-table"
+      />
+      <input
+        type="search"
+        class="form-input"
+        placeholder="Target"
+        aria-label="Filter webhooks by target"
+        data-table-column-filter="target"
+        data-table-column-filter-table="webhooks-table"
+      />
+      <select
+        class="form-input"
+        aria-label="Filter webhooks by status"
+        data-table-column-filter="status"
+        data-table-column-filter-table="webhooks-table"
+      >
+        <option value="">All statuses</option>
+        <option value="pending">Pending</option>
+        <option value="in_progress">In progress</option>
+        <option value="succeeded">Succeeded</option>
+        <option value="failed">Failed</option>
+      </select>
+      <input
+        type="search"
+        class="form-input"
+        placeholder="Attempts"
+        aria-label="Filter webhooks by attempts"
+        data-table-column-filter="attempts"
+        data-table-column-filter-table="webhooks-table"
+      />
+      <input
+        type="search"
+        class="form-input"
+        placeholder="Last error"
+        aria-label="Filter webhooks by last error"
+        data-table-column-filter="last_error"
+        data-table-column-filter-table="webhooks-table"
+      />
+    </div>
+  </header>
+  <p class="card__subtitle">Showing {{ events|length }} loaded webhook events{% if webhook_search %} matching “{{ webhook_search }}”{% endif %}. Increase the history window to search farther back.</p>
+  <div class="table-wrapper">
+    <table class="table" id="webhooks-table" data-table data-table-id="webhooks">
+      <thead>
+        <tr>
+          <th scope="col" data-sort="string" data-column-key="direction">Direction</th>
+          <th scope="col" data-sort="string" data-column-key="name">Name</th>
+          <th scope="col" data-sort="string" class="table__col--truncate" data-column-key="target">Target</th>
+          <th scope="col" data-sort="string" data-column-key="status">Status</th>
+          <th scope="col" data-sort="number" data-column-key="attempts">Attempts</th>
+          <th scope="col" data-sort="date" data-column-key="next_attempt">Next attempt</th>
+          <th scope="col" data-sort="string" data-column-key="last_error">Last error</th>
+          <th scope="col" data-sort="date" data-column-key="updated">Updated</th>
+          <th scope="col" class="table__actions" data-column-key="actions">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for event in events %}
+          <tr
+            data-event-id="{{ event.id }}"
+            data-event-name="{{ event.name }}"
+            data-event-target="{{ event.target_url or '' }}"
+            data-event-status="{{ event.status }}"
+            data-event-direction="{{ event.direction or 'outgoing' }}"
+          >
+            <td data-label="Direction" data-value="{{ event.direction or 'outgoing' }}" data-column-key="direction">
+              {% if event.direction == 'incoming' %}
+                <span class="badge badge--info">⬇ Incoming</span>
+              {% else %}
+                <span class="badge badge--primary">⬆ Outgoing</span>
+              {% endif %}
+            </td>
+            <td data-label="Name" data-value="{{ event.name }}" data-column-key="name">{{ event.name }}</td>
+            <td data-label="Target" class="table__col--truncate" title="{{ event.target_url or '' }}" data-value="{{ event.target_url or '' }}" data-column-key="target">{{ event.target_url }}</td>
+            <td data-label="Status" data-value="{{ event.status }}" data-column-key="status">{{ event.status }}</td>
+            <td data-label="Attempts" data-value="{{ event.attempt_count }}" data-column-key="attempts">
+              {{ event.attempt_count }}/{{ event.max_attempts }}
+            </td>
+            <td data-label="Next attempt" data-value="{{ event.next_attempt_iso or '' }}" data-column-key="next_attempt">
+              {% if event.next_attempt_iso %}
+                <span data-utc="{{ event.next_attempt_iso }}"></span>
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td data-label="Last error" data-value="{{ event.last_error or '' }}" data-column-key="last_error">{{ event.last_error or '—' }}</td>
+            <td data-label="Updated" data-value="{{ event.updated_iso or '' }}" data-column-key="updated">
+              {% if event.updated_iso %}
+                <span data-utc="{{ event.updated_iso }}"></span>
+              {% endif %}
+            </td>
+            <td class="table__actions" data-column-key="actions">
+              <details class="header-title-menu__dropdown" data-header-menu>
+                <summary class="header-title-menu__toggle" data-header-menu-toggle aria-haspopup="true">
+                  Actions
+                  <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" class="header-title-menu__icon">
+                    <path d="M6.2 8.2a1 1 0 0 1 1.4 0L12 12.6l4.4-4.4a1 1 0 0 1 1.4 1.4l-5.1 5.1a1 1 0 0 1-1.4 0L6.2 9.6a1 1 0 0 1 0-1.4z" />
+                  </svg>
+                  <span class="visually-hidden">Toggle row actions menu</span>
+                </summary>
+                <ul class="header-title-menu__list" role="menu">
+                  <li class="header-title-menu__item" role="none">
+                    <button type="button" class="header-title-menu__link" role="menuitem" data-webhook-attempts>
+                      View attempts
+                    </button>
+                  </li>
+                  <li class="header-title-menu__item" role="none">
+                    <button
+                      type="button"
+                      class="header-title-menu__link"
+                      role="menuitem"
+                      data-webhook-retry
+                    >
+                      Retry
+                    </button>
+                  </li>
+                  <li class="header-title-menu__item" role="none">
+                    <button
+                      type="button"
+                      class="header-title-menu__link header-title-menu__link--danger"
+                      role="menuitem"
+                      data-webhook-delete
+                      {% if event.status == 'in_progress' %}disabled{% endif %}
+                    >
+                      Delete
+                    </button>
+                  </li>
+                </ul>
+              </details>
+            </td>
+          </tr>
+        {% else %}
+          <tr>
+            <td colspan="9" class="table__empty">No webhook activity recorded.</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-pagination" data-pagination="webhooks-table">
+    <div class="table-pagination__group">
+      <button
+        type="button"
+        class="button button--ghost table-pagination__button"
+        data-page-prev
+        disabled
+      >
+        Previous
+      </button>
+      <button
+        type="button"
+        class="button button--ghost table-pagination__button"
+        data-page-next
+      >
+        Next
+      </button>
+    </div>
+    <p class="table-pagination__status" data-page-info aria-live="polite"></p>
+  </div>
+</section>
+
+<div class="modal" id="webhook-attempts-modal" role="dialog" aria-modal="true" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close webhook attempts</span>
+    </button>
+    <h2 class="modal__title" id="webhook-attempts-title">Webhook attempts</h2>
+    <div class="modal__body">
+      <p id="webhook-attempts-description" class="modal__subtitle text-muted">
+        Review the latest delivery attempts for the selected webhook event.
+      </p>
+      <div class="modal__controls">
+        <input
+          type="search"
+          class="form-input"
+          placeholder="Filter attempts"
+          aria-label="Filter webhook attempts"
+          data-table-filter="webhook-attempts-table"
+        />
+      </div>
+      <div class="table-wrapper">
+        <table class="table" id="webhook-attempts-table" data-table data-table-id="webhook-attempts">
+          <thead>
+            <tr>
+              <th scope="col" data-sort="date">Attempted</th>
+              <th scope="col" data-sort="number">Status</th>
+              <th scope="col" data-sort="number">Duration (ms)</th>
+              <th scope="col" data-sort="string">Response</th>
+              <th scope="col" data-sort="string">Error</th>
+              <th scope="col" class="table__actions">Details</th>
+            </tr>
+          </thead>
+          <tbody id="webhook-attempts-body">
+            <tr>
+              <td colspan="6" class="table__empty" id="webhook-attempts-empty">Select a webhook event to inspect its attempts.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="attempt-details" id="webhook-attempt-details">
+        <h3 class="attempt-details__title">Attempt details</h3>
+        <p class="text-muted" data-attempt-placeholder>
+          Choose a delivery attempt to review the recorded request and response payloads.
+        </p>
+        <div class="attempt-details__grid" data-attempt-details hidden>
+          <section class="attempt-details__section" aria-labelledby="attempt-request-heading">
+            <h4 id="attempt-request-heading">Request</h4>
+            <dl class="attempt-details__list">
+              <dt>Headers</dt>
+              <dd><pre data-attempt-request-headers class="attempt-details__code">—</pre></dd>
+              <dt>Body</dt>
+              <dd><pre data-attempt-request-body class="attempt-details__code">—</pre></dd>
+            </dl>
+          </section>
+          <section class="attempt-details__section" aria-labelledby="attempt-response-heading">
+            <h4 id="attempt-response-heading">Response</h4>
+            <dl class="attempt-details__list">
+              <dt>Status</dt>
+              <dd data-attempt-response-status>—</dd>
+              <dt>Headers</dt>
+              <dd><pre data-attempt-response-headers class="attempt-details__code">—</pre></dd>
+              <dt>Body</dt>
+              <dd><pre data-attempt-response-body class="attempt-details__code">—</pre></dd>
+              <dt>Error</dt>
+              <dd data-attempt-response-error>—</dd>
+            </dl>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/webhooks.js') }}" defer></script>
+{% endblock %}

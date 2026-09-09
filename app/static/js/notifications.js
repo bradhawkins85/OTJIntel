@@ -1,0 +1,912 @@
+(function () {
+  function getCookie(name) {
+    const pattern = `(?:^|; )${name.replace(/([.$?*|{}()\[\]\\\/\+^])/g, '\\$1')}=([^;]*)`;
+    const matches = document.cookie.match(new RegExp(pattern));
+    return matches ? decodeURIComponent(matches[1]) : '';
+  }
+
+  function getCsrfToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta && meta.getAttribute('content')) {
+      return meta.getAttribute('content');
+    }
+    return getCookie('myportal_session_csrf');
+  }
+
+  const notificationSelectors = {
+    table: '#notifications-table',
+    selectAll: '[data-notification-select-all]',
+    selection: '[data-notification-select]',
+    markButtons: '[data-notification-mark]',
+    markAll: '[data-notification-mark-all]',
+    markSelected: '[data-notification-mark-selected]',
+    deleteButtons: '[data-notification-delete]',
+    deleteSelected: '[data-notification-delete-selected]',
+    excludeButtons: '[data-notification-exclude]',
+    filtersForm: '#notification-filters',
+    resetButton: '[data-notification-reset]',
+    pageField: '[data-notification-page-field]',
+    totalCount: '[data-total-notifications]',
+    unreadVisible: '[data-unread-visible]',
+    unreadTotal: '[data-unread-total]',
+    navBadge: '[data-unread-nav]',
+  };
+
+  function parseCount(element) {
+    if (!element) {
+      return 0;
+    }
+    const cached = element.getAttribute('data-count');
+    if (cached !== null) {
+      const parsed = Number(cached);
+      return Number.isNaN(parsed) ? 0 : parsed;
+    }
+    const text = element.textContent || '';
+    const match = text.match(/(-?\d+)/);
+    const value = match ? Number(match[1]) : 0;
+    element.setAttribute('data-count', String(value));
+    return value;
+  }
+
+  function updateCount(element, value) {
+    if (!element) {
+      return;
+    }
+    const safeValue = Math.max(0, value);
+    element.setAttribute('data-count', String(safeValue));
+    const label = element.getAttribute('data-label');
+    element.textContent = label ? `${label}: ${safeValue}` : String(safeValue);
+  }
+
+  function updateNavUnread(count) {
+    const navBadge = document.querySelector(notificationSelectors.navBadge);
+    if (count > 0) {
+      if (navBadge) {
+        navBadge.textContent = String(count);
+        navBadge.setAttribute('data-count', String(count));
+        navBadge.removeAttribute('hidden');
+        navBadge.style.display = '';
+        return;
+      }
+      const link = document.querySelector('a[href="/notifications"] .menu__label');
+      if (!link) {
+        return;
+      }
+      const badge = document.createElement('span');
+      badge.className = 'menu__badge';
+      badge.setAttribute('data-unread-nav', '');
+      badge.setAttribute('data-count', String(count));
+      badge.textContent = String(count);
+      link.appendChild(badge);
+      return;
+    }
+    if (navBadge) {
+      navBadge.remove();
+    }
+  }
+
+  const summaryFieldMap = {
+    q: 'search',
+    search: 'search',
+    read_state: 'read_state',
+    event_type: 'event_type',
+    created_from: 'created_from',
+    created_to: 'created_to',
+  };
+
+  function buildSummaryParams() {
+    const params = new URLSearchParams();
+    const form = document.querySelector(notificationSelectors.filtersForm);
+    if (!form) {
+      return params;
+    }
+    const formData = new FormData(form);
+    formData.forEach((value, key) => {
+      if (!(key in summaryFieldMap)) {
+        return;
+      }
+      const mappedKey = summaryFieldMap[key];
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed) {
+          params.append(mappedKey, trimmed);
+        }
+        return;
+      }
+      if (value !== null && typeof value !== 'undefined') {
+        params.append(mappedKey, String(value));
+      }
+    });
+    return params;
+  }
+
+  function applySummary(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return;
+    }
+    updateCount(
+      document.querySelector(notificationSelectors.totalCount),
+      Number.isFinite(summary.total_count) ? Number(summary.total_count) : 0
+    );
+    updateCount(
+      document.querySelector(notificationSelectors.unreadVisible),
+      Number.isFinite(summary.filtered_unread_count)
+        ? Number(summary.filtered_unread_count)
+        : 0
+    );
+    updateCount(
+      document.querySelector(notificationSelectors.unreadTotal),
+      Number.isFinite(summary.global_unread_count) ? Number(summary.global_unread_count) : 0
+    );
+    updateNavUnread(
+      Number.isFinite(summary.global_unread_count) ? Number(summary.global_unread_count) : 0
+    );
+  }
+
+  async function refreshNotificationSummary() {
+    const params = buildSummaryParams();
+    const query = params.toString();
+    const response = await fetch(`/api/notifications/summary${query ? `?${query}` : ''}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      throw new Error('Failed to refresh notification summary');
+    }
+    const data = await response.json();
+    applySummary(data);
+    return data;
+  }
+
+  function formatLocalTime(isoValue) {
+    if (!isoValue) {
+      return '';
+    }
+    const date = new Date(isoValue);
+    if (Number.isNaN(date.getTime())) {
+      return isoValue;
+    }
+    return date.toLocaleString();
+  }
+
+  function applyNotificationUpdate(record) {
+    if (!record || typeof record.id === 'undefined') {
+      return false;
+    }
+    const row = document.querySelector(`[data-notification-row="${record.id}"]`);
+    if (!row) {
+      return false;
+    }
+    const wasUnread = row.getAttribute('data-unread') === '1';
+    const isUnread = !record.read_at;
+    row.setAttribute('data-unread', isUnread ? '1' : '0');
+    row.classList.toggle('notification-row--unread', isUnread);
+
+    const statusCell = row.querySelector('td[data-label="Status"] span');
+    if (statusCell) {
+      statusCell.textContent = isUnread ? 'Unread' : 'Read';
+      statusCell.classList.remove('status--unread', 'status--read');
+      statusCell.classList.add(isUnread ? 'status--unread' : 'status--read');
+    }
+
+    const readCell = row.querySelector('td[data-label="Read at"]');
+    if (readCell) {
+      let readSpan = readCell.querySelector('[data-utc]');
+      if (record.read_at) {
+        if (!readSpan) {
+          readSpan = document.createElement('span');
+          readCell.innerHTML = '';
+          readCell.appendChild(readSpan);
+        }
+        readSpan.setAttribute('data-utc', record.read_at);
+        readSpan.textContent = formatLocalTime(record.read_at);
+      } else {
+        if (readSpan) {
+          readSpan.remove();
+        }
+        readCell.innerHTML = '<span class="text-muted">Not read</span>';
+      }
+    }
+
+    const createdSpan = row.querySelector('td[data-label="Created"] [data-utc]');
+    if (createdSpan && record.created_at) {
+      createdSpan.setAttribute('data-utc', record.created_at);
+      createdSpan.textContent = formatLocalTime(record.created_at);
+    }
+
+    const actionButton = row.querySelector(notificationSelectors.markButtons);
+    if (actionButton) {
+      if (isUnread) {
+        actionButton.disabled = false;
+        actionButton.textContent = 'Mark as read';
+      } else {
+        actionButton.disabled = true;
+        actionButton.textContent = 'Read';
+      }
+    }
+
+    const checkbox = row.querySelector(notificationSelectors.selection);
+    if (checkbox) {
+      checkbox.checked = false;
+    }
+
+    return wasUnread && !isUnread;
+  }
+
+
+  function buildErrorMessage(payload, fallbackMessage) {
+    const detail = payload && payload.detail ? payload.detail : fallbackMessage;
+    const reference = payload && (payload.error_reference || payload.request_id);
+    if (reference) {
+      return `${detail} (Reference: ${reference})`;
+    }
+    return detail;
+  }
+
+  async function markNotification(notificationId) {
+    const response = await fetch(`/api/notifications/${notificationId}/read`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCsrfToken(),
+      },
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(buildErrorMessage(detail, 'Failed to update notification'));
+    }
+    return response.json();
+  }
+
+  async function acknowledgeNotifications(ids) {
+    const response = await fetch('/api/notifications/acknowledge', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCsrfToken(),
+      },
+      body: JSON.stringify({ notification_ids: ids }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(buildErrorMessage(detail, 'Failed to acknowledge notifications'));
+    }
+    return response.json();
+  }
+
+  async function excludeNotification(notificationId) {
+    const response = await fetch(`/api/notifications/${notificationId}/exclude`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': getCsrfToken() },
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(buildErrorMessage(detail, 'Failed to exclude notification type'));
+    }
+    return response.json();
+  }
+
+
+
+  async function deleteNotification(notificationId) {
+    const response = await fetch(`/api/notifications/${notificationId}`, {
+      method: 'DELETE',
+      credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': getCsrfToken() },
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(buildErrorMessage(detail, 'Failed to delete notification'));
+    }
+  }
+
+  function removeNotificationRow(notificationId) {
+    const row = document.querySelector(`[data-notification-row="${notificationId}"]`);
+    if (row) {
+      const wasUnread = row.getAttribute('data-unread') === '1';
+      row.remove();
+      return wasUnread;
+    }
+    return false;
+  }
+
+  function updateSelectionState() {
+    const selectAll = document.querySelector(notificationSelectors.selectAll);
+    const checkboxes = Array.from(document.querySelectorAll(notificationSelectors.selection));
+    const markSelected = document.querySelector(notificationSelectors.markSelected);
+    const deleteSelected = document.querySelector(notificationSelectors.deleteSelected);
+
+    const selected = checkboxes.filter((checkbox) => checkbox.checked && !checkbox.disabled);
+    if (markSelected) {
+      markSelected.disabled = selected.length === 0;
+    }
+    if (deleteSelected) {
+      deleteSelected.disabled = selected.length === 0;
+    }
+
+    if (!selectAll) {
+      return;
+    }
+
+    if (selected.length === 0) {
+      selectAll.checked = false;
+      selectAll.indeterminate = false;
+      return;
+    }
+
+    if (selected.length === checkboxes.length) {
+      selectAll.checked = true;
+      selectAll.indeterminate = false;
+      return;
+    }
+
+    selectAll.checked = false;
+    selectAll.indeterminate = true;
+  }
+
+  function bindSelectionControls() {
+    const selectAll = document.querySelector(notificationSelectors.selectAll);
+    if (selectAll) {
+      selectAll.addEventListener('change', () => {
+        const checkboxes = document.querySelectorAll(notificationSelectors.selection);
+        checkboxes.forEach((checkbox) => {
+          checkbox.checked = selectAll.checked;
+        });
+        updateSelectionState();
+      });
+    }
+
+    document.querySelectorAll(notificationSelectors.selection).forEach((checkbox) => {
+      checkbox.addEventListener('change', () => {
+        updateSelectionState();
+      });
+    });
+  }
+
+  function bindInlineActions() {
+    document.querySelectorAll(notificationSelectors.markButtons).forEach((button) => {
+      button.addEventListener('click', async () => {
+        const notificationId = button.getAttribute('data-notification-mark');
+        if (!notificationId) {
+          return;
+        }
+        button.disabled = true;
+        const originalText = button.textContent;
+        button.textContent = 'Marking…';
+        try {
+          const record = await markNotification(notificationId);
+          const changed = applyNotificationUpdate(record);
+          if (changed) {
+            try {
+              await refreshNotificationSummary();
+            } catch (summaryError) {
+              console.warn(summaryError);
+            }
+          }
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = originalText;
+          window.alert(error.message || 'Unable to mark notification as read');
+          return;
+        }
+        button.textContent = 'Read';
+        updateSelectionState();
+      });
+    });
+  }
+
+  function bindMarkAllAction() {
+    const actionButton = document.querySelector(notificationSelectors.markAll);
+    if (!actionButton) {
+      return;
+    }
+
+    actionButton.addEventListener('click', async () => {
+      const visibleNotificationIds = Array.from(document.querySelectorAll(notificationSelectors.selection))
+        .filter((checkbox) => !checkbox.disabled)
+        .map((checkbox) => Number(checkbox.value))
+        .filter((value) => !Number.isNaN(value));
+
+      if (!visibleNotificationIds.length) {
+        return;
+      }
+
+      actionButton.disabled = true;
+      const originalText = actionButton.textContent;
+      actionButton.textContent = 'Marking…';
+
+      try {
+        const records = await acknowledgeNotifications(visibleNotificationIds);
+        records.forEach((record) => {
+          applyNotificationUpdate(record);
+        });
+        try {
+          await refreshNotificationSummary();
+        } catch (summaryError) {
+          console.warn(summaryError);
+        }
+      } catch (error) {
+        window.alert(error.message || 'Unable to mark all notifications as read');
+      }
+
+      actionButton.textContent = originalText;
+      actionButton.disabled = false;
+      updateSelectionState();
+    });
+  }
+
+  function bindBulkActions() {
+    const actionButton = document.querySelector(notificationSelectors.markSelected);
+    if (!actionButton) {
+      return;
+    }
+
+    actionButton.addEventListener('click', async () => {
+      const selected = Array.from(document.querySelectorAll(notificationSelectors.selection))
+        .filter((checkbox) => checkbox.checked && !checkbox.disabled)
+        .map((checkbox) => Number(checkbox.value))
+        .filter((value) => !Number.isNaN(value));
+
+      if (!selected.length) {
+        actionButton.disabled = true;
+        return;
+      }
+
+      actionButton.disabled = true;
+      const originalText = actionButton.textContent;
+      actionButton.textContent = 'Marking…';
+
+      try {
+        const records = await acknowledgeNotifications(selected);
+        let changes = 0;
+        records.forEach((record) => {
+          if (applyNotificationUpdate(record)) {
+            changes += 1;
+          }
+        });
+        if (changes) {
+          try {
+            await refreshNotificationSummary();
+          } catch (summaryError) {
+            console.warn(summaryError);
+          }
+        }
+      } catch (error) {
+        window.alert(error.message || 'Unable to acknowledge notifications');
+      }
+
+      actionButton.textContent = originalText;
+      updateSelectionState();
+    });
+  }
+
+  function bindDeleteActions() {
+    document.querySelectorAll(notificationSelectors.deleteButtons).forEach((button) => {
+      button.addEventListener('click', async () => {
+        const notificationId = button.getAttribute('data-notification-delete');
+        if (!notificationId) return;
+        if (!window.confirm('Are you sure you want to delete this notification?')) return;
+        button.disabled = true;
+        const originalText = button.textContent;
+        button.textContent = 'Deleting…';
+        try {
+          await deleteNotification(notificationId);
+          removeNotificationRow(notificationId);
+          try {
+            await refreshNotificationSummary();
+          } catch (e) {
+            console.warn(e);
+          }
+          updateSelectionState();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = originalText;
+          window.alert(error.message || 'Unable to delete notification');
+        }
+      });
+    });
+  }
+
+  function bindBulkDeleteActions() {
+    const actionButton = document.querySelector(notificationSelectors.deleteSelected);
+    if (!actionButton) return;
+    actionButton.addEventListener('click', async () => {
+      const selected = Array.from(document.querySelectorAll(notificationSelectors.selection))
+        .filter((cb) => cb.checked && !cb.disabled).map((cb) => Number(cb.value)).filter((v) => !Number.isNaN(v));
+      if (!selected.length) { actionButton.disabled = true; return; }
+      if (!window.confirm(`Are you sure you want to delete ${selected.length} notification(s)?`)) return;
+      actionButton.disabled = true;
+      const originalText = actionButton.textContent;
+      actionButton.textContent = 'Deleting…';
+      try {
+        await Promise.all(selected.map((id) => deleteNotification(id)));
+        selected.forEach((id) => removeNotificationRow(id));
+        try {
+          await refreshNotificationSummary();
+        } catch (e) {
+          console.warn(e);
+        }
+      } catch (error) { window.alert(error.message || 'Unable to delete notifications'); }
+      actionButton.textContent = originalText;
+      updateSelectionState();
+    });
+  }
+
+  function bindExcludeActions() {
+    document.querySelectorAll(notificationSelectors.excludeButtons).forEach((button) => {
+      button.addEventListener('click', async () => {
+        const notificationId = button.getAttribute('data-notification-exclude');
+        if (!notificationId) {
+          return;
+        }
+        button.disabled = true;
+        const originalText = button.textContent;
+        button.textContent = 'Excluding…';
+        try {
+          await excludeNotification(notificationId);
+          button.textContent = 'Excluded';
+          button.title = 'Manage exclusions in Notification settings';
+        } catch (error) {
+          button.textContent = originalText;
+          button.disabled = false;
+          window.alert(error.message || 'Unable to exclude notification');
+        }
+      });
+    });
+  }
+
+  function bindFilters() {
+    const form = document.querySelector(notificationSelectors.filtersForm);
+    if (!form) {
+      return;
+    }
+    const pageField = form.querySelector(notificationSelectors.pageField);
+
+    const submitForm = () => {
+      if (pageField) {
+        pageField.value = '1';
+      }
+      if (typeof form.requestSubmit === 'function') {
+        form.requestSubmit();
+      } else {
+        form.submit();
+      }
+    };
+
+    form.querySelectorAll('select, input[type="datetime-local"]').forEach((element) => {
+      element.addEventListener('change', submitForm);
+    });
+
+    const resetButton = form.querySelector(notificationSelectors.resetButton);
+    if (resetButton) {
+      resetButton.addEventListener('click', () => {
+        form.querySelectorAll('input[type="search"], input[type="datetime-local"]').forEach((input) => {
+          input.value = '';
+        });
+        form.querySelectorAll('select').forEach((select) => {
+          const first = select.querySelector('option');
+          if (first) {
+            select.value = first.value;
+          }
+        });
+        if (pageField) {
+          pageField.value = '1';
+        }
+        submitForm();
+      });
+    }
+
+    form.addEventListener('submit', () => {
+      if (pageField) {
+        pageField.value = '1';
+      }
+    });
+  }
+
+  function bindOnboardingActionButtons() {
+    const modal = document.getElementById('onboarding-action-modal');
+    if (!modal) {
+      return;
+    }
+
+    const approveForm = document.getElementById('onboarding-approve-form');
+    const denyForm = document.getElementById('onboarding-deny-form');
+    const description = document.getElementById('onboarding-action-description');
+
+    function openOnboardingModal(staffId, notificationId, staffName) {
+      document.getElementById('onboarding-approve-staff-id').value = staffId;
+      document.getElementById('onboarding-approve-notification-id').value = notificationId;
+      document.getElementById('onboarding-deny-staff-id').value = staffId;
+      document.getElementById('onboarding-deny-notification-id').value = notificationId;
+      if (description) {
+        description.textContent = staffName
+          ? `Review the onboarding request for ${staffName}.`
+          : 'Review the pending onboarding request.';
+      }
+      if (approveForm) {
+        approveForm.querySelector('#onboarding-approve-comment').value = '';
+      }
+      if (denyForm) {
+        denyForm.querySelector('#onboarding-deny-reason').value = '';
+        const errorEl = denyForm.querySelector('#onboarding-deny-reason-error');
+        if (errorEl) {
+          errorEl.hidden = true;
+        }
+      }
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeOnboardingModal() {
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+    }
+
+    modal.querySelectorAll('[data-modal-close]').forEach((btn) => {
+      btn.addEventListener('click', closeOnboardingModal);
+    });
+
+    document.querySelectorAll('[data-onboarding-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const notificationId = button.getAttribute('data-onboarding-action');
+        const staffId = button.getAttribute('data-staff-id');
+        const row = document.querySelector(`[data-notification-row="${notificationId}"]`);
+        const messageCell = row ? row.querySelector('td[data-label="Message"] .notification-message') : null;
+        const staffName = messageCell ? messageCell.textContent.trim() : '';
+        openOnboardingModal(staffId, notificationId, staffName);
+      });
+    });
+
+    async function submitStaffDecision(action, staffId, body, notificationId) {
+      const response = await fetch(`/api/staff/${staffId}/onboarding/${action}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': getCsrfToken(),
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(buildErrorMessage(detail, `Failed to ${action} onboarding request`));
+      }
+      try {
+        const record = await markNotification(notificationId);
+        const changed = applyNotificationUpdate(record);
+        if (changed) {
+          try {
+            await refreshNotificationSummary();
+          } catch (summaryError) {
+            console.warn(summaryError);
+          }
+        }
+      } catch (markError) {
+        console.warn('Could not mark notification as read:', markError);
+      }
+    }
+
+    if (approveForm) {
+      approveForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const staffId = document.getElementById('onboarding-approve-staff-id').value;
+        const notificationId = document.getElementById('onboarding-approve-notification-id').value;
+        const comment = document.getElementById('onboarding-approve-comment').value.trim();
+        const submitBtn = document.getElementById('onboarding-approve-btn');
+        submitBtn.disabled = true;
+        const originalText = submitBtn.textContent;
+        submitBtn.textContent = 'Approving…';
+        try {
+          await submitStaffDecision('approve', staffId, { comment: comment || null }, notificationId);
+          closeOnboardingModal();
+          window.alert('Onboarding request approved successfully.');
+        } catch (error) {
+          window.alert(error.message || 'Unable to approve onboarding request');
+          submitBtn.disabled = false;
+          submitBtn.textContent = originalText;
+        }
+      });
+    }
+
+    if (denyForm) {
+      denyForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const staffId = document.getElementById('onboarding-deny-staff-id').value;
+        const notificationId = document.getElementById('onboarding-deny-notification-id').value;
+        const reason = document.getElementById('onboarding-deny-reason').value.trim();
+        const errorEl = document.getElementById('onboarding-deny-reason-error');
+        if (!reason) {
+          if (errorEl) {
+            errorEl.hidden = false;
+          }
+          document.getElementById('onboarding-deny-reason').focus();
+          return;
+        }
+        if (errorEl) {
+          errorEl.hidden = true;
+        }
+        const submitBtn = document.getElementById('onboarding-deny-btn');
+        submitBtn.disabled = true;
+        const originalText = submitBtn.textContent;
+        submitBtn.textContent = 'Denying…';
+        try {
+          await submitStaffDecision('deny', staffId, { reason }, notificationId);
+          closeOnboardingModal();
+          window.alert('Onboarding request denied.');
+        } catch (error) {
+          window.alert(error.message || 'Unable to deny onboarding request');
+          submitBtn.disabled = false;
+          submitBtn.textContent = originalText;
+        }
+      });
+    }
+  }
+
+  function bindOffboardingActionButtons() {
+    const modal = document.getElementById('offboarding-action-modal');
+    if (!modal) {
+      return;
+    }
+
+    const approveForm = document.getElementById('offboarding-approve-form');
+    const denyForm = document.getElementById('offboarding-deny-form');
+    const description = document.getElementById('offboarding-action-description');
+
+    function openOffboardingModal(staffId, notificationId, staffName) {
+      document.getElementById('offboarding-approve-staff-id').value = staffId;
+      document.getElementById('offboarding-approve-notification-id').value = notificationId;
+      document.getElementById('offboarding-deny-staff-id').value = staffId;
+      document.getElementById('offboarding-deny-notification-id').value = notificationId;
+      if (description) {
+        description.textContent = staffName
+          ? `Review the offboarding request for ${staffName}.`
+          : 'Review the pending offboarding request.';
+      }
+      if (approveForm) {
+        approveForm.querySelector('#offboarding-approve-comment').value = '';
+      }
+      if (denyForm) {
+        denyForm.querySelector('#offboarding-deny-reason').value = '';
+        const errorEl = denyForm.querySelector('#offboarding-deny-reason-error');
+        if (errorEl) {
+          errorEl.hidden = true;
+        }
+      }
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeOffboardingModal() {
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+    }
+
+    modal.querySelectorAll('[data-modal-close]').forEach((btn) => {
+      btn.addEventListener('click', closeOffboardingModal);
+    });
+
+    document.querySelectorAll('[data-offboarding-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const notificationId = button.getAttribute('data-offboarding-action');
+        const staffId = button.getAttribute('data-staff-id');
+        const row = document.querySelector(`[data-notification-row="${notificationId}"]`);
+        const messageCell = row ? row.querySelector('td[data-label="Message"] .notification-message') : null;
+        const staffName = messageCell ? messageCell.textContent.trim() : '';
+        openOffboardingModal(staffId, notificationId, staffName);
+      });
+    });
+
+    async function submitOffboardingDecision(action, staffId, body, notificationId) {
+      const response = await fetch(`/api/staff/${staffId}/offboarding/${action}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': getCsrfToken(),
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(buildErrorMessage(detail, `Failed to ${action} offboarding request`));
+      }
+      try {
+        const record = await markNotification(notificationId);
+        const changed = applyNotificationUpdate(record);
+        if (changed) {
+          try {
+            await refreshNotificationSummary();
+          } catch (summaryError) {
+            console.warn(summaryError);
+          }
+        }
+      } catch (markError) {
+        console.warn('Could not mark notification as read:', markError);
+      }
+    }
+
+    if (approveForm) {
+      approveForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const staffId = document.getElementById('offboarding-approve-staff-id').value;
+        const notificationId = document.getElementById('offboarding-approve-notification-id').value;
+        const comment = document.getElementById('offboarding-approve-comment').value.trim();
+        const submitBtn = document.getElementById('offboarding-approve-btn');
+        submitBtn.disabled = true;
+        const originalText = submitBtn.textContent;
+        submitBtn.textContent = 'Approving…';
+        try {
+          await submitOffboardingDecision('approve', staffId, { comment: comment || null }, notificationId);
+          closeOffboardingModal();
+          window.alert('Offboarding request approved successfully.');
+        } catch (error) {
+          window.alert(error.message || 'Unable to approve offboarding request');
+          submitBtn.disabled = false;
+          submitBtn.textContent = originalText;
+        }
+      });
+    }
+
+    if (denyForm) {
+      denyForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const staffId = document.getElementById('offboarding-deny-staff-id').value;
+        const notificationId = document.getElementById('offboarding-deny-notification-id').value;
+        const reason = document.getElementById('offboarding-deny-reason').value.trim();
+        const errorEl = document.getElementById('offboarding-deny-reason-error');
+        if (!reason) {
+          if (errorEl) {
+            errorEl.hidden = false;
+          }
+          document.getElementById('offboarding-deny-reason').focus();
+          return;
+        }
+        if (errorEl) {
+          errorEl.hidden = true;
+        }
+        const submitBtn = document.getElementById('offboarding-deny-btn');
+        submitBtn.disabled = true;
+        const originalText = submitBtn.textContent;
+        submitBtn.textContent = 'Denying…';
+        try {
+          await submitOffboardingDecision('deny', staffId, { reason }, notificationId);
+          closeOffboardingModal();
+          window.alert('Offboarding request denied.');
+        } catch (error) {
+          window.alert(error.message || 'Unable to deny offboarding request');
+          submitBtn.disabled = false;
+          submitBtn.textContent = originalText;
+        }
+      });
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    bindFilters();
+    bindSelectionControls();
+    bindInlineActions();
+    bindMarkAllAction();
+    bindBulkActions();
+    bindDeleteActions();
+    bindBulkDeleteActions();
+    bindExcludeActions();
+    bindOnboardingActionButtons();
+    bindOffboardingActionButtons();
+    updateSelectionState();
+
+    const visibleCounter = document.querySelector(notificationSelectors.unreadVisible);
+    if (visibleCounter) {
+      updateCount(visibleCounter, parseCount(visibleCounter));
+    }
+    const totalCounter = document.querySelector(notificationSelectors.unreadTotal);
+    if (totalCounter) {
+      const totalValue = parseCount(totalCounter);
+      updateCount(totalCounter, totalValue);
+      updateNavUnread(totalValue);
+    }
+  });
+})();

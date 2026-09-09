@@ -1,0 +1,1958 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+
+{% block header_title %}Ticket detail{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "Clock history", "type": "button", "attrs": {"data-ticket-page-clock-history": true}},
+    {"label": "Audit Trail", "type": "button", "attrs": {"data-ticket-automation-history-open": true, "data-ticket-id": ticket.id}},
+    {"label": "All tickets", "type": "link", "href": "/admin/tickets"}
+  ]) }}
+{% endblock %}
+{% block extra_head %}
+  {{ super() }}
+  <link rel="stylesheet" href="{{ static_url('/static/css/suneditor.min.css') }}" />
+{% endblock %}
+
+{% block content %}
+  <div
+    class="management management--single"
+    data-layout
+    data-admin-ticket-detail
+    data-ticket-id="{{ ticket.id }}"
+  >
+    <section class="management__content">
+      <header class="management__header">
+        <div>
+          <h1 class="management__title">{{ ticket.subject }}</h1>
+          {% set ticket_status = (ticket.status or 'open') %}
+          {% set ai_badge_map = {'succeeded': 'badge--success', 'error': 'badge--danger', 'skipped': 'badge--muted', 'unknown': 'badge--muted'} %}
+          {% set ai_date_color_map = {'succeeded': '#bbf7d0', 'error': '#fecaca', 'skipped': 'rgba(226, 232, 240, 0.75)', 'unknown': 'rgba(226, 232, 240, 0.75)'} %}
+          {% set resolution_label_map = {'likely_resolved': 'Likely Resolved', 'likely_in_progress': 'Likely In Progress'} %}
+          {% set resolution_badge_map = {'likely_resolved': 'badge--success', 'likely_in_progress': 'badge--warning'} %}
+          {% set ai_status_value = ticket.ai_summary_status if ticket.ai_summary_status is not none else 'skipped' %}
+          {% set ai_status_lower = ai_status_value | lower %}
+          {% set ai_status_label = ai_status_lower.replace('_', ' ') | title %}
+          {% set tag_status_value = ticket.ai_tags_status if ticket.ai_tags_status is not none else 'skipped' %}
+          {% set tag_status_lower = tag_status_value | lower %}
+          {% set ticket_status_label = ticket_status_label_map.get(ticket_status, ticket_status.replace('_', ' ').title()) %}
+          <p class="management__meta">SLA: <span class="status status--{{ 'danger' if ticket_sla.state == 'breached' else ('warning' if ticket_sla.state == 'at_risk' else ('success' if ticket_sla.state in ['met','on_track'] else 'neutral')) }}">{{ ticket_sla.name ~ ' · ' if ticket_sla.name else '' }}{{ ticket_sla.label }}</span>{% if ticket_sla.paused %} &middot; Timer paused{% endif %}{% if ticket_sla.resolution_due_at %} &middot; Resolution due <span data-utc="{{ ticket_sla.resolution_due_at.isoformat() }}">{{ ticket_sla.resolution_due_at.isoformat() }}</span>{% endif %}</p>
+        </div>
+        <div class="management__header-actions">
+          <a href="/admin/tickets" class="button button--ghost">Back to tickets</a>
+          {% if module_enabled.get('hudu', false) and hudu_company_url %}
+            <a
+              href="{{ hudu_company_url }}"
+              target="_blank"
+              rel="noreferrer noopener"
+              class="button button--ghost"
+              title="Open company in Hudu"
+              aria-label="Open company in Hudu"
+            >
+              <span class="button__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false" fill="currentColor">
+                  <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
+                </svg>
+              </span>
+              Hudu
+            </a>
+          {% endif %}
+          {% if solidtime_links and solidtime_links.enabled and solidtime_links.timer_url %}
+            <a
+              href="{{ solidtime_links.timer_url }}"
+              target="_blank"
+              rel="noreferrer noopener"
+              class="button button--ghost"
+              title="Open Solidtime timer for this ticket"
+              aria-label="Open Solidtime timer for this ticket"
+            >
+              <span class="button__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false" fill="currentColor">
+                  <title>Solidtime timer</title>
+                  <path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 010 16zm.5-13H11v6l5.2 3.1.8-1.3-4.5-2.7V7z"/>
+                </svg>
+              </span>
+              Solidtime
+            </a>
+          {% endif %}
+          {% if can_delete_ticket %}
+            <form
+              action="/admin/tickets/{{ ticket.id }}/delete"
+              method="post"
+              class="inline-form"
+              data-confirm="Delete ticket {{ ticket.id }}? This cannot be undone."
+            >
+              {% if csrf_token %}
+                <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+              {% endif %}
+              <button type="submit" class="button button--danger">Delete ticket</button>
+            </form>
+          {% endif %}
+        </div>
+      </header>
+
+      <div class="management__body management__body--columns management__body--ticket-detail management__body--ticket-detail-admin">
+        <div class="management__column management__column--details">
+          <details class="card card--panel card-collapsible">
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Ticket details</h2>
+              <div class="card__collapsible-meta">
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+            <form id="ticket-details-form" action="/admin/tickets/{{ ticket.id }}/details" method="post" class="form card__form" data-ticket-details-autosave>
+              {% if csrf_token %}
+                <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+              {% endif %}
+              <input type="hidden" name="returnUrl" value="{{ ticket_return_url }}" />
+              <div class="form-field">
+                <label class="form-label required" for="ticket-subject-detail">Subject</label>
+                <input
+                  id="ticket-subject-detail"
+                  name="subject"
+                  class="form-input"
+                  maxlength="255"
+                  value="{{ ticket.subject or '' }}"
+                  required
+                  placeholder="Briefly describe the request"
+                />
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-status-detail">Status</label>
+                <select id="ticket-status-detail" name="status" class="form-input">
+                  {% if ticket_status not in ticket_selectable_status_values %}
+                    <option value="{{ ticket_status }}" selected>{{ ticket_status_label }}</option>
+                  {% endif %}
+                  {% for status_option in ticket_status_definitions %}
+                    <option value="{{ status_option.tech_status }}" {% if status_option.tech_status == ticket_status %}selected{% endif %}>
+                      {{ status_option.tech_label }}
+                    </option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-priority-detail">Priority</label>
+                <select id="ticket-priority-detail" name="priority" class="form-input">
+                  {% for priority_option in ticket_priority_options %}
+                    {% set priority_value = priority_option|lower %}
+                    <option value="{{ priority_value }}" {% if priority_value == (ticket.priority or 'normal')|lower %}selected{% endif %}>
+                      {{ priority_option.replace('_', ' ')|title() }}
+                    </option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-company-detail">Company</label>
+                <select id="ticket-company-detail" name="companyId" class="form-input">
+                  <option value="">Not linked</option>
+                  {% for company_option in ticket_company_options %}
+                    <option value="{{ company_option.id }}" {% if company_option.id == ticket.company_id %}selected{% endif %}>
+                      {{ company_option.name }}
+                    </option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-requester-detail">Requester</label>
+                <select
+                  id="ticket-requester-detail"
+                  name="requesterId"
+                  class="form-input"
+                  data-ticket-requester-select
+                  {% if not ticket.company_id %}disabled aria-disabled="true"{% endif %}
+                >
+                  <option value="">Not set</option>
+                  {% for requester in ticket_requester_options %}
+                    {% set requester_value = requester.requester_value or ('user:' ~ requester.id) %}
+                    <option value="{{ requester_value }}" {% if requester.staff_id == ticket.requester_staff_id or (requester.user_id and requester.user_id == ticket.requester_id) %}selected{% endif %}>
+                      {{ ([requester.first_name, requester.last_name] | select | join(' ')) | trim or requester.email }}{% if requester.email %} ({{ requester.email }}){% endif %}
+                    </option>
+                  {% endfor %}
+                </select>
+                <p
+                  class="form-help"
+                  data-ticket-requester-help
+                  data-help-disabled="Link a company before selecting a requester."
+                  data-help-empty="No enabled staff members are available for the linked company."
+                  {% if ticket.company_id and ticket_requester_options %}hidden{% endif %}
+                >
+                  {% if not ticket.company_id %}
+                    Link a company before selecting a requester.
+                  {% elif not ticket_requester_options %}
+                    No enabled staff members are available for the linked company.
+                  {% endif %}
+                </p>
+              </div>
+              <div class="form-field">
+                <span class="form-label">Requester phone</span>
+                {% if ticket_requester_phone_display %}
+                  <p class="form-help">Mobile: {{ ticket_requester_phone_display }}</p>
+                {% endif %}
+                {% if ticket_company_phone_display %}
+                  <p class="form-help">Company: {{ ticket_company_phone_display }}</p>
+                {% endif %}
+                {% if not ticket_requester_phone_display and not ticket_company_phone_display %}
+                  <p class="form-help">—</p>
+                {% endif %}
+                {% if ticket_requester_lookup_name %}
+                  <div
+                    data-outlook-contact-phones
+                    data-requester-name="{{ ticket_requester_lookup_name }}"
+                    data-ticket-id="{{ ticket.id }}"
+                    {% if ticket.requester_staff_id %}data-requester-staff-id="{{ ticket.requester_staff_id }}"{% endif %}
+                  >
+                    <button type="button" class="button button--ghost button--small" data-outlook-contact-load>Check Outlook contacts</button>
+                    <p class="form-help" data-outlook-contact-status hidden></p>
+                    <div data-outlook-contact-results></div>
+                  </div>
+                {% endif %}
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-review-date-detail">Review Date</label>
+                <input
+                  id="ticket-review-date-detail"
+                  name="reviewDate"
+                  type="date"
+                  class="form-input"
+                  value="{{ ticket.review_date.isoformat() if ticket.review_date else '' }}"
+                />
+                <p class="form-help">Flag when this ticket should be reviewed again.</p>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-assigned-detail">Assigned to</label>
+                <select id="ticket-assigned-detail" name="assignedUserId" class="form-input">
+                  <option value="">Unassigned</option>
+                  {% for user in ticket_user_options %}
+                    <option value="{{ user.id }}" {% if user.id == ticket.assigned_user_id %}selected{% endif %}>
+                      {{ user.email }}
+                    </option>
+                  {% endfor %}
+                </select>
+              </div>
+              <p class="form-help" data-ticket-details-autosave-status role="status" aria-live="polite">Changes save automatically when you leave a field.</p>
+            </form>
+            </div>
+          </details>
+
+          {% if relevant_services %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Related Service Status</h2>
+              </header>
+              <div class="card__body">
+                <ul class="list">
+                  {% for service in relevant_services %}
+                    {% set status_meta = service_status_lookup.get(service.status) %}
+                    {% set status_variant = status_meta.variant if status_meta else 'status--neutral' %}
+                    {% set status_label = status_meta.label if status_meta else (service.status | replace('_', ' ') | title) %}
+                    <li class="list__item">
+                      <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
+                        <div style="flex: 1;">
+                          <strong>{{ service.name }}</strong>
+                          {% if service.description %}
+                            <div class="list__meta">{{ service.description }}</div>
+                          {% endif %}
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                          <span class="status {{ status_variant }}">{{ status_label }}</span>
+                        </div>
+                      </div>
+                      {% if service.status_message %}
+                        <div class="list__meta" style="margin-top: 0.5rem;">
+                          {{ service.status_message }}
+                        </div>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </article>
+          {% endif %}
+
+          <details class="card card--panel card-collapsible">
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Additional details</h2>
+              <div class="card__collapsible-meta">
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+            <div class="card__body card__body--meta">
+              <dl class="definition-list">
+                <div class="definition-list__item">
+                  <dt>Watchers</dt>
+                  <dd>
+                    <div data-watchers-container>
+                      {% if ticket_watchers %}
+                        <ul class="list" data-watchers-list>
+                          {% for watcher in ticket_watchers %}
+                            {% set watcher_user = watcher.user %}
+                            {% set watcher_email = watcher.email %}
+                            {% set display_text = watcher_user.email if watcher_user else (watcher_email if watcher_email else 'User #' ~ watcher.user_id) %}
+                            <li class="list__item" data-watcher-item 
+                                data-user-id="{{ watcher.user_id if watcher.user_id else '' }}"
+                                data-watcher-email="{{ watcher_email if watcher_email else '' }}">
+                              <div style="display: flex; align-items: center; justify-content: space-between;">
+                                <div>
+                                  <strong>{{ display_text }}</strong>
+                                  {% if watcher.created_at %}
+                                    <div class="list__meta">Watching since {{ watcher.created_at.astimezone().strftime('%Y-%m-%d %H:%M') }}</div>
+                                  {% endif %}
+                                </div>
+                                <button
+                                  type="button"
+                                  class="button button--small button--ghost"
+                                  data-remove-watcher
+                                  data-user-id="{{ watcher.user_id if watcher.user_id else '' }}"
+                                  data-watcher-email="{{ watcher_email if watcher_email else '' }}"
+                                  data-user-display="{{ display_text }}"
+                                  title="Remove watcher"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </li>
+                          {% endfor %}
+                        </ul>
+                      {% else %}
+                        <ul class="list" data-watchers-list style="display: none;"></ul>
+                        <span class="card__empty" data-watchers-empty>No watchers are subscribed to this ticket.</span>
+                      {% endif %}
+                      <div style="margin-top: 12px; display: flex; gap: 8px; align-items: flex-start; flex-direction: column;">
+                        <div style="display: flex; gap: 8px; align-items: center; width: 100%;">
+                          <select class="form-input" data-watcher-select style="flex: 1;">
+                            <option value="">Select a staff member to add...</option>
+                            {% if ticket_watcher_staff_options %}
+                              {% for staff_user in ticket_watcher_staff_options %}
+                                {% set is_watching = namespace(value=false) %}
+                                {% for watcher in ticket_watchers %}
+                                  {% if watcher.user_id == staff_user.id %}
+                                    {% set is_watching.value = true %}
+                                  {% endif %}
+                                {% endfor %}
+                                {% if not is_watching.value %}
+                                  {% if staff_user.user_id %}
+                                    <option value="{{ staff_user.user_id }}" data-watcher-kind="user">{{ staff_user.email }}</option>
+                                  {% else %}
+                                    <option value="{{ staff_user.email }}" data-watcher-kind="email">{{ staff_user.email }}</option>
+                                  {% endif %}
+                                {% endif %}
+                              {% endfor %}
+                            {% endif %}
+                          </select>
+                          <button
+                            type="button"
+                            class="button button--primary"
+                            data-add-watcher
+                            disabled
+                          >
+                            Add
+                          </button>
+                        </div>
+                        {% if ticket.company_id %}
+                          <div style="display: flex; gap: 8px; align-items: center; width: 100%;">
+                            <input
+                              type="email"
+                              class="form-input"
+                              data-watcher-email-input
+                              placeholder="Or enter email address..."
+                              style="flex: 1;"
+                            />
+                            <button
+                              type="button"
+                              class="button button--primary"
+                              data-add-watcher-email
+                              disabled
+                            >
+                              Add
+                            </button>
+                          </div>
+                          <p class="form-help" style="margin-top: 4px;">
+                            Add company staff from the dropdown, or enter any email address to notify them about ticket updates.
+                          </p>
+                        {% else %}
+                          <p class="form-help" style="margin-top: 4px;">
+                            Link a company to this ticket to add watchers from the company staff.
+                          </p>
+                        {% endif %}
+                      </div>
+                    </div>
+                  </dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt><label class="form-label" for="ticket-reference-detail">External reference</label></dt>
+                  <dd>
+                    <input
+                      id="ticket-reference-detail"
+                      name="externalReference"
+                      form="ticket-details-form"
+                      class="form-input"
+                      maxlength="128"
+                      value="{{ ticket.external_reference or '' }}"
+                      placeholder="Syncro ID or external case"
+                    />
+                  </dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt>Billable minutes</dt>
+                  <dd data-ticket-billable-total>{{ ticket_billable_minutes }}</dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt>Non-billable minutes</dt>
+                  <dd data-ticket-non-billable-total>{{ ticket_non_billable_minutes }}</dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt><label class="form-label" for="ticket-shipment-tracking-url">Shipment tracking URL</label></dt>
+                  <dd>
+                    <input
+                      id="ticket-shipment-tracking-url"
+                      name="shipmentTrackingUrl"
+                      form="ticket-details-form"
+                      class="form-input"
+                      maxlength="500"
+                      value="{{ ticket_shipment_watch.tracking_url if ticket_shipment_watch else '' }}"
+                      placeholder="Paste the full carrier tracking URL"
+                      data-shipment-watch-url
+                    />
+                    <div class="form-help" style="margin-top: 6px;">
+                      Provider:
+                      <strong data-shipment-watch-provider>{{ ticket_shipment_watch.provider|title if ticket_shipment_watch and ticket_shipment_watch.provider else 'Not detected' }}</strong>
+                      {% if ticket_shipment_watch and ticket_shipment_watch.last_checked_at %}
+                        · Last checked {{ ticket_shipment_watch.last_checked_at.astimezone().strftime('%Y-%m-%d %H:%M') }}
+                      {% endif %}
+                      {% if ticket_shipment_watch and ticket_shipment_watch.last_posted_update_at %}
+                        · Last posted {{ ticket_shipment_watch.last_posted_update_at.astimezone().strftime('%Y-%m-%d %H:%M') }}
+                      {% endif %}
+                    </div>
+                  </dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt><label class="form-label" for="ticket-shipment-poll-interval">Shipment poll interval (seconds)</label></dt>
+                  <dd>
+                    <input
+                      id="ticket-shipment-poll-interval"
+                      name="shipmentPollIntervalSeconds"
+                      form="ticket-details-form"
+                      class="form-input"
+                      type="number"
+                      min="0"
+                      max="86400"
+                      value="{{ ticket_shipment_watch.poll_interval_seconds if ticket_shipment_watch else 900 }}"
+                    />
+                    <div class="form-help" style="margin-top: 6px;">
+                      Set to 0 to disable shipment lookups for this ticket. Positive intervals poll at the configured rate.
+                    </div>
+                    <div class="form-field form-field--checkbox">
+                      <label class="checkbox" for="ticket-shipment-public-comments-enabled">
+                        <input
+                          id="ticket-shipment-public-comments-enabled"
+                          type="checkbox"
+                          name="shipmentPublicCommentsEnabled"
+                          value="1"
+                          form="ticket-details-form"
+                          {% if not ticket_shipment_watch or ticket_shipment_watch.public_comments_enabled %}checked{% endif %}
+                        />
+                        <span>Post shipping updates as public ticket comments</span>
+                      </label>
+                    </div>
+                  </dd>
+                </div>
+                {% if ticket_assets %}
+                  <div class="definition-list__item">
+                    <dt>Assets</dt>
+                    <dd>
+                      <div class="tag-list">
+                        {% for asset in ticket_assets %}
+                      {% set asset_label = asset.name %}
+                          <span class="tag">{{ asset_label }}</span>
+                        {% endfor %}
+                      </div>
+                    </dd>
+                  </div>
+                {% endif %}
+                {% if ticket.ai_tags_status or (ticket.ai_tags is not none and ticket.ai_tags|length > 0) %}
+                  <div class="definition-list__item">
+                    <dt>AI Tags</dt>
+                    <dd>
+                      {% if tag_status_lower == 'succeeded' and ticket.ai_tags %}
+                        <div class="tag-list" id="ai-tags-container">
+                          {% for tag in ticket.ai_tags %}
+                            <span class="tag" data-tag-slug="{{ tag }}">
+                              {{ tag.replace('-', ' ') }}
+                              {% if is_super_admin %}
+                                <button 
+                                  type="button" 
+                                  class="tag__remove" 
+                                  onclick="removeTag('{{ tag }}')"
+                                  aria-label="Remove tag {{ tag }}"
+                                  title="Remove this tag"
+                                >×</button>
+                                <button
+                                  type="button"
+                                  class="tag__exclude"
+                                  onclick="excludeAndRemoveTag('{{ tag }}')"
+                                  aria-label="Exclude tag {{ tag }} from future use"
+                                  title="Remove and exclude from future use"
+                                ><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" aria-hidden="true"><path d="M8.27 3 3 8.27v7.46L8.27 21h7.46L21 15.73V8.27L15.73 3H8.27zm4.5 13h-1.5v-1.5h1.5V16zm0-3h-1.5V8h1.5v5z"/></svg></button>
+                              {% endif %}
+                            </span>
+                          {% endfor %}
+                        </div>
+                      {% elif tag_status_lower == 'succeeded' %}
+                        <span class="card__empty">Ollama did not return tags for this ticket.</span>
+                      {% elif tag_status_lower == 'skipped' %}
+                        <span class="card__empty">Enable the Ollama integration module to generate tags.</span>
+                      {% elif tag_status_lower == 'error' %}
+                        <span class="card__empty">AI tag generation failed. Check the Ollama module logs.</span>
+                      {% else %}
+                        <span class="card__empty">AI tags are not currently available.</span>
+                      {% endif %}
+                    </dd>
+                  </div>
+                {% endif %}
+                <div class="definition-list__item">
+                  <dt>Module</dt>
+                  <dd>{{ ticket_module.name if ticket_module else (ticket.module_slug or '—') }}</dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt><label class="form-label" for="ticket-category-detail">Category</label></dt>
+                  <dd>
+                    <input
+                      id="ticket-category-detail"
+                      name="category"
+                      form="ticket-details-form"
+                      class="form-input"
+                      maxlength="64"
+                      value="{{ ticket.category or '' }}"
+                      placeholder="Networking, onboarding, escalation…"
+                    />
+                  </dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt>Created</dt>
+                  <dd>{{ ticket.created_at.astimezone().strftime('%Y-%m-%d %H:%M') if ticket.created_at else '—' }}</dd>
+                </div>
+                <div class="definition-list__item">
+                  <dt>Updated</dt>
+                  <dd>{{ ticket.updated_at.astimezone().strftime('%Y-%m-%d %H:%M') if ticket.updated_at else '—' }}</dd>
+                </div>
+              </dl>
+            </div>
+            </div>
+          </details>
+
+          {% if ticket_assigned_user and ticket_assigned_user.booking_link_url %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Book a Call</h2>
+              </header>
+              <div class="card__body">
+                <p class="text-muted" style="margin-bottom: 1rem;">
+                  Schedule a call with {{ ticket_assigned_user.email }} to discuss this ticket.
+                </p>
+                <button
+                  data-cal-link="{{ ticket_assigned_user.booking_link_url }}"
+                  data-ticket-id="{{ ticket.id }}"
+                  data-ticket-subject="{{ ticket.subject | e }}"
+                  data-user-name="{{ ([user.first_name, user.last_name] | select | join(' ')) | e }}"
+                  data-user-email="{{ (user.email or '') | e }}"
+                  data-user-phone="{{ (user.mobile_phone or '') | e }}"
+                  class="button button--primary"
+                >
+                  Book a Call
+                </button>
+              </div>
+            </article>
+          {% endif %}
+
+          {% if matrix_chat_enabled and ticket_chat_room %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Chat</h2>
+              </header>
+              <div class="card__body">
+                <p class="text-muted" style="margin-bottom: 1rem;">
+                  A chat room is linked to this ticket.
+                </p>
+                <a href="/chat/{{ ticket_chat_room.id }}" class="button button--primary">
+                  Open Chat
+                </a>
+              </div>
+            </article>
+          {% endif %}
+
+          <details
+            class="card card--panel card-collapsible ticket-related"
+            data-ticket-related
+            data-ticket-id="{{ ticket.id }}"
+            data-auto-scan="false"
+          >
+            <summary class="card__header card__header--collapsible ticket-related__summary">
+              <h2 class="card__title">Related</h2>
+              <div class="card__collapsible-meta ticket-related__actions">
+                <button
+                  type="button"
+                  class="button button--ghost button--small ticket-related__refresh"
+                  data-ticket-related-refresh
+                  title="Re-scan this ticket for related MyPortal content"
+                  aria-label="Re-scan related content"
+                >Refresh</button>
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content card__body">
+              <div
+                class="ticket-related__status"
+                data-ticket-related-status
+                {% if ticket_related_items %}hidden{% endif %}
+              >
+                No pre-discovered related MyPortal content is available yet. Use refresh to scan this ticket manually.
+              </div>
+              {% if ticket.merged_into_ticket_id %}
+                <div class="alert alert--info">This child ticket was merged into <a href="/admin/tickets/{{ ticket.merged_into_ticket_id }}">ticket #{{ ticket.merged_into_ticket_id }}</a>. Automations and billing are handled by the parent ticket.</div>
+              {% endif %}
+              {% if merged_child_tickets %}
+                <div class="ticket-related__merged">
+                  <h3 class="card__subtitle">Merged child tickets</h3>
+                  <ul>
+                    {% for child_ticket in merged_child_tickets %}
+                      <li><a href="/admin/tickets/{{ child_ticket.id }}">#{{ child_ticket.id }}</a> — {{ child_ticket.subject or 'Untitled ticket' }}</li>
+                    {% endfor %}
+                  </ul>
+                </div>
+              {% endif %}
+              <ul
+                class="ticket-related__list"
+                data-ticket-related-list
+                {% if not ticket_related_items %}hidden{% endif %}
+              >
+                {% for item in ticket_related_items %}
+                  <li class="ticket-related__item">
+                    <a
+                      class="ticket-related__link"
+                      href="{{ item.url }}"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="{{ item.label }}"
+                    >{{ item.label }}</a>
+                  </li>
+                {% endfor %}
+              </ul>
+            </div>
+          </details>
+
+          {% if ticket.xero_invoice_number %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Xero Invoice</h2>
+              </header>
+              <div class="card__body">
+                <dl class="definition-list definition-list--vertical">
+                  <div class="definition-list__item">
+                    <dt>Invoice Number</dt>
+                    <dd>
+                      <strong>{{ ticket.xero_invoice_number }}</strong>
+                    </dd>
+                  </div>
+                  {% if ticket.billed_at %}
+                  <div class="definition-list__item">
+                    <dt>Billed At</dt>
+                    <dd>{{ ticket.billed_at.strftime('%Y-%m-%d %H:%M') if ticket.billed_at }}</dd>
+                  </div>
+                  {% endif %}
+                </dl>
+                <p class="card__help" style="margin-top: 1rem;">
+                  This ticket has been billed and closed. No further time can be added.
+                </p>
+              </div>
+            </article>
+          {% endif %}
+
+          {% if relevant_kb_articles %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Related Knowledge Base Articles</h2>
+              </header>
+              <div class="card__body">
+                <ul class="list">
+                  {% for article in relevant_kb_articles %}
+                    <li class="list__item">
+                      <a href="/knowledge-base?slug={{ article.slug }}" target="_blank" rel="noopener noreferrer">
+                        <strong>{{ article.title }}</strong>
+                      </a>
+                      {% if article.summary %}
+                        <div class="list__meta">{{ article.summary }}</div>
+                      {% endif %}
+                      {% if article.matching_tags_count %}
+                        <div class="list__meta">
+                          <span class="badge badge--muted">{{ article.matching_tags_count }} matching tag{{ 's' if article.matching_tags_count > 1 else '' }}</span>
+                        </div>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </article>
+          {% endif %}
+        </div>
+
+        <div class="management__column-group management__column-group--main">
+          <div class="management__column management__column--content">
+          {% set description_html = ticket.description_html if ticket.description_html is defined else '' %}
+          <details class="card card--panel card-collapsible" data-ticket-description-panel>
+            <summary class="card__header card__header--collapsible ticket-description-summary">
+              <div class="ticket-description-summary__main">
+                <h2 class="card__title">Description</h2>
+                {% if description_html %}
+                  <div class="rich-text-viewer ticket-description-summary__preview" data-ticket-description-preview>
+                    {{ description_html | safe }}
+                  </div>
+                {% endif %}
+              </div>
+              <div class="card__collapsible-meta">
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+              <div class="card__body">
+                <p
+                  class="card__empty"
+                  data-ticket-description-empty
+                  {% if description_html %}hidden{% endif %}
+                >
+                  The ticket description does not contain displayable content.
+                </p>
+              </div>
+              <form action="/admin/tickets/{{ ticket.id }}/description" method="post" class="form card__form" data-ticket-description-form>
+                {% if csrf_token %}
+                  <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+                {% endif %}
+                <input type="hidden" name="returnUrl" value="{{ ticket_return_url }}" />
+                <div class="form-field">
+                  <textarea
+                    id="ticket-description-editor"
+                    name="description"
+                    class="form-input"
+                    data-ticket-description-input
+                  >{{- (description_html or '')|replace('\r\n', '\n')|replace('\r', '\n') -}}</textarea>
+                  <p class="form-help">Share customer notes, troubleshooting steps, or context for technicians.</p>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="button button--primary">Save description</button>
+                </div>
+              </form>
+            </div>
+          </details>
+
+          {% if ticket.ai_summary or ticket.ai_summary_status %}
+            <details class="card card--panel card-collapsible" data-ticket-ai-card open>
+              <summary class="card__header card__header--collapsible">
+                <div style="display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap;">
+                  <h2 class="card__title">AI Summary</h2>
+                  {% if ticket.ai_summary_updated_at %}
+                    <span class="card__subtitle" style="margin: 0; color: {{ ai_date_color_map.get(ai_status_lower, 'rgba(226, 232, 240, 0.75)') }}">Updated {{ ticket.ai_summary_updated_at.astimezone().strftime('%Y-%m-%d %H:%M') }}</span>
+                  {% endif %}
+                </div>
+                <div class="card__collapsible-meta">
+                  <div class="button-group" style="align-items: center;">
+                    {% set resolution_label = resolution_label_map.get(ticket.ai_resolution_state) %}
+                    {% if resolution_label %}
+                      <span class="badge {{ resolution_badge_map.get(ticket.ai_resolution_state, 'badge--muted') }}" style="align-self: center;">{{ resolution_label }}</span>
+                    {% endif %}
+                    <button
+                      type="button"
+                      class="button button--ghost button--small"
+                      data-ticket-ai-replace-description
+                      data-ticket-id="{{ ticket.id }}"
+                      data-processing-label="Replacing description…"
+                      aria-label="Replace the ticket description with the AI summary"
+                      title="Replace the ticket description with the AI summary"
+                      {% if not ticket.ai_summary %}disabled aria-disabled="true"{% endif %}
+                    >
+                      <span data-button-label>Replace description</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="button button--ghost button--small"
+                      data-ticket-ai-refresh
+                      data-ticket-id="{{ ticket.id }}"
+                      data-processing-label="Reprocessing AI summary and AI tags…"
+                      aria-label="Reprocess AI summary and AI tags"
+                      title="Reprocess AI summary and AI tags"
+                    >
+                      <span class="sr-only" data-button-label>Reprocess AI summary and AI tags</span>
+                      <span class="button__icon" aria-hidden="true" data-button-icon>
+                        <svg viewBox="0 0 24 24" focusable="false">
+                          <path d="M12 4a8 8 0 0 1 7.75 6.11 1 1 0 0 1-1.94.46A6 6 0 1 0 17 16h1.59l-1.3-1.29a1 1 0 1 1 1.42-1.42l3 3a1 1 0 0 1 0 1.42l-3 3a1 1 0 0 1-1.42-1.42L18.59 18H17a8 8 0 1 1-5-14Z" />
+                        </svg>
+                      </span>
+                    </button>
+                  </div>
+                  <span class="card__toggle-icon" aria-hidden="true"></span>
+                </div>
+              </summary>
+              <div class="card-collapsible__content">
+                <p
+                  class="form-help"
+                  role="status"
+                  aria-live="polite"
+                  data-ticket-ai-status
+                  hidden
+                ></p>
+                <div class="card__body">
+                  {% if ai_status_lower == 'succeeded' and ticket.ai_summary %}
+                    {% set paragraphs = ticket.ai_summary.split('\n\n') %}
+                    {% for paragraph in paragraphs %}
+                      {% set safe_paragraph = (paragraph | e).replace('\n', '<br />') %}
+                      {% if safe_paragraph %}
+                        <p>{{ safe_paragraph | safe }}</p>
+                      {% endif %}
+                    {% endfor %}
+                  {% elif ai_status_lower == 'succeeded' %}
+                    <p class="card__empty">Ollama did not return a summary for this ticket.</p>
+                  {% elif ai_status_lower == 'skipped' %}
+                    <p class="card__empty">Enable the Ollama integration module to generate summaries.</p>
+                  {% elif ai_status_lower == 'error' %}
+                    <p class="card__empty">AI summary generation failed. Check the Ollama module logs.</p>
+                  {% else %}
+                    <p class="card__empty">AI summary is not currently available.</p>
+                  {% endif %}
+
+                </div>
+              </div>
+            </details>
+          {% endif %}
+
+          <details class="card card--panel card-collapsible" data-ticket-tasks-card>
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Tasks <span data-tasks-count-badge hidden></span></h2>
+              <div class="card__collapsible-meta">
+                <div class="button-group">
+                  <button
+                    type="button"
+                    class="button button--ghost button--small"
+                    data-add-task-button
+                    data-ticket-id="{{ ticket.id }}"
+                    aria-label="Add a new task"
+                  >
+                    Add task
+                  </button>
+                </div>
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+              <div class="card__body">
+                <ul class="task-list" data-task-list data-ticket-id="{{ ticket.id }}">
+                  <!-- Tasks will be loaded dynamically -->
+                </ul>
+                <p class="card__empty" data-tasks-empty hidden>No tasks have been added yet.</p>
+              </div>
+            </div>
+          </details>
+
+          <details class="card card--panel card-collapsible" data-ticket-assets-card>
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Assets</h2>
+              <div class="card__collapsible-meta">
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+              <div class="card__body">
+                <div class="form-field">
+                  <label class="form-label" for="ticket-assets">Assets</label>
+                <select
+                  id="ticket-assets"
+                  class="form-input"
+                  data-ticket-asset-selector
+                  data-assets-endpoint-template="/api/companies/{companyId}/assets"
+                  data-initial-options="{{ ticket_asset_options | tojson | forceescape }}"
+                  data-selected-assets="{{ ticket_asset_selection | tojson | forceescape }}"
+                  data-placeholder="Select an asset to link"
+                  data-initial-company-id="{{ ticket.company_id or '' }}"
+                  {% if not ticket.company_id %}disabled aria-disabled="true"{% endif %}
+                >
+                  <option value="">Select an asset to link</option>
+                  {% for option in ticket_asset_options %}
+                    <option value="{{ option.id }}">{{ option.label }}</option>
+                  {% endfor %}
+                </select>
+                <p
+                  class="form-help"
+                  data-ticket-asset-help
+                  data-help-enabled="Choose an asset to link. Linked devices appear below."
+                  data-help-disabled="Link the ticket to a company before selecting assets."
+                  data-help-empty="No assets are available for the linked company."
+                  data-help-exhausted="All company assets are already linked to this ticket."
+                >
+                  {% if not ticket.company_id %}
+                    Link the ticket to a company before selecting assets.
+                  {% elif not ticket_asset_options %}
+                    No assets are available for the linked company.
+                  {% else %}
+                    Choose an asset to link. Linked devices appear below.
+                  {% endif %}
+                </p>
+                <div
+                  class="ticket-assets-linked"
+                  data-ticket-linked-assets
+                  data-initial-linked="{{ ticket_asset_linked_data | tojson | forceescape }}"
+                  data-tactical-base-url="{{ tacticalrmm_base_url if module_enabled.get('tacticalrmm', false) else '' }}"
+                  data-empty-message="No assets are linked to this ticket yet."
+                  data-details-form-id="ticket-details-form"
+                  data-ticket-number="{{ ticket.ticket_number or ticket.id }}"
+                  data-ticket-subject="{{ ticket.subject | e }}"
+                >
+                  <ul class="ticket-assets-linked__list" data-linked-assets-list>
+                    {% for asset in ticket_suggested_assets %}
+                      {% set suggested_name = asset.name or ('Asset ' ~ asset.asset_id) %}
+                      <li class="ticket-assets-linked__item ticket-assets-linked__item--suggested">
+                        <span class="ticket-assets-linked__name">{{ suggested_name }}</span>
+                        <span class="badge badge--warning">Suggested</span>
+                        <span class="ticket-assets-linked__meta">Matched {{ asset.matched_username }}</span>
+                        <form method="post" action="/admin/tickets/{{ ticket.id }}/assets/{{ asset.asset_id }}/confirm">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+                          <button type="submit" class="button button--small">Confirm asset</button>
+                        </form>
+                      </li>
+                    {% endfor %}
+                    {% for asset in ticket_assets %}
+                      {% set serial_value = asset.serial_number %}
+                      {% set status_value = asset.status %}
+                      {% set status_label = status_value.replace('_', ' ').title() if status_value %}
+                      {% set meta_parts = [] %}
+                      {% if status_label %}
+                        {% set _ = meta_parts.append(status_label) %}
+                      {% endif %}
+                      {% set base_name = asset.name or ('Asset ' ~ asset.asset_id) %}
+                      {% set display_name = base_name | trim %}
+                      {% if not display_name %}
+                        {% set display_name = 'Asset ' ~ asset.asset_id %}
+                      {% endif %}
+                      {% set tooltip_label = display_name %}
+                      {% if meta_parts %}
+                        {% set tooltip_label = display_name ~ ' · ' ~ (meta_parts | join(' · ')) %}
+                      {% endif %}
+                      {% set tactical_link = None %}
+                      {% if module_enabled.get('tacticalrmm', false) and tacticalrmm_base_url and asset.name and asset.name | trim %}
+                        {% set tactical_link = tacticalrmm_base_url ~ '/?search=' ~ (asset.name | trim | urlencode) %}
+                      {% endif %}
+                      <li
+                        class="ticket-assets-linked__item ticket-assets-linked__item--actions"
+                        data-linked-asset
+                        data-asset-id="{{ asset.asset_id }}"
+                        data-tactical-id="{{ asset.tactical_asset_id or '' }}"
+                      >
+                        <input type="hidden" name="assetIds" value="{{ asset.asset_id }}" form="ticket-details-form" />
+                        {% if tactical_link %}
+                          <a
+                            href="{{ tactical_link }}"
+                            target="_blank"
+                            rel="noreferrer noopener"
+                            class="ticket-assets-linked__name"
+                            data-linked-asset-name
+                            title="{{ tooltip_label }}"
+                          >
+                            {{ display_name }}
+                          </a>
+                        {% else %}
+                          <span class="ticket-assets-linked__name" data-linked-asset-name title="{{ tooltip_label }}">
+                            {{ display_name }}
+                          </span>
+                        {% endif %}
+                        {% if meta_parts %}
+                          <p class="ticket-assets-linked__meta">{{ meta_parts | join(' · ') }}</p>
+                        {% endif %}
+                        <div class="ticket-assets-linked__actions">
+                          {% if tactical_link %}
+                            <a
+                              href="{{ tactical_link }}"
+                              target="_blank"
+                              rel="noreferrer noopener"
+                              class="button button--ghost button--icon ticket-assets-linked__action"
+                              title="Open in Tactical RMM"
+                              aria-label="Open {{ display_name }} in Tactical RMM"
+                            >
+                              <span aria-hidden="true">🖥️</span>
+                            </a>
+                          {% else %}
+                            <button
+                              type="button"
+                              class="button button--ghost button--icon ticket-assets-linked__action"
+                              disabled
+                              aria-disabled="true"
+                              title="Tactical RMM search is not configured"
+                              aria-label="Tactical RMM search is not configured for {{ display_name }}"
+                            >
+                              <span aria-hidden="true">🖥️</span>
+                            </button>
+                          {% endif %}
+                          <button
+                            type="button"
+                            class="button button--ghost button--icon ticket-assets-linked__action"
+                            data-linked-asset-chat
+                            data-device-uid="{{ asset.tray_device_uid or '' }}"
+                            data-asset-name="{{ display_name | e }}"
+                            {% if not asset.tray_device_uid %}disabled aria-disabled="true"{% endif %}
+                            title="Open chat"
+                            aria-label="Open chat with {{ display_name }}"
+                          >
+                            <span aria-hidden="true">💬</span>
+                          </button>
+                          <button
+                            type="button"
+                            class="button button--ghost button--icon ticket-assets-linked__remove"
+                            data-linked-asset-remove
+                          >
+                            <span class="visually-hidden">Remove asset</span>
+                            ×
+                          </button>
+                        </div>
+                      </li>
+                    {% endfor %}
+                  </ul>
+                  <p class="ticket-assets-linked__empty" data-linked-assets-empty {% if ticket_assets %}hidden{% endif %}>
+                    No assets are linked to this ticket yet.
+                  </p>
+                </div>
+              </div>
+              <div class="form-field">
+                <label class="form-label form-label--checkbox">
+                  <input type="checkbox" name="sendTrayNotification" value="1" form="ticket-details-form" />
+                  Send tray push notification
+                </label>
+                <p class="form-help">Optionally notify linked tray devices that this ticket was updated.</p>
+              </div>
+              <p class="form-help" data-ticket-details-autosave-status role="status" aria-live="polite">Asset changes save automatically.</p>
+              </div>
+            </div>
+          </details>
+
+          <details class="card card--panel card-collapsible" {% if not ticket_attachments %}open{% endif %}>
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Attachments</h2>
+              <div class="card__collapsible-meta">
+                {% if ticket_attachments %}<span class="badge badge--muted">{{ ticket_attachments|length }}</span>{% endif %}
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content card__body">
+              <div
+                class="attachments-grid"
+                data-attachments-grid
+                data-ticket-id="{{ ticket.id }}"
+              >
+                {% for attachment in ticket_attachments %}
+                  <article class="attachment-card" data-attachment-id="{{ attachment.id }}">
+                    <a
+                      class="attachment-card__preview"
+                      href="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download"
+                      title="Open {{ attachment.original_filename or attachment.filename }}"
+                      {% if attachment.mime_type and attachment.mime_type.startswith('image/') %}data-attachment-image-preview{% endif %}
+                    >
+                      {% if attachment.mime_type and attachment.mime_type.startswith('image/') %}
+                        <img
+                          src="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download?preview=true"
+                          alt="Preview of {{ attachment.original_filename or attachment.filename }}"
+                          loading="lazy"
+                        />
+                      {% elif attachment.mime_type == 'application/pdf' %}
+                        <iframe
+                          src="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download?preview=true#toolbar=0&navpanes=0"
+                          title="Preview of {{ attachment.original_filename or attachment.filename }}"
+                          loading="lazy"
+                          tabindex="-1"
+                        ></iframe>
+                        <span class="attachment-card__preview-shield" aria-hidden="true"></span>
+                      {% else %}
+                        <span class="attachment-card__file-type" aria-hidden="true">{{ (attachment.original_filename or attachment.filename).rsplit('.', 1)[-1][:5] | upper if '.' in (attachment.original_filename or attachment.filename) else 'FILE' }}</span>
+                      {% endif %}
+                    </a>
+                    <div class="attachment-card__content">
+                      <div class="attachment-card__header">
+                        <p class="attachment-card__name">
+                          <a
+                            href="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download"
+                            download
+                            title="{{ attachment.original_filename or attachment.filename }}"
+                          >
+                            {{ attachment.original_filename or attachment.filename }}
+                          </a>
+                        </p>
+                      </div>
+                      <p class="attachment-card__date">
+                        {% if attachment.uploaded_iso %}
+                          <span data-utc="{{ attachment.uploaded_iso }}"></span>
+                        {% else %}
+                          <span class="visually-hidden">Upload date unavailable</span>
+                        {% endif %}
+                      </p>
+                      <div class="attachment-card__footer">
+                        <div class="attachment-card__actions">
+                          <button
+                            type="button"
+                            class="button button--ghost button--small attachment-card__action"
+                            data-block-attachment
+                            data-attachment-id="{{ attachment.id }}"
+                            data-can-remove-existing="{{ 'true' if is_super_admin else 'false' }}"
+                            aria-label="Block this attachment content"
+                            title="Block this file so matching attachments are discarded"
+                          >
+                            <svg class="attachment-card__block-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 2a7.96 7.96 0 0 1 5.13 1.87L5.87 17.13A8 8 0 0 1 12 4Zm0 16a7.96 7.96 0 0 1-5.13-1.87L18.13 6.87A8 8 0 0 1 12 20Z"/></svg>
+                            <span class="visually-hidden">Block</span>
+                          </button>
+                          <button
+                            type="button"
+                            class="button button--ghost button--small attachment-card__action"
+                            data-remove-attachment
+                            data-attachment-id="{{ attachment.id }}"
+                            aria-label="Remove attachment"
+                          >
+                            <svg class="attachment-card__remove-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-1 12H8L7 9Zm3 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z"/></svg>
+                            <span class="visually-hidden">Remove</span>
+                          </button>
+                        </div>
+                        <p class="attachment-card__meta">{{ attachment.file_size | filesizeformat }}</p>
+                      </div>
+                    </div>
+                  </article>
+                {% endfor %}
+              </div>
+              <p
+                class="card__empty"
+                data-attachments-empty
+                {% if ticket_attachments %}hidden{% endif %}
+              >
+                No attachments have been added yet.
+              </p>
+            </div>
+          </details>
+
+          <details class="card card--panel card-collapsible" {% if not ticket_expenses %}open{% endif %}>
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Expenses</h2>
+              <div class="card__collapsible-meta">
+                {% if ticket_expenses %}<span class="badge badge--muted">{{ ticket_expenses|length }} · {{ ticket_expense_total }}</span>{% endif %}
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content card__body">
+              <form action="/admin/tickets/{{ ticket.id }}/expenses" method="post" class="form card__form">
+                <div class="form-grid form-grid--2">
+                  <div class="form-field">
+                    <label class="form-label" for="ticket-expense-description">Description</label>
+                    <input class="form-input" id="ticket-expense-description" name="description" type="text" placeholder="Parking, freight, tolls" required>
+                  </div>
+                  <div class="form-field">
+                    <label class="form-label" for="ticket-expense-amount">Amount</label>
+                    <input class="form-input" id="ticket-expense-amount" name="amount" type="number" min="0.01" step="0.01" required>
+                  </div>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="button button--secondary">Add expense</button>
+                </div>
+              </form>
+              {% if ticket_expenses %}
+                <div class="table-responsive">
+                  <table class="data-table">
+                    <thead><tr><th>Description</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+                    <tbody>
+                      {% for expense in ticket_expenses %}
+                        <tr>
+                          <td>{{ expense.description }}</td>
+                          <td>{{ expense.amount }}</td>
+                          <td>{% if expense.billed_at %}Billed{% else %}Unbilled{% endif %}</td>
+                          <td>
+                            {% if not expense.billed_at %}
+                              <form method="post" action="/admin/tickets/{{ ticket.id }}/expenses/{{ expense.id }}/delete" onsubmit="return confirm('Remove this expense?');">
+                                <button type="submit" class="button button--ghost button--small">Remove</button>
+                              </form>
+                            {% endif %}
+                          </td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              {% else %}
+                <p class="card__empty">No expenses have been added yet.</p>
+              {% endif %}
+            </div>
+          </details>
+
+
+        </div>
+
+        <div class="management__column management__column--activity">
+          <details class="card card--panel card-collapsible ticket-reply-composer" open>
+            <summary class="card__header card__header--collapsible">
+              <div class="card__title-group">
+                <h2 class="card__title">Add a reply</h2>
+                <button type="button" class="button button--secondary button--small" data-canned-responses-open>Use canned response</button>
+                <button type="button" class="button button--secondary button--small" data-ticket-reply-cache-load data-ticket-reply-cache-target="ticket-reply-form" hidden>Load Previous Reply</button>
+              </div>
+              <div class="card__collapsible-meta">
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+            <form id="ticket-reply-form" action="/admin/tickets/{{ ticket.id }}/replies" method="post" class="form card__form ticket-reply-form" enctype="multipart/form-data" data-ticket-reply-cache data-ticket-reply-cache-ticket-id="{{ ticket.id }}">
+              {% if csrf_token %}
+                <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+              {% endif %}
+              <div class="ticket-reply-context" aria-label="Reply delivery details">
+                <span><strong>To:</strong> {{ ticket_requester_lookup_name or 'Requester' }}</span>
+                <span><strong>Channel:</strong> Email</span>
+                <span data-reply-visibility><strong>Visibility:</strong> Public reply</span>
+              </div>
+              <div class="form-field">
+                <span class="form-label" id="ticket-reply-label">Reply</span>
+                <div
+                  class="rich-text-editor"
+                  data-rich-text-editor
+                  data-ticket-mention-users='{{ ticket_mention_staff_options | tojson | e }}'
+                  aria-labelledby="ticket-reply-label"
+                >
+                  <div class="rich-text-editor__toolbar" role="toolbar" aria-label="Formatting options">
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="bold"
+                      aria-label="Bold"
+                    >
+                      <span aria-hidden="true">B</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="italic"
+                      aria-label="Italic"
+                    >
+                      <span aria-hidden="true">I</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="underline"
+                      aria-label="Underline"
+                    >
+                      <span aria-hidden="true">U</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="insertUnorderedList"
+                      aria-label="Bulleted list"
+                    >
+                      <span aria-hidden="true">•</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="insertOrderedList"
+                      aria-label="Numbered list"
+                    >
+                      <span aria-hidden="true">1.</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="formatBlock"
+                      data-command-value="blockquote"
+                      aria-label="Quote"
+                    >
+                      <span aria-hidden="true">“”</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="formatBlock"
+                      data-command-value="pre"
+                      aria-label="Code block"
+                    >
+                      <span aria-hidden="true">&lt;/&gt;</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="link"
+                      aria-label="Insert link"
+                    >
+                      <span aria-hidden="true">🔗</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="rich-text-editor__button"
+                      data-rich-text-button
+                      data-command="removeFormat"
+                      aria-label="Clear formatting"
+                    >
+                      <span aria-hidden="true">⨯</span>
+                    </button>
+                  </div>
+                  <div
+                    id="ticket-reply-body"
+                    class="rich-text-editor__surface"
+                    data-rich-text-content
+                    contenteditable="true"
+                    role="textbox"
+                    aria-labelledby="ticket-reply-label"
+                    aria-multiline="true"
+                    data-placeholder="Write your reply..."
+                  ></div>
+                  <input type="hidden" name="mentionedUserIds" data-ticket-mention-user-ids />
+                  <textarea
+                    name="body"
+                    class="rich-text-editor__fallback"
+                    data-rich-text-value
+                    data-rich-text-fallback
+                    aria-labelledby="ticket-reply-label"
+                    placeholder="Write your reply..."
+                    required
+                  ></textarea>
+                </div>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-reply-attachments">Attachments (optional)</label>
+                <input
+                  type="file"
+                  id="ticket-reply-attachments"
+                  name="attachments"
+                  class="form-input"
+                  multiple
+                  accept="*/*"
+                />
+                <p class="form-help">You can upload multiple files. Server limit: 50MB per file.</p>
+              </div>
+              <div class="form-field form-field--checkbox">
+                <label class="checkbox">
+                  <input type="checkbox" name="isInternal" value="true" />
+                  <span>Write an internal note instead</span>
+                </label>
+              </div>
+              <details class="ticket-reply-worklog" open>
+                <summary>Time &amp; billing</summary>
+              <div class="form-field">
+                <label class="form-label" for="ticket-reply-minutes">Minutes spent</label>
+                <input
+                  id="ticket-reply-minutes"
+                  name="minutesSpent"
+                  class="form-input"
+                  type="number"
+                  min="0"
+                  max="1440"
+                  step="1"
+                  inputmode="numeric"
+                />
+                <p class="form-help">Log how many minutes this update required.</p>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="ticket-reply-labour">Labour type</label>
+                <select id="ticket-reply-labour" name="labourTypeId" class="form-input">
+                  <option value="">No labour type</option>
+                  {% for labour_type in ticket_labour_types %}
+                    <option value="{{ labour_type.id }}"{% if labour_type.is_default %} selected{% endif %}>
+                      {{ labour_type.name }}{% if labour_type.code %} ({{ labour_type.code }}){% endif %}
+                    </option>
+                  {% endfor %}
+                </select>
+                <p class="form-help">Select the labour code to synchronise with Xero invoices.</p>
+              </div>
+              <div class="form-grid form-grid--auto">
+                <div class="form-field form-field--checkbox">
+                  <label class="checkbox">
+                    <input
+                      type="checkbox"
+                      name="isBillable"
+                      value="true"
+                      {% if ticket_company is none or ticket_company.default_ticket_replies_billable is not defined or ticket_company.default_ticket_replies_billable %}checked{% endif %}
+                    />
+                    <span>Billable</span>
+                  </label>
+                </div>
+              </div>
+              </details>
+              <div class="form-actions ticket-reply-actions">
+                <div class="ticket-page-clock" data-ticket-page-clock data-ticket-id="{{ ticket.id }}" aria-live="polite">
+                  <span class="ticket-page-clock__label">Time open</span>
+                  <strong data-ticket-page-clock-display>0:00:00</strong>
+                </div>
+                <div class="ticket-reply-submit" data-ticket-reply-submit>
+                  <input type="hidden" name="replyStatus" value="" data-ticket-reply-status-input />
+                  <button type="submit" class="button button--primary ticket-reply-submit__primary" data-reply-submit-label>Send reply</button>
+                  <details class="ticket-reply-submit__status-menu">
+                    <summary class="button button--primary ticket-reply-submit__toggle" aria-label="Post reply with a selected ticket status">
+                      <span aria-hidden="true">▾</span>
+                    </summary>
+                    <div class="ticket-reply-submit__menu" role="menu" aria-label="Post reply and set status">
+                      {% for status_definition in ticket_status_definitions %}
+                        <button type="submit" value="{{ status_definition.tech_status }}" class="ticket-reply-submit__menu-item" role="menuitem" onclick="this.form.querySelector('[data-ticket-reply-status-input]').value = this.value;">
+                          {{ status_definition.tech_label }}
+                        </button>
+                      {% endfor %}
+                    </div>
+                  </details>
+                </div>
+              </div>
+            </form>
+            <dialog class="ticket-page-clock-dialog" data-ticket-page-clock-dialog aria-labelledby="ticket-page-clock-history-title">
+              <div class="ticket-page-clock-dialog__header">
+                <h3 id="ticket-page-clock-history-title">Ticket clock history</h3>
+                <button type="button" class="button button--ghost button--small" data-ticket-page-clock-close>Close</button>
+              </div>
+              <div data-ticket-page-clock-history-content>Loading clock history…</div>
+            </dialog>
+            </div>
+          </details>
+
+          <article class="card card--panel">
+            <header class="card__header ticket-split-toolbar">
+              <div>
+                <h2 class="card__title">Conversation history</h2>
+                <p class="card__subtitle">Showing the latest meaningful updates first.</p>
+              </div>
+              <div class="ticket-split-toolbar__actions">
+                <button type="button" class="button button--secondary button--small" data-ticket-select-mode aria-pressed="false">Select messages</button>
+                <button type="button" class="button button--secondary button--small" data-show-split-hidden hidden>Show hidden split history</button>
+                <button type="button" class="button button--primary button--small" data-split-selected disabled hidden>Split selected</button>
+              </div>
+            </header>
+            <div class="card__body">
+              <div class="ticket-history-filters" aria-label="Filter conversation">
+                <button type="button" class="is-active" data-history-filter="all" aria-pressed="true">All</button>
+                <button type="button" data-history-filter="customer" aria-pressed="false">Customer</button>
+                <button type="button" data-history-filter="technician" aria-pressed="false">Technician</button>
+                <button type="button" data-history-filter="internal" aria-pressed="false">Internal</button>
+                <button type="button" data-history-filter="automation" aria-pressed="false">Automation</button>
+              </div>
+              {% if ticket_replies or ticket_call_recordings %}
+                <div class="timeline timeline--conversation" data-ticket-timeline data-ticket-id="{{ ticket.id }}">
+                  {% for reply in ticket_replies %}
+                    {% set reply_is_automation = reply.external_reference and reply.external_reference.startswith('shipment-watch:') %}
+                    <article
+                      class="timeline__event timeline__event--{{ 'internal' if reply.is_internal else ('automation' if reply_is_automation else ('technician' if reply.author_id and reply.author_id != ticket.requester_id else 'customer')) }}{% if reply.is_split_hidden %} timeline__event--split-hidden{% endif %}"
+                      data-ticket-reply
+                      data-message-kind="{{ 'internal' if reply.is_internal else ('automation' if reply_is_automation else ('technician' if reply.author_id and reply.author_id != ticket.requester_id else 'customer')) }}"
+                      {% if reply.is_split_hidden %}data-split-hidden="true" hidden{% endif %}
+                  data-reply-id="{{ reply.id }}"
+                  data-reply-minutes="{{ reply.minutes_spent if reply.minutes_spent is not none else '' }}"
+                  data-reply-billable="{{ 'true' if reply.is_billable else 'false' }}"
+                  data-reply-labour="{{ reply.labour_type_id if reply.labour_type_id is not none else '' }}"
+                >
+                      <header class="timeline__header">
+                        <div class="timeline__header-main">
+                          {% if not reply.is_split_hidden %}
+                            <label class="ticket-split-select">
+                              <input type="checkbox" data-split-reply-checkbox value="{{ reply.id }}" aria-label="Select reply {{ reply.id }} for ticket split" />
+                            </label>
+                          {% endif %}
+                          <span class="timeline__timestamp">
+                            {{ reply.created_at.astimezone().strftime('%Y-%m-%d %H:%M') if reply.created_at else '—' }}
+                          </span>
+                          <span class="timeline__action">
+                            {{ reply.author.email if reply.author else (reply.author_display_name or reply.author_email or 'System') }}
+                            <span class="timeline__direction">{{ 'Internal note' if reply.is_internal else ('Automation' if reply_is_automation else ('Technician reply' if reply.author_id and reply.author_id != ticket.requester_id else 'Customer message')) }}</span>
+                            {% if reply.is_internal %}
+                              <span class="badge badge--muted">Internal</span>
+                            {% endif %}
+                            {% if reply.is_split_hidden %}
+                              <span class="badge badge--warning">Split to #{{ reply.split_to_ticket_number or reply.split_to_ticket_id }}</span>
+                            {% endif %}
+                            {% if reply.has_email_tracking %}
+                              {% set _reply_recipient_count = reply.recipient_count|default(0) %}
+                              {% set _is_multi_recipient = _reply_recipient_count and _reply_recipient_count > 1 %}
+                              {% if reply.is_email_bounced %}
+                                {% set bounce_time = reply.email_bounced_at.astimezone().strftime('%Y-%m-%d %H:%M') if reply.email_bounced_at else 'unknown' %}
+                                {% set _badge_html %}<span class="badge badge--danger" title="Email bounced on {{ bounce_time }}">✗ Bounced</span>{% endset %}
+                              {% elif reply.is_email_opened %}
+                                {% set open_count_text = reply.email_open_count ~ (' time' if reply.email_open_count == 1 else ' times') %}
+                                {% set first_open = reply.email_opened_at.astimezone().strftime('%Y-%m-%d %H:%M') if reply.email_opened_at else '' %}
+                                {% set tooltip = 'Email opened ' ~ open_count_text %}
+                                {% if first_open %}
+                                  {% set tooltip = tooltip ~ ' · First opened: ' ~ first_open %}
+                                {% endif %}
+                                {% set _badge_html %}<span class="badge badge--success" title="{{ tooltip }}">✓ Read</span>{% endset %}
+                              {% elif reply.is_email_delivered %}
+                                {% set delivery_time = reply.email_delivered_at.astimezone().strftime('%Y-%m-%d %H:%M') if reply.email_delivered_at else 'unknown' %}
+                                {% set _badge_html %}<span class="badge badge--info" title="Email delivered on {{ delivery_time }}">✓ Delivered</span>{% endset %}
+                              {% else %}
+                                {% set sent_time = reply.email_sent_at.astimezone().strftime('%Y-%m-%d %H:%M') if reply.email_sent_at else '' %}
+                                {% set tooltip = 'Email sent' ~ (' on ' ~ sent_time if sent_time else '') ~ ', not yet delivered' %}
+                                {% set _badge_html %}<span class="badge badge--muted" title="{{ tooltip }}">📧 Sent</span>{% endset %}
+                              {% endif %}
+                              {% if _is_multi_recipient %}
+                                <button
+                                  type="button"
+                                  class="badge-trigger"
+                                  data-email-recipients-trigger
+                                  data-reply-id="{{ reply.id }}"
+                                  data-recipient-count="{{ _reply_recipient_count }}"
+                                  aria-haspopup="dialog"
+                                  aria-controls="email-recipients-modal"
+                                  title="Show per-recipient delivery status ({{ _reply_recipient_count }} recipients)"
+                                >{{ _badge_html|safe }}</button>
+                              {% else %}
+                                {{ _badge_html|safe }}
+                              {% endif %}
+                            {% endif %}
+                          </span>
+                          <span
+                            class="timeline__meta timeline__meta-group"
+                            data-reply-time-summary
+                            {% if not reply.time_summary %}hidden{% endif %}
+                            aria-label="Time spent details"
+                          >
+                            {% if reply.minutes_spent is not none %}
+                              <span class="timeline__chip timeline__chip--time">
+                                ⏱️ {{ reply.minutes_spent }} minute{{ 's' if reply.minutes_spent != 1 else '' }}
+                              </span>
+                            {% endif %}
+                            {% if not reply.external_reference %}
+                              <span class="timeline__chip {{ 'timeline__chip--billable' if reply.is_billable else 'timeline__chip--nonbillable' }}">
+                                {{ 'Billable' if reply.is_billable else 'Non-billable' }}
+                              </span>
+                            {% endif %}
+                            {% if reply.labour_type_name %}
+                              <span class="timeline__chip timeline__chip--labour">{{ reply.labour_type_name }}</span>
+                            {% endif %}
+                          </span>
+                        </div>
+                        <div class="timeline__header-controls">
+                          <button
+                            type="button"
+                            class="button button--ghost button--icon timeline__edit-button"
+                            {% if reply.is_split_hidden %}hidden disabled{% endif %}
+                            data-reply-edit
+                            aria-label="Edit time entry"
+                            aria-controls="reply-time-modal"
+                            aria-haspopup="dialog"
+                            title="Edit time entry"
+                          >
+                            <span class="visually-hidden">Edit time entry</span>
+                            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                              <path d="M20.71 7.04a1 1 0 0 0 0-1.41L18.37 3.3a1 1 0 0 0-1.41 0L6 14.25V18h3.75l10.96-10.96Z" />
+                              <path d="M5 20h14a1 1 0 1 0 0-2H5a1 1 0 1 0 0 2Z" />
+                            </svg>
+                          </button>
+                        </div>
+                      </header>
+                      <div class="timeline__body">
+                        <div
+                          class="timeline__message"
+                          data-timeline-message
+                        >
+                          <div
+                            class="rich-text-viewer timeline__message-content"
+                            data-timeline-message-content
+                          >
+                            {{ reply.body | safe }}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          class="button button--ghost button--small timeline__message-toggle"
+                          data-timeline-message-toggle
+                          data-more-label="Show more"
+                          data-less-label="Show less"
+                          hidden
+                          aria-expanded="false"
+                        >
+                          Expand message
+                        </button>
+                      </div>
+                    </article>
+                  {% endfor %}
+                  <button type="button" class="button button--secondary ticket-history-load" data-history-load-earlier hidden>Load earlier messages</button>
+                  
+                  {% for recording in ticket_call_recordings %}
+                    <article
+                      class="timeline__event timeline__event--call-recording"
+                      data-call-recording
+                      data-recording-id="{{ recording.id }}"
+                      data-recording-minutes="{{ recording.minutes_spent if recording.minutes_spent is not none else '' }}"
+                      data-recording-billable="{{ 'true' if recording.is_billable else 'false' }}"
+                      data-recording-labour="{{ recording.labour_type_id if recording.labour_type_id is not none else '' }}"
+                    >
+                      <header class="timeline__header">
+                        <div class="timeline__header-main">
+                          <span class="timeline__timestamp">
+                            {{ recording.call_date.astimezone().strftime('%Y-%m-%d %H:%M') if recording.call_date else '—' }}
+                          </span>
+                          <span class="timeline__action">
+                            <strong>📞 Call Recording:</strong> {{ recording.caller_name or 'Unknown' }} → {{ recording.callee_name or 'Unknown' }}
+                          </span>
+                          <span
+                            class="timeline__meta timeline__meta-group"
+                            data-recording-time-summary
+                            {% if not recording.time_summary %}hidden{% endif %}
+                            aria-label="Time spent details"
+                          >
+                            {% if recording.minutes_spent is not none %}
+                              <span class="timeline__chip timeline__chip--time">
+                                ⏱️ {{ recording.minutes_spent }} minute{{ 's' if recording.minutes_spent != 1 else '' }}
+                              </span>
+                            {% endif %}
+                            <span class="timeline__chip {{ 'timeline__chip--billable' if recording.is_billable else 'timeline__chip--nonbillable' }}">
+                              {{ 'Billable' if recording.is_billable else 'Non-billable' }}
+                            </span>
+                            {% if recording.labour_type_name %}
+                              <span class="timeline__chip timeline__chip--labour">{{ recording.labour_type_name }}</span>
+                            {% endif %}
+                          </span>
+                        </div>
+                        <div class="timeline__header-controls">
+                          <button
+                            type="button"
+                            class="button button--ghost button--icon timeline__edit-button"
+                            {% if reply.is_split_hidden %}hidden disabled{% endif %}
+                            data-recording-edit
+                            aria-label="Edit time entry"
+                            aria-controls="recording-time-modal"
+                            aria-haspopup="dialog"
+                            title="Edit time entry"
+                          >
+                            <span class="visually-hidden">Edit time entry</span>
+                            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                              <path d="M20.71 7.04a1 1 0 0 0 0-1.41L18.37 3.3a1 1 0 0 0-1.41 0L6 14.25V18h3.75l10.96-10.96Z" />
+                              <path d="M5 20h14a1 1 0 1 0 0-2H5a1 1 0 1 0 0 2Z" />
+                            </svg>
+                          </button>
+                        </div>
+                      </header>
+                      <div class="timeline__body">
+                        <div class="timeline__message" data-timeline-message>
+                          <p><strong>File:</strong> {{ recording.file_name }}</p>
+                          {% if recording.duration_seconds %}
+                            <p><strong>Duration:</strong> {{ recording.duration_seconds }} seconds</p>
+                          {% endif %}
+                          {% if recording.transcription %}
+                            <div class="timeline__message-content" data-timeline-message-content>
+                              <p><strong>Transcription:</strong></p>
+                              <div class="rich-text-viewer">{{ recording.transcription }}</div>
+                            </div>
+                            <button
+                              type="button"
+                              class="button button--ghost button--small timeline__message-toggle"
+                              data-timeline-message-toggle
+                              data-more-label="Show transcription"
+                              data-less-label="Hide transcription"
+                              hidden
+                              aria-expanded="false"
+                            >
+                              Show transcription
+                            </button>
+                          {% else %}
+                            <p class="text-muted">No transcription available.</p>
+                          {% endif %}
+                        </div>
+                      </div>
+                    </article>
+                  {% endfor %}
+                </div>
+              {% else %}
+                <p class="card__empty">No replies or call recordings have been posted yet.</p>
+              {% endif %}
+            </div>
+          </article>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+
+
+  <div class="modal" id="canned-responses-modal" role="dialog" aria-modal="true" aria-labelledby="canned-responses-title" hidden data-canned-responses-modal data-ticket-id="{{ ticket.id }}">
+    <div class="modal__content" role="document">
+      <button type="button" class="modal__close" data-canned-responses-close aria-label="Close">×</button>
+      <h2 class="modal__title" id="canned-responses-title">Canned responses</h2>
+      <p class="form-help">Selecting a response appends it after any existing reply text.</p>
+      <div class="list" data-canned-responses-list>
+        {% for response in ticket_canned_responses %}
+          <button type="button" class="button button--ghost" data-canned-response-insert data-response-id="{{ response.id }}">{{ response.title }}</button>
+        {% else %}
+          <p class="card__empty">No canned responses have been created yet.</p>
+        {% endfor %}
+      </div>
+      <p class="form-help" data-canned-responses-error hidden></p>
+    </div>
+  </div>
+
+  <div class="modal" id="reply-time-modal" role="dialog" aria-modal="true" hidden>
+    <div class="modal__content" role="document">
+      <button type="button" class="modal__close" data-modal-close>
+        <span class="visually-hidden">Close time entry editor</span>
+        &times;
+      </button>
+      <h2 class="modal__title">Edit time entry</h2>
+      <form class="form-grid" data-reply-time-form novalidate>
+        <p class="form-help">Adjust the minutes recorded for this reply and whether the work is billable.</p>
+        <div class="form-field">
+          <label class="form-label" for="reply-time-minutes">Minutes spent</label>
+          <input
+            class="form-input"
+            id="reply-time-minutes"
+            type="number"
+            min="0"
+            max="1440"
+            step="1"
+            inputmode="numeric"
+            data-reply-time-minutes
+          />
+          <p class="form-help">Leave blank to remove the time entry from this update.</p>
+        </div>
+        <div class="form-field form-field--checkbox">
+          <label class="checkbox">
+            <input type="checkbox" data-reply-time-billable />
+            <span>Billable</span>
+          </label>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="reply-time-labour">Labour type</label>
+          <select id="reply-time-labour" class="form-input" data-reply-time-labour>
+            <option value="">No labour type</option>
+            {% for labour_type in ticket_labour_types %}
+              <option value="{{ labour_type.id }}">
+                {{ labour_type.name }}{% if labour_type.code %} ({{ labour_type.code }}){% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <p class="form-help form-help--error" data-reply-time-error role="alert" hidden></p>
+        <div class="form-actions">
+          <button type="submit" class="button button--primary" data-reply-time-submit>Save changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  
+  <div class="modal" id="recording-time-modal" role="dialog" aria-modal="true" hidden>
+    <div class="modal__content" role="document">
+      <button type="button" class="modal__close" data-modal-close>
+        <span class="visually-hidden">Close time entry editor</span>
+        &times;
+      </button>
+      <h2 class="modal__title">Edit call recording time entry</h2>
+      <form class="form-grid" data-recording-time-form novalidate>
+        <p class="form-help">Adjust the minutes recorded for this call and whether the work is billable.</p>
+        <div class="form-field">
+          <label class="form-label" for="recording-time-minutes">Minutes spent</label>
+          <input
+            class="form-input"
+            id="recording-time-minutes"
+            type="number"
+            min="0"
+            max="1440"
+            step="1"
+            inputmode="numeric"
+            data-recording-time-minutes
+          />
+          <p class="form-help">Leave blank to remove the time entry from this call recording.</p>
+        </div>
+        <div class="form-field form-field--checkbox">
+          <label class="checkbox">
+            <input type="checkbox" data-recording-time-billable />
+            <span>Billable</span>
+          </label>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="recording-time-labour">Labour type</label>
+          <select id="recording-time-labour" class="form-input" data-recording-time-labour>
+            <option value="">No labour type</option>
+            {% for labour_type in ticket_labour_types %}
+              <option value="{{ labour_type.id }}">
+                {{ labour_type.name }}{% if labour_type.code %} ({{ labour_type.code }}){% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <p class="form-help form-help--error" data-recording-time-error role="alert" hidden></p>
+        <div class="form-actions">
+          <button type="submit" class="button button--primary" data-recording-time-submit>Save changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+
+  <div class="modal" id="ticket-automation-history-modal" role="dialog" aria-modal="true" aria-labelledby="ticket-automation-history-title" hidden>
+    <div class="modal__backdrop" data-ticket-automation-history-close></div>
+    <div class="modal__panel modal__panel--wide">
+      <header class="modal__header">
+        <h2 class="modal__title" id="ticket-automation-history-title">Ticket automation audit trail</h2>
+        <button type="button" class="modal__close" data-ticket-automation-history-close aria-label="Close">×</button>
+      </header>
+      <div class="modal__body">
+        <p class="card__subtitle">Automation actions recorded against ticket #{{ ticket.ticket_number or ticket.id }}.</p>
+        <div class="management__toolbar">
+          <div class="management__toolbar-search">
+            <input type="search" class="form-input" placeholder="Filter audit trail" aria-label="Filter ticket automation audit trail" data-table-filter="ticket-automation-history-table" />
+          </div>
+        </div>
+        <div class="table-wrapper">
+          <table class="table" id="ticket-automation-history-table" data-table data-table-id="ticket-automation-history">
+            <thead>
+              <tr>
+                <th scope="col" data-sort="string" data-column-key="occurred_at">When</th>
+                <th scope="col" data-sort="string" data-column-key="automation">Automation</th>
+                <th scope="col" data-sort="string" data-column-key="action">Action</th>
+                <th scope="col" data-sort="string" data-column-key="status">Status</th>
+                <th scope="col" data-sort="string" data-column-key="previous">Previous values</th>
+                <th scope="col" data-sort="string" data-column-key="details">Details</th>
+              </tr>
+            </thead>
+            <tbody data-ticket-automation-history-rows>
+              <tr><td colspan="6" class="table__empty">Open the audit trail to load automation history.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% include "tickets/_email_recipients_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/suneditor.min.js') }}"></script>
+  <script src="{{ static_url('/static/js/admin.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/purify.min.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/rich_text_editor.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_reply_cache.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_detail.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/email_recipients.js') }}" defer></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const descriptionField = document.getElementById('ticket-description-editor');
+      const descriptionForm = document.querySelector('[data-ticket-description-form]');
+
+      if (!descriptionField || typeof SUNEDITOR === 'undefined') {
+        return;
+      }
+
+      const descriptionEditor = SUNEDITOR.create(descriptionField, {
+        width: '100%',
+        height: '240',
+        buttonList: [
+          ['undo', 'redo'],
+          ['bold', 'underline', 'italic', 'strike'],
+          ['fontColor', 'hiliteColor'],
+          ['outdent', 'indent'],
+          ['align', 'horizontalRule', 'list', 'lineHeight'],
+          ['link'],
+          ['removeFormat'],
+          ['codeView'],
+        ],
+      });
+
+      const syncDescriptionField = () => {
+        descriptionField.value = descriptionEditor.getContents();
+      };
+
+      if (descriptionForm) {
+        descriptionForm.addEventListener('submit', () => {
+          syncDescriptionField();
+        });
+      }
+
+      document.addEventListener('ticket:description-updated', (event) => {
+        const html = event && event.detail && typeof event.detail.html === 'string' ? event.detail.html : '';
+        descriptionEditor.setContents(html);
+        syncDescriptionField();
+      });
+    });
+
+    async function removeTag(tagSlug) {
+      if (!confirm(`Remove tag "${tagSlug.replace('-', ' ')}" from this ticket?`)) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/tag-exclusions/tickets/{{ ticket.id }}/remove-tag`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ tag_slug: tagSlug }),
+        });
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.detail || 'Failed to remove tag');
+        }
+
+        // Remove the tag from the UI
+        const tagElement = document.querySelector(`[data-tag-slug="${tagSlug}"]`);
+        if (tagElement) {
+          tagElement.remove();
+        }
+
+        // Check if there are any tags left
+        const container = document.getElementById('ai-tags-container');
+        if (container && container.children.length === 0) {
+          container.innerHTML = '<span class="card__empty">No AI tags remaining.</span>';
+        }
+      } catch (error) {
+        console.error('Error removing tag:', error);
+        alert(error.message || 'Failed to remove tag. Please try again.');
+      }
+    }
+
+    async function excludeAndRemoveTag(tagSlug) {
+      const displayName = tagSlug.replace(/-/g, ' ');
+      if (!confirm(`Remove tag "${displayName}" from this ticket and exclude it from future AI tag generation?`)) {
+        return;
+      }
+
+      try {
+        const removeResponse = await fetch(`/api/tag-exclusions/tickets/{{ ticket.id }}/remove-tag`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tag_slug: tagSlug }),
+        });
+
+        if (!removeResponse.ok) {
+          const error = await removeResponse.json();
+          throw new Error(error.detail || 'Failed to remove tag from ticket');
+        }
+
+        const excludeResponse = await fetch('/api/tag-exclusions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tag_slug: tagSlug }),
+        });
+
+        if (!excludeResponse.ok && excludeResponse.status !== 409) {
+          const error = await excludeResponse.json();
+          throw new Error(error.detail || 'Failed to add tag exclusion');
+        }
+
+        const tagElement = document.querySelector(`[data-tag-slug="${tagSlug}"]`);
+        if (tagElement) {
+          tagElement.remove();
+        }
+
+        const container = document.getElementById('ai-tags-container');
+        if (container && container.children.length === 0) {
+          container.innerHTML = '<span class="card__empty">No AI tags remaining.</span>';
+        }
+      } catch (error) {
+        console.error('Error excluding tag:', error);
+        alert(error.message || 'Failed to exclude tag. Please try again.');
+      }
+    }
+  </script>
+{% endblock %}

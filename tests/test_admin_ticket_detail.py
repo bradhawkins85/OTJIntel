@@ -1,0 +1,605 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import AsyncMock, patch
+import io
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+import pytest
+from fastapi import status
+from fastapi.responses import HTMLResponse
+from starlette.requests import Request
+from starlette.datastructures import FormData, UploadFile
+
+from app import main
+from app.features.tickets import admin_routes
+from app.services.tickets import TicketStatusDefinition
+
+
+async def _dummy_receive() -> dict[str, Any]:
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+def _make_request(path: str = "/admin/tickets/1") -> Request:
+    scope = {"type": "http", "method": "GET", "path": path, "headers": []}
+    request = Request(scope, _dummy_receive)
+    return request
+
+
+def test_requester_phone_field_renders_mobile_and_company_on_separate_lines() -> None:
+    template = Path("app/templates/admin/ticket_detail.html").read_text(encoding="utf-8")
+
+    assert "Mobile: {{ ticket_requester_phone_display }}" in template
+    assert "Company: {{ ticket_company_phone_display }}" in template
+    assert template.index("Mobile: {{ ticket_requester_phone_display }}") < template.index(
+        "Company: {{ ticket_company_phone_display }}"
+    )
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_render_ticket_detail_with_tactical_module_and_ai_tags(monkeypatch):
+    """Test that settings.ai_tag_threshold works even when tactical module has settings dict."""
+    request = _make_request("/admin/tickets/1")
+    user = {"id": 1, "is_super_admin": True}
+
+    ticket = {
+        "id": 1,
+        "subject": "Test ticket",
+        "description": "Test description",
+        "status": "open",
+        "priority": "normal",
+        "company_id": 1,
+        "requester_id": 1,
+        "assigned_user_id": 1,
+        "ai_tags": ["networking", "router", "configuration"],
+        "created_at": datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc),
+        "updated_at": datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc),
+    }
+
+    # Mock modules including tacticalrmm with settings
+    modules = [
+        {
+            "slug": "tacticalrmm",
+            "name": "TacticalRMM",
+            "enabled": True,
+            "settings": {
+                "base_url": "https://tactical.example.com",
+                "api_key": "test-key",
+            },
+        }
+    ]
+
+    relevant_kb_articles = [
+        {"id": 1, "title": "Router Configuration Guide"},
+    ]
+
+    class DummySanitized:
+        def __init__(self, html: str):
+            self.html = html
+            self.text_content = html.strip()
+
+    def fake_sanitize(value: str | None) -> DummySanitized:
+        return DummySanitized(f"<p>{value or ''}</p>")
+
+    statuses = [
+        TicketStatusDefinition(tech_status="open", tech_label="Open", public_status="Open"),
+    ]
+
+    monkeypatch.setattr(main, "sanitize_rich_text", fake_sanitize)
+    monkeypatch.setattr(main.tickets_repo, "get_ticket", AsyncMock(return_value=ticket))
+    monkeypatch.setattr(main.tickets_repo, "list_replies", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main.tickets_repo,
+        "list_split_replies_for_original",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(main.tickets_repo, "list_watchers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.attachments_repo, "list_attachments", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.tickets_repo, "list_ticket_assets", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main.user_repo,
+        "get_user_by_id",
+        AsyncMock(
+            return_value={
+                "id": 1,
+                "email": "test@example.com",
+                "mobile_phone": "0412 345 678",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        main.company_repo,
+        "get_company_by_id",
+        AsyncMock(
+            return_value={
+                "id": 1,
+                "name": "Test Company",
+                "phone": "+61 2 9876 5432",
+            }
+        ),
+    )
+    monkeypatch.setattr(main.modules_service, "list_modules", AsyncMock(return_value=modules))
+    monkeypatch.setattr(main.labour_types_service, "list_labour_types", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.tickets_service, "list_status_definitions", AsyncMock(return_value=statuses))
+    monkeypatch.setattr(main.company_repo, "list_companies", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main.membership_repo,
+        "list_users_with_permission",
+        AsyncMock(return_value=[]),
+    )
+    requester_staff_options = [
+        {
+            "id": 2,
+            "user_id": 2,
+            "first_name": "Requester",
+            "last_name": "Example",
+            "email": "requester@example.com",
+            "mobile_phone": "0412 345 678",
+        }
+    ]
+    monkeypatch.setattr(
+        main.staff_repo,
+        "list_enabled_staff_users",
+        AsyncMock(return_value=requester_staff_options),
+    )
+    monkeypatch.setattr(main.assets_repo, "list_company_assets", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main.knowledge_base_repo,
+        "find_relevant_articles_for_ticket",
+        AsyncMock(return_value=relevant_kb_articles),
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_render_template(template_name, request_obj, user_obj, *, extra):
+        captured["template"] = template_name
+        captured["extra"] = extra
+        return HTMLResponse("OK")
+
+    monkeypatch.setattr(main, "_render_template", fake_render_template)
+
+    # Use patch() for the two lazy-imported DB calls inside _render_ticket_detail
+    with (
+        patch(
+            "app.repositories.call_recordings.list_ticket_call_recordings",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "app.services.service_status.find_relevant_services_for_ticket",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
+        response = await main._render_ticket_detail(request, user, ticket_id=1)
+
+    assert isinstance(response, HTMLResponse)
+    assert response.status_code == status.HTTP_200_OK
+    assert captured["template"] == "admin/ticket_detail.html"
+
+    # Verify that knowledge base search was called with the correct threshold
+    main.knowledge_base_repo.find_relevant_articles_for_ticket.assert_awaited_once()
+    call_args = main.knowledge_base_repo.find_relevant_articles_for_ticket.await_args
+    assert call_args.kwargs["ticket_ai_tags"] == ["networking", "router", "configuration"]
+    # Default ai_tag_threshold from Settings is 1
+    assert call_args.kwargs["min_matching_tags"] == 1
+
+    # Verify relevant articles were included in the response
+    assert captured["extra"]["relevant_kb_articles"] == relevant_kb_articles
+    # Verify tactical base URL was extracted correctly
+    assert captured["extra"]["tacticalrmm_base_url"] == "https://tactical.example.com"
+    assert captured["extra"]["ticket_mention_staff_options"] == [
+        {"id": 2, "label": "Requester Example", "email": "requester@example.com"}
+    ]
+    assert captured["extra"]["ticket_requester_phone_display"] == "0412 345 678"
+    assert captured["extra"]["ticket_company_phone_display"] == "02 9876 5432"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_render_ticket_detail_includes_attachments(monkeypatch):
+    """Ticket detail should include formatted attachments for the admin view."""
+    request = _make_request("/admin/tickets/2")
+    user = {"id": 1, "is_super_admin": True}
+
+    ticket = {
+        "id": 2,
+        "subject": "Attachment ticket",
+        "description": "Details",
+        "status": "open",
+        "priority": "normal",
+        "company_id": 1,
+        "requester_id": 1,
+        "assigned_user_id": None,
+        "created_at": datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc),
+        "updated_at": datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc),
+    }
+
+    class DummySanitized:
+        def __init__(self, html: str):
+            self.html = html
+            self.text_content = html.strip()
+
+    def fake_sanitize(value: str | None) -> DummySanitized:
+        return DummySanitized(f"<p>{value or ''}</p>")
+
+    attachments = [
+        {
+            "id": 5,
+            "ticket_id": 2,
+            "filename": "secure.pdf",
+            "original_filename": "report.pdf",
+            "file_size": 2048,
+            "access_level": "closed",
+            "uploaded_at": datetime(2025, 1, 1, 13, 0, tzinfo=timezone.utc),
+        }
+    ]
+
+    monkeypatch.setattr(main, "sanitize_rich_text", fake_sanitize)
+    monkeypatch.setattr(main.tickets_repo, "get_ticket", AsyncMock(return_value=ticket))
+    monkeypatch.setattr(main.tickets_repo, "list_replies", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.tickets_repo, "list_watchers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.attachments_repo, "list_attachments", AsyncMock(return_value=attachments))
+    monkeypatch.setattr(main.tickets_repo, "list_ticket_assets", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.user_repo, "get_user_by_id", AsyncMock(return_value={"id": 1, "email": "test@example.com"}))
+    monkeypatch.setattr(main.company_repo, "get_company_by_id", AsyncMock(return_value={"id": 1, "name": "Test Company"}))
+    monkeypatch.setattr(main.modules_service, "list_modules", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.labour_types_service, "list_labour_types", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.tickets_service, "list_status_definitions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.company_repo, "list_companies", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.membership_repo, "list_users_with_permission", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.staff_repo, "list_enabled_staff_users", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.assets_repo, "list_company_assets", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.knowledge_base_repo, "find_relevant_articles_for_ticket", AsyncMock(return_value=[]))
+
+    captured: dict[str, Any] = {}
+
+    async def fake_render_template(template_name, request_obj, user_obj, *, extra):
+        captured["template"] = template_name
+        captured["extra"] = extra
+        return HTMLResponse("OK")
+
+    monkeypatch.setattr(main, "_render_template", fake_render_template)
+
+    with patch(
+        "app.repositories.call_recordings.list_ticket_call_recordings",
+        new=AsyncMock(return_value=[]),
+    ):
+        response = await main._render_ticket_detail(request, user, ticket_id=2)
+
+    assert isinstance(response, HTMLResponse)
+    assert response.status_code == status.HTTP_200_OK
+    assert captured["template"] == "admin/ticket_detail.html"
+    assert captured["extra"]["ticket_attachments"][0]["id"] == 5
+    assert captured["extra"]["ticket_attachments"][0]["file_size"] == 2048
+    assert captured["extra"]["ticket_attachments"][0]["uploaded_iso"].startswith("2025-01-01T13:00:00")
+
+
+@pytest.mark.anyio("asyncio")
+async def test_admin_reply_saves_attachments(monkeypatch):
+    """Posting an admin reply should persist uploaded attachments."""
+
+    class DummySanitized:
+        def __init__(self, html: str):
+            self.html = html
+            self.text_content = html
+            self.has_rich_content = True
+
+    upload = UploadFile(filename="note.txt", file=io.BytesIO(b"hello"))
+    form_data = FormData(
+        [
+            ("body", "<p>reply</p>"),
+            ("attachments", upload),
+        ]
+    )
+
+    class DummyRequest:
+        def __init__(self) -> None:
+            self.url = type("url", (), {"path": "/admin/tickets/3"})()
+
+        async def form(self):
+            return form_data
+
+    request = DummyRequest()
+
+    monkeypatch.setattr(
+        main, "_require_helpdesk_page", AsyncMock(return_value=({"id": 9, "is_super_admin": True}, None))
+    )
+    monkeypatch.setattr(main, "sanitize_rich_text", lambda value: DummySanitized(str(value or "")))
+    monkeypatch.setattr(
+        main.tickets_repo,
+        "get_ticket",
+        AsyncMock(return_value={"id": 3, "xero_invoice_number": None}),
+    )
+    monkeypatch.setattr(main.tickets_repo, "create_reply", AsyncMock(return_value=None))
+    set_status_mock = AsyncMock(return_value={"id": 3, "status": "pending"})
+    monkeypatch.setattr(main.tickets_repo, "set_ticket_status", set_status_mock)
+    add_watcher_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(main.tickets_repo, "add_watcher", add_watcher_mock)
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_summary", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_tags", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "broadcast_ticket_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_updated_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_replied_event", AsyncMock(return_value=None))
+
+    save_mock = AsyncMock(return_value={"id": 1})
+    monkeypatch.setattr(main.attachments_service, "save_uploaded_file", save_mock)
+
+    response = await admin_routes.admin_create_ticket_reply(3, request)
+
+    assert response.status_code == status.HTTP_303_SEE_OTHER
+    assert "/admin/tickets/3" in response.headers.get("location", "")
+    set_status_mock.assert_not_awaited()
+    add_watcher_mock.assert_not_awaited()
+    assert save_mock.await_count == 1
+    called_args = save_mock.await_args.kwargs
+    assert called_args["ticket_id"] == 3
+    saved_file = called_args["file"]
+    assert saved_file.filename == "note.txt"
+    saved_file.file.seek(0)
+    assert saved_file.file.read() == b"hello"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_admin_update_ticket_details_persists_shipment_public_comments_flag(monkeypatch):
+    form_data = FormData(
+        [
+            ("subject", "Shipment ticket"),
+            ("status", "open"),
+            ("priority", "normal"),
+            ("shipmentTrackingUrl", "https://www.startrack.com.au/track/ABC123"),
+            ("shipmentPollIntervalSeconds", "900"),
+            ("shipmentPublicCommentsEnabled", "1"),
+        ]
+    )
+
+    class DummyRequest:
+        url = type("url", (), {"path": "/admin/tickets/12/details"})()
+
+        async def form(self):
+            return form_data
+
+    monkeypatch.setattr(
+        main, "_require_helpdesk_page", AsyncMock(return_value=({"id": 9, "is_super_admin": True}, None))
+    )
+    monkeypatch.setattr(
+        main.tickets_repo,
+        "get_ticket",
+        AsyncMock(
+            return_value={
+                "id": 12,
+                "subject": "Shipment ticket",
+                "priority": "normal",
+                "status": "open",
+                "company_id": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(main.tickets_service, "validate_status_choice", AsyncMock(return_value="open"))
+    monkeypatch.setattr(main.tickets_repo, "update_ticket", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_repo, "set_ticket_status", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_repo, "replace_ticket_assets", AsyncMock(return_value=None))
+    upsert_watch_mock = AsyncMock(return_value={"id": 1})
+    monkeypatch.setattr(admin_routes.shipment_watch_service, "upsert_watch", upsert_watch_mock)
+    monkeypatch.setattr(main.tickets_service, "update_ticket_description", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_summary", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_tags", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "broadcast_ticket_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_details_updated_event", AsyncMock(return_value=None))
+
+    response = await admin_routes.admin_update_ticket_details(12, DummyRequest())
+
+    assert response.status_code == status.HTTP_303_SEE_OTHER
+    upsert_watch_mock.assert_awaited_once()
+    assert upsert_watch_mock.await_args.kwargs["active"] is True
+    assert upsert_watch_mock.await_args.kwargs["public_comments_enabled"] is True
+
+
+@pytest.mark.anyio("asyncio")
+async def test_admin_reply_uses_last_duplicate_reply_status(monkeypatch):
+    """A selected split-button status should win over the primary default status."""
+
+    class DummySanitized:
+        html = "<p>reply</p>"
+        text_content = "reply"
+        has_rich_content = True
+
+    form_data = FormData(
+        [
+            ("body", "<p>reply</p>"),
+            ("replyStatus", "waiting_on_client"),
+            ("replyStatus", "resolved"),
+        ]
+    )
+
+    class DummyRequest:
+        url = type("url", (), {"path": "/admin/tickets/8"})()
+
+        async def form(self):
+            return form_data
+
+    monkeypatch.setattr(
+        main, "_require_helpdesk_page", AsyncMock(return_value=({"id": 9, "is_super_admin": True}, None))
+    )
+    monkeypatch.setattr(main, "sanitize_rich_text", lambda value: DummySanitized())
+    monkeypatch.setattr(
+        main.tickets_service,
+        "list_status_definitions",
+        AsyncMock(
+            return_value=[
+                TicketStatusDefinition(
+                    tech_status="waiting_on_client",
+                    tech_label="Waiting on client",
+                    public_status="Waiting on client",
+                    is_default=True,
+                ),
+                TicketStatusDefinition(
+                    tech_status="resolved",
+                    tech_label="Resolved",
+                    public_status="Resolved",
+                    is_default=False,
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(main.tickets_repo, "get_ticket", AsyncMock(return_value={"id": 8, "xero_invoice_number": None}))
+    monkeypatch.setattr(main.tickets_repo, "create_reply", AsyncMock(return_value={"id": 81}))
+    set_status_mock = AsyncMock(return_value={"id": 8, "status": "resolved"})
+    monkeypatch.setattr(main.tickets_repo, "set_ticket_status", set_status_mock)
+    monkeypatch.setattr(main.tickets_repo, "add_watcher", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_summary", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_tags", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "broadcast_ticket_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_updated_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_replied_event", AsyncMock(return_value=None))
+
+    response = await admin_routes.admin_create_ticket_reply(8, DummyRequest())
+
+    assert response.status_code == status.HTTP_303_SEE_OTHER
+    assert set_status_mock.await_args.args == (8, "resolved")
+
+
+@pytest.mark.anyio("asyncio")
+async def test_admin_reply_without_selected_attachments_uses_plain_success_message(monkeypatch):
+    """An empty file input should not be reported as a failed attachment upload."""
+
+    class DummySanitized:
+        def __init__(self, html: str):
+            self.html = html
+            self.text_content = html
+            self.has_rich_content = True
+
+    empty_upload = UploadFile(filename="", file=io.BytesIO(b""))
+    form_data = FormData(
+        [
+            ("body", "<p>reply</p>"),
+            ("attachments", empty_upload),
+        ]
+    )
+
+    class DummyRequest:
+        def __init__(self) -> None:
+            self.url = type("url", (), {"path": "/admin/tickets/9"})()
+
+        async def form(self):
+            return form_data
+
+    monkeypatch.setattr(
+        main,
+        "_require_helpdesk_page",
+        AsyncMock(return_value=({"id": 9, "is_super_admin": True}, None)),
+    )
+    monkeypatch.setattr(main, "sanitize_rich_text", lambda value: DummySanitized(str(value or "")))
+    monkeypatch.setattr(
+        main.tickets_repo,
+        "get_ticket",
+        AsyncMock(return_value={"id": 9, "xero_invoice_number": None}),
+    )
+    monkeypatch.setattr(main.tickets_repo, "create_reply", AsyncMock(return_value={"id": 91}))
+    monkeypatch.setattr(main.tickets_repo, "set_ticket_status", AsyncMock(return_value={"id": 9, "status": "pending"}))
+    monkeypatch.setattr(main.tickets_repo, "add_watcher", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_summary", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_tags", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "broadcast_ticket_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_updated_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_replied_event", AsyncMock(return_value=None))
+
+    save_mock = AsyncMock(return_value={"id": 1})
+    monkeypatch.setattr(main.attachments_service, "save_uploaded_file", save_mock)
+
+    response = await admin_routes.admin_create_ticket_reply(9, DummyRequest())
+
+    assert response.status_code == status.HTTP_303_SEE_OTHER
+    parsed = urlparse(response.headers.get("location", ""))
+    message_values = [value for values in parse_qs(parsed.query).values() for value in values]
+    message_values.extend(response.headers.getlist("set-cookie"))
+    decoded_messages = [unquote(value) for value in message_values]
+    assert any("Reply posted." in value for value in decoded_messages)
+    assert not any("failed" in value.lower() for value in decoded_messages)
+    save_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio("asyncio")
+async def test_admin_reply_reports_failed_attachments(monkeypatch):
+    """Failed attachment uploads should surface in the success message."""
+
+    class DummySanitized:
+        def __init__(self, html: str):
+            self.html = html
+            self.text_content = html
+            self.has_rich_content = True
+
+    upload = UploadFile(filename="note.txt", file=io.BytesIO(b"hello"))
+    form_data = FormData(
+        [
+            ("body", "<p>reply</p>"),
+            ("attachments", upload),
+        ]
+    )
+
+    class DummyRequest:
+        def __init__(self) -> None:
+            self.url = type("url", (), {"path": "/admin/tickets/4"})()
+
+        async def form(self):
+            return form_data
+
+    request = DummyRequest()
+
+    monkeypatch.setattr(
+        main, "_require_helpdesk_page", AsyncMock(return_value=({"id": 9, "is_super_admin": True}, None))
+    )
+    monkeypatch.setattr(main, "sanitize_rich_text", lambda value: DummySanitized(str(value or "")))
+    monkeypatch.setattr(
+        main.tickets_repo,
+        "get_ticket",
+        AsyncMock(return_value={"id": 4, "xero_invoice_number": None}),
+    )
+    monkeypatch.setattr(main.tickets_repo, "create_reply", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_repo, "set_ticket_status", AsyncMock(return_value={"id": 4, "status": "pending"}))
+    monkeypatch.setattr(main.tickets_repo, "add_watcher", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_summary", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "refresh_ticket_ai_tags", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "broadcast_ticket_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_updated_event", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.tickets_service, "emit_ticket_replied_event", AsyncMock(return_value=None))
+
+    save_mock = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(main.attachments_service, "save_uploaded_file", save_mock)
+
+    response = await admin_routes.admin_create_ticket_reply(4, request)
+
+    assert response.status_code == status.HTTP_303_SEE_OTHER
+    parsed = urlparse(response.headers.get("location", ""))
+    message_values = [value for values in parse_qs(parsed.query).values() for value in values]
+    message_values.extend(response.headers.getlist("set-cookie"))
+    assert any("failed" in unquote(value).lower() for value in message_values)
+    assert save_mock.await_count == 1
+
+
+def test_ticket_reply_worklog_is_expanded_without_optional_caption() -> None:
+    template = Path("app/templates/admin/ticket_detail.html").read_text(encoding="utf-8")
+
+    assert '<details class="ticket-reply-worklog" open>' in template
+    assert "Optional worklog details" not in template
+    assert "Optional working details" not in template
+
+
+def test_ticket_detail_omits_action_centre() -> None:
+    template = Path("app/templates/admin/ticket_detail.html").read_text(encoding="utf-8")
+
+    assert "Action centre" not in template
+    assert "ticket-current-state" not in template
+
+
+def test_external_customer_messages_are_not_labelled_as_automation() -> None:
+    template = Path("app/templates/admin/ticket_detail.html").read_text(encoding="utf-8")
+
+    assert "reply.external_reference and not reply.author_id" not in template
+    assert "reply.external_reference.startswith('shipment-watch:')" in template
+    assert "reply.author_id != ticket.requester_id" in template
+    assert 'data-message-kind="{{ \'internal\' if reply.is_internal else (\'automation\' if reply_is_automation' in template

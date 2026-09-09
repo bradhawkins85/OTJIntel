@@ -1,0 +1,160 @@
+"""Tests for ticket views repository layer."""
+import pytest
+
+import json
+
+from app.repositories import ticket_views
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_normalise_ticket_view_handles_json_filters():
+    """Test that ticket view normalisation handles JSON filters correctly."""
+    import json
+    from datetime import datetime, timezone
+    
+    # Mock row data
+    row = {
+        "id": 1,
+        "user_id": 10,
+        "name": "Test View",
+        "description": "Test description",
+        "filters": json.dumps({"status": ["open", "in_progress"]}),
+        "grouping_field": "status",
+        "sort_field": "created_at",
+        "sort_direction": "desc",
+        "is_default": 1,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    
+    # Call the private normalisation function
+    result = ticket_views._normalise_ticket_view(row)
+    
+    # Verify
+    assert result["id"] == 1
+    assert result["user_id"] == 10
+    assert result["name"] == "Test View"
+    assert isinstance(result["filters"], dict)
+    assert result["filters"]["status"] == ["open", "in_progress"]
+    assert result["is_default"] is True
+
+
+@pytest.mark.anyio
+async def test_normalise_ticket_view_handles_none_filters():
+    """Test that ticket view normalisation handles None filters."""
+    from datetime import datetime, timezone
+    
+    row = {
+        "id": 1,
+        "user_id": 10,
+        "name": "Test View",
+        "description": None,
+        "filters": None,
+        "grouping_field": None,
+        "sort_field": None,
+        "sort_direction": None,
+        "is_default": 0,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    
+    result = ticket_views._normalise_ticket_view(row)
+    
+    assert result["filters"] is None
+    assert result["is_default"] is False
+
+
+@pytest.mark.anyio
+async def test_normalise_ticket_view_handles_legacy_list_filters():
+    """Legacy rows stored filters as a raw list of statuses."""
+    from datetime import datetime, timezone
+
+    row = {
+        "id": 2,
+        "user_id": 11,
+        "name": "Legacy View",
+        "description": "",
+        "filters": json.dumps(["open", "in_progress"]),
+        "grouping_field": None,
+        "sort_field": None,
+        "sort_direction": None,
+        "is_default": 0,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    result = ticket_views._normalise_ticket_view(row)
+
+    assert result["filters"] == {"status": ["open", "in_progress"]}
+
+
+@pytest.mark.anyio
+async def test_normalise_ticket_view_discards_invalid_filters():
+    """Invalid JSON blobs should not break the response payload."""
+    from datetime import datetime, timezone
+
+    row = {
+        "id": 3,
+        "user_id": 11,
+        "name": "Broken View",
+        "description": None,
+        "filters": "not-json",
+        "grouping_field": None,
+        "sort_field": None,
+        "sort_direction": None,
+        "is_default": 0,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    result = ticket_views._normalise_ticket_view(row)
+
+    assert result["filters"] is None
+
+
+def test_ticket_view_filters_status_roundtrip():
+    """Status filter values survive a save/load cycle via TicketViewFilters schema."""
+    from app.schemas.tickets import TicketViewFilters
+
+    statuses = ["open", "in_progress", "pending"]
+    filters = TicketViewFilters(status=statuses, priority=[])
+    dumped = filters.model_dump()
+
+    assert dumped["status"] == statuses
+
+    stored = json.dumps(dumped)
+    loaded = json.loads(stored)
+
+    assert loaded["status"] == statuses
+
+
+@pytest.mark.anyio
+async def test_normalise_ticket_view_preserves_status_filter():
+    """Status filters stored in JSON are correctly parsed and returned."""
+    from datetime import datetime, timezone
+
+    statuses = ["open", "pending"]
+    row = {
+        "id": 5,
+        "user_id": 20,
+        "name": "Status View",
+        "description": None,
+        "filters": json.dumps({"status": statuses, "priority": [], "company_id": None}),
+        "grouping_field": None,
+        "sort_field": None,
+        "sort_direction": None,
+        "is_default": 0,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    result = ticket_views._normalise_ticket_view(row)
+
+    assert isinstance(result["filters"], dict)
+    assert result["filters"]["status"] == statuses
+

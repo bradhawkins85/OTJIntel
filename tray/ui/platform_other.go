@@ -1,0 +1,40 @@
+//go:build !windows && !darwin && !nowebview
+
+package main
+
+import (
+	"os/exec"
+
+	"github.com/bradhawkins85/myportal-tray/internal/api"
+)
+
+func openBrowser(url string) {
+	_ = exec.Command("xdg-open", url).Start()
+}
+
+func showTextWindow(title, text string) {
+	// Phase 3: simple fallback — log to stdout.
+	_ = title
+	_ = text
+}
+
+func openChatWindow(chatURL string, cfg *api.ConfigResponse) {
+	if chatURL == "" {
+		// Try to get an authenticated popup URL; fall back to the plain chat URL.
+		authedURL := requestChatTokenForRoom(0)
+		if authedURL != "" {
+			chatURL = authedURL
+		} else {
+			chatURL = buildChatURL(0)
+		}
+	}
+	openBrowser(chatURL)
+}
+
+func openNewTicketWindow(_ *api.ConfigResponse) {
+	openBrowser(gPortalURL + "/tickets/new")
+}
+
+func showOSNotification(title, body string) {
+	_ = exec.Command("notify-send", title, body).Start()
+}

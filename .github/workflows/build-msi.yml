@@ -1,0 +1,203 @@
+# Build the MyPortal Tray MSI installer on Windows and upload it to the
+# GitHub release that triggered this workflow, or the release selected manually.
+#
+# Triggered by: publishing a new GitHub release (any tag), or manually via workflow_dispatch.
+# Runner:       windows-latest (required — WiX v7 only works on Windows)
+#
+# The MSI is built with WiX v7 (installed as a .NET global tool).
+# The -acceptEula wix7 flag accepts the FireGiant OSMF EULA non-interactively
+# per https://docs.firegiant.com/wix/osmf/.
+
+name: Build MSI
+
+on:
+  release:
+    # Build installers when a release is published. Using only `created` misses
+    # common flows where a draft release is created first and published later.
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to build installers for (defaults to current ref)'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # needed to upload the artifact to the release
+
+jobs:
+  build-msi:
+    name: Build Windows MSI
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: tray
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: tray/go.mod
+          cache-dependency-path: tray/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: tray/chat-shell/package-lock.json
+
+      - name: Install WiX v7
+        shell: pwsh
+        run: dotnet tool install --global wix --version "7.*"
+
+      - name: Build Windows binaries
+        shell: pwsh
+        run: |
+          $env:GOOS      = "windows"
+          $env:GOARCH    = "amd64"
+          $env:CGO_ENABLED = "0"
+          $version = "${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}"
+          $ldflags = "-X 'github.com/bradhawkins85/myportal-tray/internal/updater.AgentVersion=$version'"
+
+          New-Item -ItemType Directory -Force -Path dist\windows | Out-Null
+
+          go build -ldflags $ldflags -o dist\windows\myportal-tray-service.exe .\service
+          $env:GOFLAGS = "-tags=nowebview"
+          # -H windowsgui hides the console window so the tray UI runs silently
+          $uiLdflags = "$ldflags -H windowsgui"
+          go build -ldflags $uiLdflags -o dist\windows\myportal-tray-ui.exe     .\ui
+      
+      - name: Build Windows chat shell
+        shell: pwsh
+        working-directory: tray/chat-shell
+        run: |
+          npm ci
+          npm run build:win
+      - name: Stage Windows chat shell runtime
+        shell: pwsh
+        working-directory: tray
+        run: |
+          if (-not (Test-Path chat-shell\dist\win-unpacked)) {
+            Write-Host 'Available chat-shell/dist contents:'
+            Get-ChildItem -Recurse -Depth 2 chat-shell\dist | Format-Table -AutoSize
+            throw 'electron-builder did not create chat-shell/dist/win-unpacked'
+          }
+          Remove-Item -Recurse -Force dist\windows\chat-shell -ErrorAction SilentlyContinue
+          Copy-Item chat-shell\dist\win-unpacked dist\windows\chat-shell -Recurse -Force
+
+      - name: Validate code-signing certificate
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          SIGNING_CERTIFICATE_PFX: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PFX }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PFX)) {
+            throw 'The WINDOWS_SIGNING_CERTIFICATE_PFX repository secret is not configured.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD)) {
+            throw 'The WINDOWS_SIGNING_CERTIFICATE_PASSWORD repository secret is not configured.'
+          }
+
+          try {
+            $pfxBytes = [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_PFX)
+          } catch {
+            throw 'WINDOWS_SIGNING_CERTIFICATE_PFX is not a valid base64-encoded PFX.'
+          }
+
+          try {
+            # Keep the private key in memory. Importing a PFX into a certificate
+            # store can invoke Windows key-protection UI and hang a headless runner.
+            $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $pfxBytes, $env:SIGNING_CERTIFICATE_PASSWORD, $flags)
+          } catch {
+            throw 'Unable to load WINDOWS_SIGNING_CERTIFICATE_PFX with the configured password.'
+          } finally {
+            if ($null -ne $pfxBytes) {
+              [Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+            }
+          }
+          if (-not $certificate.HasPrivateKey) {
+            throw 'The signing PFX did not contain a certificate with a private key.'
+          }
+          Write-Host "Loaded signing certificate $($certificate.Thumbprint) in memory."
+          $certificate.Dispose()
+
+      - name: Sign Windows executables
+        shell: pwsh
+        env:
+          SIGNING_CERTIFICATE_PFX: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PFX }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfxBytes = [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_PFX)
+          $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+          $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $pfxBytes, $env:SIGNING_CERTIFICATE_PASSWORD, $flags)
+          [Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+          $executables = @(Get-ChildItem dist\windows -Filter '*.exe' -File -Recurse)
+          if ($executables.Count -eq 0) {
+            throw 'No Windows executables were found to sign.'
+          }
+
+          foreach ($executable in $executables) {
+            Set-AuthenticodeSignature -FilePath $executable.FullName -Certificate $certificate -HashAlgorithm SHA256 | Out-Null
+            $signature = Get-AuthenticodeSignature -FilePath $executable.FullName
+            if ($signature.Status -in @('NotSigned', 'HashMismatch')) {
+              throw "Invalid Authenticode signature on $($executable.FullName): $($signature.StatusMessage)"
+            }
+          }
+          $certificate.Dispose()
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $binDir = (Resolve-Path dist\windows).Path
+          $version = "${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}"
+          $msiVersion = ($version -replace '^v', '' -replace '[^0-9.].*$', '')
+          if ([string]::IsNullOrWhiteSpace($msiVersion)) {
+            $msiVersion = '0.0.0'
+          }
+          $versionParts = @($msiVersion.Split('.') | ForEach-Object {
+            if ($_ -match '^\d+$') { [int]$_ } else { 0 }
+          })
+          while ($versionParts.Count -lt 3) {
+            $versionParts += 0
+          }
+          $msiVersion = ($versionParts[0..2] -join '.')
+
+          wix build -acceptEula wix7 installer\windows\myportal-tray.wxs `
+            -arch x64 `
+            -d "BinDir=$binDir" `
+            -d "ProductVersion=$msiVersion" `
+            -o dist\windows\myportal-tray.msi
+
+      - name: Sign Windows installer
+        shell: pwsh
+        env:
+          SIGNING_CERTIFICATE_PFX: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PFX }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $installer = (Resolve-Path dist\windows\myportal-tray.msi).Path
+          $pfxBytes = [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_PFX)
+          $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+          $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $pfxBytes, $env:SIGNING_CERTIFICATE_PASSWORD, $flags)
+          [Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+          Set-AuthenticodeSignature -FilePath $installer -Certificate $certificate -HashAlgorithm SHA256 | Out-Null
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($signature.Status -in @('NotSigned', 'HashMismatch')) {
+            throw "Invalid Authenticode signature on ${installer}: $($signature.StatusMessage)"
+          }
+          $certificate.Dispose()
+
+      - name: Upload MSI to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}
+          files: tray/dist/windows/myportal-tray.msi

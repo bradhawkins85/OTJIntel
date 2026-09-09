@@ -1,0 +1,574 @@
+"""Tests for the Microsoft 365 enterprise app provisioning service."""
+from __future__ import annotations
+
+import pytest
+from unittest.mock import AsyncMock, patch
+from typing import Any
+
+from app.services import m365 as m365_service
+from tests.conftest import drain_provision_background_tasks
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_app_data(client_id: str = "new-client-id") -> dict[str, Any]:
+    return {"id": "app-object-id", "appId": client_id}
+
+
+def _make_sp_data(sp_id: str = "sp-object-id") -> dict[str, Any]:
+    return {"id": sp_id}
+
+
+def _make_graph_sp_response(graph_sp_id: str = "graph-sp-id") -> dict[str, Any]:
+    return {
+        "value": [
+            {
+                "id": graph_sp_id,
+                "appRoles": [{"id": role_id} for role_id in m365_service._PROVISION_APP_ROLES],
+            }
+        ]
+    }
+
+
+def _make_role_assignment() -> dict[str, Any]:
+    return {"id": "assignment-id"}
+
+
+def _make_secret_data(secret: str = "plain-text-secret") -> dict[str, Any]:
+    return {"secretText": secret}
+
+
+# ---------------------------------------------------------------------------
+# Tests for _graph_post
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio("asyncio")
+async def test_graph_post_success():
+    """_graph_post returns parsed JSON on 200/201."""
+    from unittest.mock import MagicMock
+
+    with patch("app.services.m365.httpx.AsyncClient") as mock_client_cls:
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": "abc"}
+        mock_client_cls.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+
+        result = await m365_service._graph_post(
+            "token", "https://graph.microsoft.com/v1.0/applications", {"name": "test"}
+        )
+
+    assert result == {"id": "abc"}
+
+
+@pytest.mark.anyio("asyncio")
+async def test_graph_post_raises_on_error():
+    """_graph_post raises M365Error on non-200/201 status."""
+    from unittest.mock import MagicMock
+
+    with patch("app.services.m365.httpx.AsyncClient") as mock_client_cls:
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.text = "Forbidden"
+        mock_client_cls.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+
+        with pytest.raises(m365_service.M365Error, match="403"):
+            await m365_service._graph_post(
+                "token",
+                "https://graph.microsoft.com/v1.0/applications",
+                {},
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tests for provision_app_registration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_registration_success():
+    """provision_app_registration returns a dict with client_id, client_secret, etc."""
+    access_token = "delegated-access-token"
+
+    call_order: list[str] = []
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        call_order.append(url)
+        if "/applications" in url and "addPassword" not in url and "owners" not in url:
+            return _make_app_data("provisioned-client-id")
+        if "/servicePrincipals" in url and "appRoleAssignments" not in url:
+            return _make_sp_data("provisioned-sp-id")
+        if "appRoleAssignments" in url:
+            return _make_role_assignment()
+        if "owners/$ref" in url:
+            return {}  # 204 No Content → empty dict
+        if "addPassword" in url:
+            return _make_secret_data("provisioned-secret")
+        return {}
+
+    async def mock_graph_get(token: str, url: str) -> dict:
+        if "servicePrincipals" in url and m365_service._TEAMS_APP_ID in url:
+            return {"value": [{"id": "graph-sp-id", "appRoles": [{"id": m365_service._TEAMS_MANAGE_AS_APP_ROLE}]}]}
+        if "servicePrincipals" in url:
+            return _make_graph_sp_response("graph-sp-id")
+        return {}
+
+    with (
+        patch.object(m365_service, "_graph_post", side_effect=mock_graph_post),
+        patch.object(m365_service, "_graph_get", side_effect=mock_graph_get),
+    ):
+        result = await m365_service.provision_app_registration(
+            access_token=access_token,
+            display_name="MyPortal – Acme Corp",
+        )
+        # Drain the background role-grant task while mocks are still active
+        await drain_provision_background_tasks()
+
+    assert result["client_id"] == "provisioned-client-id"
+    assert result["client_secret"] == "provisioned-secret"
+    assert result["app_object_id"] == "app-object-id"
+    # Verify all required Graph calls were made
+    assert any("/applications" in u and "addPassword" not in u for u in call_order), \
+        "Should POST to /applications to create app registration"
+    assert any("/servicePrincipals" in u and "appRoleAssignments" not in u for u in call_order), \
+        "Should POST to /servicePrincipals to create service principal"
+    assert sum(1 for u in call_order if "appRoleAssignments" in u) == len(
+        m365_service._PROVISION_APP_ROLES
+    ) + 2, "Should grant one role assignment per required role plus Exchange.ManageAsApp and Teams.ManageAsApp"
+    assert any("addPassword" in u for u in call_order), \
+        "Should POST to addPassword to create client secret"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_registration_missing_graph_sp():
+    """provision_app_registration raises M365Error if Graph SP not found."""
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        if "/applications" in url and "addPassword" not in url and "owners" not in url:
+            return _make_app_data()
+        if "/servicePrincipals" in url and "appRoleAssignments" not in url:
+            return _make_sp_data()
+        return {}
+
+    async def mock_graph_get(token: str, url: str) -> dict:
+        # Return empty list – Graph SP not found
+        return {"value": []}
+
+    with (
+        patch.object(m365_service, "_graph_post", side_effect=mock_graph_post),
+        patch.object(m365_service, "_graph_get", side_effect=mock_graph_get),
+    ):
+        with pytest.raises(m365_service.M365Error, match="Microsoft Graph service principal"):
+            await m365_service.provision_app_registration(
+                access_token="token",
+                display_name="Test App",
+            )
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_registration_default_display_name():
+    """provision_app_registration uses default display name when not specified."""
+    captured_payloads: list[dict] = []
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        captured_payloads.append({"url": url, "payload": payload})
+        if "/applications" in url and "addPassword" not in url and "owners" not in url:
+            return _make_app_data()
+        if "/servicePrincipals" in url and "appRoleAssignments" not in url:
+            return _make_sp_data()
+        if "appRoleAssignments" in url:
+            return _make_role_assignment()
+        if "owners/$ref" in url:
+            return {}
+        if "addPassword" in url:
+            return _make_secret_data()
+        return {}
+
+    async def mock_graph_get(token: str, url: str, **kwargs: Any) -> dict:
+        if "filter=displayName" in url:
+            return {"value": []}
+        return _make_graph_sp_response()
+
+    with (
+        patch.object(m365_service, "_graph_post", side_effect=mock_graph_post),
+        patch.object(m365_service, "_graph_get", side_effect=mock_graph_get),
+    ):
+        await m365_service.provision_app_registration(access_token="token")
+        # Drain background role-grant task while mocks are still active
+        await drain_provision_background_tasks()
+
+    app_create = next(
+        p for p in captured_payloads
+        if "/applications" in p["url"] and "addPassword" not in p["url"]
+    )
+    assert app_create["payload"]["displayName"] == "MyPortal Integration"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_registration_keeps_sharepoint_permission_when_lookup_omits_it():
+    """Provisioning must request SharePointTenantSettings.Read.All even if Graph appRoles omits it."""
+    captured_payloads: list[dict] = []
+    sharepoint_role = m365_service._SHAREPOINT_TENANT_SETTINGS_ROLE
+    graph_roles_without_sharepoint = [
+        {"id": role_id}
+        for role_id in m365_service._PROVISION_APP_ROLES
+        if role_id != sharepoint_role
+    ]
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        captured_payloads.append({"url": url, "payload": payload})
+        if "/applications" in url and "addPassword" not in url and "owners" not in url:
+            return _make_app_data()
+        if "/servicePrincipals" in url and "appRoleAssignments" not in url:
+            return _make_sp_data()
+        if "appRoleAssignments" in url:
+            return _make_role_assignment()
+        if "owners/$ref" in url:
+            return {}
+        if "addPassword" in url:
+            return _make_secret_data()
+        return {}
+
+    async def mock_graph_get(token: str, url: str, **kwargs: Any) -> dict:
+        if "filter=displayName" in url:
+            return {"value": []}
+        if m365_service._TEAMS_APP_ID in url:
+            return {
+                "value": [
+                    {
+                        "id": "teams-sp-id",
+                        "appRoles": [{"id": m365_service._TEAMS_MANAGE_AS_APP_ROLE}],
+                    }
+                ]
+            }
+        return {"value": [{"id": "graph-sp-id", "appRoles": graph_roles_without_sharepoint}]}
+
+    with (
+        patch.object(m365_service, "_graph_post", side_effect=mock_graph_post),
+        patch.object(m365_service, "_graph_get", side_effect=mock_graph_get),
+    ):
+        await m365_service.provision_app_registration(access_token="token")
+        await drain_provision_background_tasks()
+
+    app_create = next(
+        p for p in captured_payloads
+        if "/applications" in p["url"] and "addPassword" not in p["url"]
+    )
+    graph_access = next(
+        access
+        for access in app_create["payload"]["requiredResourceAccess"]
+        if access["resourceAppId"] == m365_service._GRAPH_APP_ID
+    )
+    requested_graph_roles = {role["id"] for role in graph_access["resourceAccess"]}
+    granted_graph_roles = {
+        p["payload"]["appRoleId"]
+        for p in captured_payloads
+        if "appRoleAssignments" in p["url"]
+        and p["payload"].get("resourceId") == "graph-sp-id"
+    }
+
+    assert sharepoint_role in requested_graph_roles
+    assert sharepoint_role in granted_graph_roles
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_registration_registers_redirect_uri():
+    """provision_app_registration includes web.redirectUris when redirect_uri is provided."""
+    captured_payloads: list[dict] = []
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        captured_payloads.append({"url": url, "payload": payload})
+        if "/applications" in url and "addPassword" not in url and "owners" not in url:
+            return _make_app_data()
+        if "/servicePrincipals" in url and "appRoleAssignments" not in url:
+            return _make_sp_data()
+        if "appRoleAssignments" in url:
+            return _make_role_assignment()
+        if "owners/$ref" in url:
+            return {}
+        if "addPassword" in url:
+            return _make_secret_data()
+        return {}
+
+    async def mock_graph_get(token: str, url: str, **kwargs: Any) -> dict:
+        if "filter=displayName" in url:
+            return {"value": []}
+        return _make_graph_sp_response()
+
+    redirect_uri = "https://myportal.example.com/m365/callback"
+
+    with (
+        patch.object(m365_service, "_graph_post", side_effect=mock_graph_post),
+        patch.object(m365_service, "_graph_get", side_effect=mock_graph_get),
+    ):
+        await m365_service.provision_app_registration(
+            access_token="token",
+            redirect_uri=redirect_uri,
+        )
+        # Drain background role-grant task while mocks are still active
+        await drain_provision_background_tasks()
+
+    app_create = next(
+        p for p in captured_payloads
+        if "/applications" in p["url"]
+        and "addPassword" not in p["url"]
+        and "owners" not in p["url"]
+    )
+    assert "web" in app_create["payload"], "App payload should include web section with redirectUris"
+    assert app_create["payload"]["web"]["redirectUris"] == [redirect_uri]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_registration_no_redirect_uri_when_not_provided():
+    """provision_app_registration omits web.redirectUris when redirect_uri is not provided."""
+    captured_payloads: list[dict] = []
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        captured_payloads.append({"url": url, "payload": payload})
+        if "/applications" in url and "addPassword" not in url and "owners" not in url:
+            return _make_app_data()
+        if "/servicePrincipals" in url and "appRoleAssignments" not in url:
+            return _make_sp_data()
+        if "appRoleAssignments" in url:
+            return _make_role_assignment()
+        if "owners/$ref" in url:
+            return {}
+        if "addPassword" in url:
+            return _make_secret_data()
+        return {}
+
+    async def mock_graph_get(token: str, url: str, **kwargs: Any) -> dict:
+        if "filter=displayName" in url:
+            return {"value": []}
+        return _make_graph_sp_response()
+
+    with (
+        patch.object(m365_service, "_graph_post", side_effect=mock_graph_post),
+        patch.object(m365_service, "_graph_get", side_effect=mock_graph_get),
+    ):
+        await m365_service.provision_app_registration(access_token="token")
+        # Drain background role-grant task while mocks are still active
+        await drain_provision_background_tasks()
+
+    app_create = next(
+        p for p in captured_payloads
+        if "/applications" in p["url"]
+        and "addPassword" not in p["url"]
+        and "owners" not in p["url"]
+    )
+    assert "web" not in app_create["payload"], "App payload should not include web section when no redirect_uri"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_scope_constant():
+    """PROVISION_SCOPE contains the required Graph-qualified delegated permissions."""
+    assert "https://graph.microsoft.com/Application.ReadWrite.All" in m365_service.PROVISION_SCOPE
+    assert "https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All" in m365_service.PROVISION_SCOPE
+    assert "offline_access" in m365_service.PROVISION_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# Tests for transient appRoleAssignment propagation retry
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio("asyncio")
+async def test_post_app_role_assignment_retries_on_transient_propagation_error(monkeypatch):
+    """`_post_app_role_assignment_with_retry` retries on the well-known
+    Microsoft Graph propagation error and succeeds on a later attempt."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(m365_service.asyncio, "sleep", fake_sleep)
+
+    attempts = {"n": 0}
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise m365_service.M365Error(
+                "Microsoft Graph POST failed (400): Permission being assigned was not found on application",
+                http_status=400,
+                graph_error_code="Request_BadRequest",
+            )
+        return {"id": "assignment-id"}
+
+    with patch.object(m365_service, "_graph_post", side_effect=mock_graph_post):
+        result = await m365_service._post_app_role_assignment_with_retry(
+            "token",
+            "https://graph.microsoft.com/v1.0/servicePrincipals/sp-id/appRoleAssignments",
+            {"principalId": "sp-id", "resourceId": "graph-sp-id", "appRoleId": "role-id"},
+            initial_delay_seconds=0.0,
+        )
+
+    assert result == {"id": "assignment-id"}
+    assert attempts["n"] == 3
+    assert len(sleeps) == 2  # slept between attempts 1→2 and 2→3
+
+
+@pytest.mark.anyio("asyncio")
+async def test_post_app_role_assignment_does_not_retry_on_409(monkeypatch):
+    """Conflicts (already-assigned roles) must propagate immediately so the
+    caller's existing 409 short-circuit can run."""
+    async def fake_sleep(seconds: float) -> None:  # pragma: no cover
+        raise AssertionError("should not sleep on 409")
+
+    monkeypatch.setattr(m365_service.asyncio, "sleep", fake_sleep)
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        raise m365_service.M365Error(
+            "Microsoft Graph POST failed (409)", http_status=409
+        )
+
+    with patch.object(m365_service, "_graph_post", side_effect=mock_graph_post):
+        with pytest.raises(m365_service.M365Error):
+            await m365_service._post_app_role_assignment_with_retry(
+                "token",
+                "https://graph.microsoft.com/v1.0/servicePrincipals/sp-id/appRoleAssignments",
+                {},
+                initial_delay_seconds=0.0,
+            )
+
+
+@pytest.mark.anyio("asyncio")
+async def test_post_app_role_assignment_default_budget_recovers_after_seven_failures(monkeypatch):
+    """Default retry budget tolerates slow Graph SP propagation (>6 attempts).
+
+    Regression test for the case where a tenant takes longer than the previous
+    6-attempt / ~46 second budget to replicate a newly-created service
+    principal, surfacing as repeated ``Permission being assigned was not found
+    on application`` errors before the assignment finally succeeds.
+    """
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(m365_service.asyncio, "sleep", fake_sleep)
+
+    attempts = {"n": 0}
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] < 8:
+            raise m365_service.M365Error(
+                "Microsoft Graph POST failed (400): Permission being assigned was not found on application",
+                http_status=400,
+                graph_error_code="Request_BadRequest",
+            )
+        return {"id": "assignment-id"}
+
+    with patch.object(m365_service, "_graph_post", side_effect=mock_graph_post):
+        result = await m365_service._post_app_role_assignment_with_retry(
+            "token",
+            "https://graph.microsoft.com/v1.0/servicePrincipals/sp-id/appRoleAssignments",
+            {"principalId": "sp-id", "resourceId": "graph-sp-id", "appRoleId": "role-id"},
+            initial_delay_seconds=0.0,
+        )
+
+    assert result == {"id": "assignment-id"}
+    assert attempts["n"] == 8
+    assert len(sleeps) == 7
+
+
+@pytest.mark.anyio("asyncio")
+async def test_post_app_role_assignment_gives_up_after_max_attempts(monkeypatch):
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(m365_service.asyncio, "sleep", fake_sleep)
+
+    attempts = {"n": 0}
+
+    async def mock_graph_post(token: str, url: str, payload: dict) -> dict:
+        attempts["n"] += 1
+        raise m365_service.M365Error(
+            "Microsoft Graph POST failed (400): Permission being assigned was not found on application",
+            http_status=400,
+            graph_error_code="Request_BadRequest",
+        )
+
+    with patch.object(m365_service, "_graph_post", side_effect=mock_graph_post):
+        with pytest.raises(m365_service.M365Error, match="Permission being assigned"):
+            await m365_service._post_app_role_assignment_with_retry(
+                "token",
+                "https://graph.microsoft.com/v1.0/servicePrincipals/sp-id/appRoleAssignments",
+                {},
+                max_attempts=3,
+                initial_delay_seconds=0.0,
+            )
+
+    assert attempts["n"] == 3
+
+
+@pytest.mark.anyio("asyncio")
+async def test_provision_app_roles_constant():
+    """_PROVISION_APP_ROLES contains known Microsoft Graph permission GUIDs."""
+    # User.Read.All
+    assert "df021288-bdef-4463-88db-98f22de89214" in m365_service._PROVISION_APP_ROLES
+    # Directory.Read.All
+    assert "7ab1d382-f21e-4acd-a863-ba3e13f7da61" in m365_service._PROVISION_APP_ROLES
+
+
+# ---------------------------------------------------------------------------
+# Tests for extract_tenant_id_from_token
+# ---------------------------------------------------------------------------
+
+def _make_jwt(payload: dict) -> str:
+    """Build a minimal JWT with the given payload (no real signature)."""
+    import base64, json
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
+    ).rstrip(b"=").decode()
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload).encode()
+    ).rstrip(b"=").decode()
+    return f"{header}.{body}.fakesig"
+
+
+def test_extract_tenant_id_success():
+    """extract_tenant_id_from_token returns the tid claim from a valid JWT."""
+    token = _make_jwt({"tid": "abc-def-1234", "sub": "user123"})
+    result = m365_service.extract_tenant_id_from_token(token)
+    assert result == "abc-def-1234"
+
+
+def test_extract_tenant_id_strips_whitespace():
+    """Whitespace around the tid value is stripped."""
+    token = _make_jwt({"tid": "  spaced-tenant  ", "sub": "user"})
+    result = m365_service.extract_tenant_id_from_token(token)
+    assert result == "spaced-tenant"
+
+
+def test_extract_tenant_id_missing_tid():
+    """Raises M365Error when the tid claim is absent."""
+    token = _make_jwt({"sub": "user123", "oid": "some-oid"})
+    with pytest.raises(m365_service.M365Error, match="tid"):
+        m365_service.extract_tenant_id_from_token(token)
+
+
+def test_extract_tenant_id_malformed_jwt():
+    """Raises M365Error for a string that is not a valid JWT."""
+    with pytest.raises(m365_service.M365Error, match="[Mm]alformed|segment|decode"):
+        m365_service.extract_tenant_id_from_token("not-a-jwt")
+
+
+def test_extract_tenant_id_invalid_base64():
+    """Raises M365Error when the payload segment is not valid base64."""
+    with pytest.raises(m365_service.M365Error):
+        m365_service.extract_tenant_id_from_token("header.!!!invalid!!!.sig")
+
+
+def test_discover_scope_constant():
+    """DISCOVER_SCOPE contains the expected OpenID scopes."""
+    assert "openid" in m365_service.DISCOVER_SCOPE
+    assert "profile" in m365_service.DISCOVER_SCOPE

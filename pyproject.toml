@@ -1,0 +1,60 @@
+[project]
+name = "myportal"
+version = "0.1.0"
+description = "Python implementation of the MyPortal backend"
+authors = [{name = "MyPortal Team"}]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy>=2.0.49",
+    "aiomysql",
+    "aiosqlite",
+    "pydantic>=2.12.5",
+    "pydantic-settings",
+    "passlib[bcrypt]",
+    "python-dotenv",
+    "redis",
+    "aiofiles",
+    "jinja2>=3.1.6",
+    "itsdangerous",
+    "pyotp",
+    "qrcode>=8.0",
+    "apscheduler",
+    "croniter>=6.2.2",
+    "httpx",
+    "loguru",
+    "cryptography>=46.0.7",
+    "email-validator",
+    "python-multipart",
+    "nh3",
+    "python-magic",
+    "Pillow>=10.0.0",
+    "markdown-it-py",
+    "mutagen",
+    "phonenumbers",
+    "python-docx>=1.1.0",
+    "weasyprint>=68.1",
+    "paramiko",
+    "defusedxml",
+    "apprise>=1.9.9",
+    "tiktoken>=0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "respx",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*", "migrations*", "deploy*", "changes*"]

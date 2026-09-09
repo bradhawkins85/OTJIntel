@@ -1,0 +1,2297 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+
+{% block header_title %}Edit company{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "Back to companies", "type": "link", "href": "/admin/companies"}
+  ]) }}
+{% endblock %}
+{% block content %}
+  <div class="company-edit-page" data-company-id="{{ company.id }}">
+  <div class="admin-grid admin-grid--columns">
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-edit-section="general" open>
+      <summary class="card__header card__header--collapsible card__header--actions">
+        <div class="stacked">
+          <h2 class="card__title">{{ form_data.name or company.name }}</h2>
+          <p class="card__subtitle">Manage general settings and email domains for this company.</p>
+        </div>
+        <div class="card__controls">
+          <span class="card__toggle-icon" aria-hidden="true"></span>
+        </div>
+      </summary>
+      <div class="card-collapsible__content card__body card__body--stacked">
+        <form id="company-settings-form" action="/admin/companies/{{ company.id }}" method="post" class="form" autocomplete="off">
+          {% include "partials/csrf.html" %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-name">Company name</label>
+            <input
+              id="edit-company-name"
+              name="name"
+              class="form-input"
+              value="{{ form_data.name }}"
+              maxlength="255"
+              required
+            />
+          </div>
+          {% if module_enabled.get('syncro', false) %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-syncro">Syncro company ID</label>
+            <input
+              id="edit-company-syncro"
+              name="syncroCompanyId"
+              class="form-input"
+              value="{{ form_data.syncro_company_id }}"
+              maxlength="255"
+            />
+          </div>
+          {% endif %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-email-domains">Email domains</label>
+            <input
+              id="edit-company-email-domains"
+              name="emailDomains"
+              class="form-input"
+              type="text"
+              placeholder="example.com, example.org"
+              value="{{ form_data.email_domains }}"
+            />
+            <p class="form-help">Use commas to list domains. Domains are matched case-insensitively.</p>
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="edit-company-phone">Company phone</label>
+            <input
+              id="edit-company-phone"
+              name="phone"
+              class="form-input"
+              type="tel"
+              autocomplete="tel"
+              placeholder="e.g. +44 20 7946 0958"
+              value="{{ form_data.phone }}"
+              maxlength="50"
+            />
+            <p class="form-help">The company's primary business phone number.</p>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button">Save changes</button>
+          </div>
+        </form>
+      </div>
+    </details>
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-edit-section="company-variables">
+      <summary class="card__header card__header--collapsible card__header--stacked">
+        <div>
+          <h2 class="card__title">Company Variables</h2>
+          <p class="card__subtitle">Set company-specific values for shared variables used in canned responses and message templates.</p>
+        </div>
+        <div class="card__collapsible-meta" aria-hidden="true"><span class="card__toggle-icon"></span></div>
+      </summary>
+      <div class="card-collapsible__content card__body card__body--stacked">
+        <p class="form-help">Use a value with <code>{{ '{{ company.variables.VARIABLE_NAME }}' }}</code>. Variable names are shared by every company; values are unique to this company.</p>
+        {% if company_variables %}
+          <form action="/admin/companies/{{ company.id }}/variables" method="post" class="form">
+            {% include "partials/csrf.html" %}
+            {% for variable in company_variables %}
+              <div class="form-field">
+                <label class="form-label" for="company-variable-{{ variable.id }}"><code>{{ variable.name }}</code></label>
+                <input id="company-variable-{{ variable.id }}" name="variable_{{ variable.id }}" class="form-input" value="{{ variable.value }}" />
+              </div>
+            {% endfor %}
+            <div class="form-actions"><button type="submit" class="button">Save variable values</button></div>
+          </form>
+        {% else %}
+          <p class="text-muted">No company variables have been defined yet.</p>
+        {% endif %}
+        <form action="/admin/companies/{{ company.id }}/variables/new" method="post" class="form">
+          {% include "partials/csrf.html" %}
+          <h3>Add shared variable</h3>
+          <div class="form-field">
+            <label class="form-label" for="new-company-variable-name">Variable name</label>
+            <input id="new-company-variable-name" name="name" class="form-input" placeholder="SUPPORT_PORTAL_URL" maxlength="100" pattern="[A-Za-z][A-Za-z0-9_]*" required />
+          </div>
+          <div class="form-field">
+            <label class="form-label" for="new-company-variable-value">Value for {{ company.name }}</label>
+            <input id="new-company-variable-value" name="value" class="form-input" placeholder="https://example.com/support" />
+          </div>
+          <div class="form-actions"><button type="submit" class="button button--secondary">Add variable</button></div>
+        </form>
+      </div>
+    </details>
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-edit-section="sla" open>
+      <summary class="card__header card__header--collapsible"><div><h2 class="card__title">Service level agreement</h2><p class="card__subtitle">Apply a reusable, priority-based SLA template to this company.</p></div><span class="card__toggle-icon" aria-hidden="true"></span></summary>
+      <div class="card-collapsible__content">
+        <form action="/admin/companies/{{ company.id }}/sla" method="post" class="form">
+          {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+          <p class="form-help">SLA coverage is optional. Tickets only receive targets when this company has a template assigned and that template contains the ticket's priority.</p>
+          <div class="form-field"><label class="form-label required" for="sla-template">SLA template</label><select class="form-input" id="sla-template" name="templateId" required><option value="">Select a template</option>{% for template in sla_templates %}<option value="{{ template.id }}" {% if company_sla and company_sla.id == template.id %}selected{% endif %}>{{ template.name }}</option>{% endfor %}</select></div>
+          {% if company_sla and company_sla.targets %}<div class="table-wrapper"><table class="table"><thead><tr><th>Priority</th><th>First response</th><th>Resolution</th></tr></thead><tbody>{% for target in company_sla.targets %}<tr><td>{{ target.priority|replace('_', ' ')|title }}</td><td>{{ target.response_minutes }} minutes</td><td>{{ target.resolution_minutes }} minutes</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+          {% if company_sla and company_sla.pause_statuses %}<p class="form-help"><strong>Timer paused while:</strong> {{ company_sla.pause_statuses|map('replace', '_', ' ')|map('title')|join(', ') }}</p>{% endif %}
+          <div class="form-actions"><button class="button" type="submit">Apply template</button><a class="button button--secondary" href="/admin/sla-templates">Manage templates</a>{% if company_sla %}<button class="button button--danger" type="submit" formaction="/admin/companies/{{ company.id }}/sla/delete" data-confirm="Remove this SLA template assignment?">Remove assignment</button>{% endif %}</div>
+        </form>
+      </div>
+    </details>
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-edit-section="external-ids">
+      <summary class="card__header card__header--collapsible card__header--stacked">
+        <div>
+          <h2 class="card__title">External IDs</h2>
+          <p class="card__subtitle">Link this company to records in connected external services.</p>
+        </div>
+        <div class="card__collapsible-meta" aria-hidden="true"><span class="card__toggle-icon"></span></div>
+      </summary>
+      <div class="card-collapsible__content card__body card__body--stacked">
+          {% if module_enabled.get('tacticalrmm', false) %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-tactical">Tactical RMM client ID</label>
+            <div class="form-field__group">
+              <input
+                id="edit-company-tactical"
+                name="tacticalClientId" form="company-settings-form"
+                class="form-input"
+                value="{{ form_data.tacticalrmm_client_id }}"
+                maxlength="255"
+              />
+              <button
+                type="button"
+                class="button button--ghost"
+                data-lookup-tactical-id
+                title="Lookup Tactical RMM client ID"
+                aria-label="Lookup Tactical RMM client ID from API"
+              >
+                <span class="button__icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
+                    <path d="M20 12h2a10 10 0 0 0-10-10v2a8 8 0 0 1 8 8z"/>
+                    <path d="M12 20v2a10 10 0 0 0 10-10h-2a8 8 0 0 1-8 8z"/>
+                    <path d="M4 12H2a10 10 0 0 0 10 10v-2a8 8 0 0 1-8-8z"/>
+                  </svg>
+                </span>
+              </button>
+            </div>
+          </div>
+          {% endif %}
+          {% if module_enabled.get('xero', false) %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-xero">Xero ID</label>
+            <div class="form-field__group">
+              <input
+                id="edit-company-xero"
+                name="xeroId" form="company-settings-form"
+                class="form-input"
+                value="{{ form_data.xero_id }}"
+                maxlength="255"
+              />
+              <button
+                type="button"
+                class="button button--ghost"
+                data-lookup-xero-id
+                title="Lookup Xero contact ID"
+                aria-label="Lookup Xero contact ID from API"
+              >
+                <span class="button__icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
+                    <path d="M20 12h2a10 10 0 0 0-10-10v2a8 8 0 0 1 8 8z"/>
+                    <path d="M12 20v2a10 10 0 0 0 10-10h-2a8 8 0 0 1-8 8z"/>
+                    <path d="M4 12H2a10 10 0 0 0 10 10v-2a8 8 0 0 1-8-8z"/>
+                  </svg>
+                </span>
+              </button>
+            </div>
+          </div>
+          {% endif %}
+          {% if module_enabled.get('hudu', false) %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-hudu">Hudu ID</label>
+            <div class="form-field__group">
+              <input
+                id="edit-company-hudu"
+                name="huduId" form="company-settings-form"
+                class="form-input"
+                value="{{ form_data.hudu_id }}"
+                maxlength="255"
+              />
+              <button
+                type="button"
+                class="button button--ghost"
+                data-lookup-hudu-id
+                title="Lookup Hudu company ID"
+                aria-label="Lookup Hudu company ID from API"
+              >
+                <span class="button__icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
+                    <path d="M20 12h2a10 10 0 0 0-10-10v2a8 8 0 0 1 8 8z"/>
+                    <path d="M12 20v2a10 10 0 0 0 10-10h-2a8 8 0 0 1-8 8z"/>
+                    <path d="M4 12H2a10 10 0 0 0 10 10v-2a8 8 0 0 1-8-8z"/>
+                  </svg>
+                </span>
+              </button>
+            </div>
+          </div>
+          {% endif %}
+          {% if module_enabled.get('huntress', false) %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-huntress">Huntress organisation ID</label>
+            <div class="form-field__group">
+              <input
+                id="edit-company-huntress"
+                name="huntressOrganizationId" form="company-settings-form"
+                class="form-input"
+                value="{{ form_data.huntress_organization_id }}"
+                maxlength="64"
+                placeholder="e.g. 12345"
+              />
+              <button
+                type="button"
+                class="button button--ghost"
+                data-lookup-huntress-id
+                title="Lookup Huntress organisation ID"
+                aria-label="Lookup Huntress organisation ID from API"
+              >
+                <span class="button__icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
+                    <path d="M20 12h2a10 10 0 0 0-10-10v2a8 8 0 0 1 8 8z"/>
+                    <path d="M12 20v2a10 10 0 0 0 10-10h-2a8 8 0 0 1-8 8z"/>
+                    <path d="M4 12H2a10 10 0 0 0 10 10v-2a8 8 0 0 1-8-8z"/>
+                  </svg>
+                </span>
+              </button>
+            </div>
+            <p class="form-help">Optional. Links this company to a Huntress organisation for EDR / ITDR / SIEM / SOC data. The nightly company-ID lookup task can populate it when the name matches.</p>
+          </div>
+          {% endif %}
+          {% if module_enabled.get('huntress', false) %}
+          <div class="form-field">
+            <label class="form-label" for="edit-company-huntress-sat">Huntress SAT account ID</label>
+            <div class="form-field__group">
+              <input id="edit-company-huntress-sat" name="huntressSatAccountId" form="company-settings-form" class="form-input"
+                value="{{ form_data.huntress_sat_account_id }}" maxlength="64" placeholder="e.g. 67890" />
+              <button type="button" class="button button--ghost" data-lookup-huntress-sat-id
+                title="Lookup Huntress SAT account ID" aria-label="Lookup Huntress SAT account ID from API">
+                <span class="button__icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/><path d="M20 12h2a10 10 0 0 0-10-10v2a8 8 0 0 1 8 8z"/><path d="M12 20v2a10 10 0 0 0 10-10h-2a8 8 0 0 1-8 8z"/><path d="M4 12H2a10 10 0 0 0 10 10v-2a8 8 0 0 1-8-8z"/></svg></span>
+              </button>
+            </div>
+            <p class="form-help">Optional. Links this company to its separate Huntress Managed SAT account. SAT API calls use this ID rather than the EDR organisation ID.</p>
+          </div>
+          {% endif %}
+        <div class="form-actions">
+          <button type="submit" class="button" form="company-settings-form">Save company settings</button>
+        </div>
+      </div>
+    </details>
+    {% if module_enabled.get('trello', false) %}
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-edit-section="trello">
+      <summary class="card__header card__header--collapsible card__header--stacked">
+        <div>
+          <h2 class="card__title">Trello</h2>
+          <p class="card__subtitle">Configure this company's Trello board, credentials, and webhook.</p>
+        </div>
+        <div class="card__collapsible-meta" aria-hidden="true"><span class="card__toggle-icon"></span></div>
+      </summary>
+      <div class="card-collapsible__content">
+        <div class="form-field">
+          <label class="form-label" for="edit-company-trello-board">Trello board ID</label>
+          <input id="edit-company-trello-board" name="trelloBoardId" form="company-settings-form" class="form-input"
+            value="{{ form_data.trello_board_id or '' }}" maxlength="255" placeholder="e.g. 5abbe4b7ddc1b351ef961414" />
+          <p class="form-help">Link this company to a Trello board. Cards created on the board will become tickets. Find the board ID in the board URL or via the Trello API.</p>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="edit-company-trello-api-key">Trello API key</label>
+          <input id="edit-company-trello-api-key" name="trelloApiKey" form="company-settings-form" class="form-input" type="password"
+            autocomplete="off" placeholder="{% if form_data.trello_api_key %}Key saved — enter to replace{% else %}Enter API key{% endif %}" maxlength="255" />
+          <p class="form-help">Stored securely. Leave blank to keep the existing value. Copy the <strong>Key</strong> (not the Secret) from <a href="https://trello.com/app-key" target="_blank" rel="noopener noreferrer">trello.com/app-key</a>.</p>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="edit-company-trello-token">Trello OAuth token</label>
+          <input id="edit-company-trello-token" name="trelloToken" form="company-settings-form" class="form-input" type="password"
+            autocomplete="off" placeholder="{% if form_data.trello_token %}Token saved — enter to replace{% else %}Enter OAuth token{% endif %}" maxlength="255" />
+          <p class="form-help">Stored securely. Leave blank to keep the existing value. This is the <strong>OAuth Token</strong> — <em>not</em> the Secret shown on the app-key page. Go to <a href="https://trello.com/app-key" target="_blank" rel="noopener noreferrer">trello.com/app-key</a>, then click <strong>Token</strong> and authorise the app to generate it.</p>
+        </div>
+        <div class="form-field">
+          <label class="form-label">Register Trello webhook</label>
+          <div class="form-field__group">
+            <button type="button" class="button button--ghost" id="trello-register-webhook-btn"
+              data-board-id="{{ form_data.trello_board_id or '' }}">Register webhook</button>
+          </div>
+          <p class="form-help" id="trello-register-status">Register this company's board with Trello so incoming card events create tickets.</p>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button" form="company-settings-form">Save company settings</button>
+        </div>
+      </div>
+    </details>
+    <script>
+      (function () {
+        var btn = document.getElementById('trello-register-webhook-btn');
+        if (!btn) return;
+        btn.addEventListener('click', async function () {
+          var boardId = btn.dataset.boardId;
+          var statusEl = document.getElementById('trello-register-status');
+          if (!boardId) { statusEl.textContent = 'Save the board ID first, then register the webhook.'; return; }
+          btn.disabled = true;
+          statusEl.textContent = 'Registering…';
+          try {
+            var resp = await fetch('/api/integration-modules/trello/boards/' + encodeURIComponent(boardId) + '/register-webhook', {method: 'POST', headers: {'X-CSRF-Token': document.querySelector('meta[name=csrf-token]')?.content || ''}});
+            var data = await resp.json();
+            if (resp.ok) { statusEl.textContent = 'Webhook registered successfully.'; }
+            else { statusEl.textContent = 'Error: ' + (data.detail || 'Unknown error'); }
+          } catch (e) { statusEl.textContent = 'Request failed: ' + e.message; }
+          btn.disabled = false;
+        });
+      })();
+    </script>
+    {% endif %}
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-edit-section="payments">
+      <summary class="card__header card__header--collapsible card__header--stacked">
+        <div>
+          <h2 class="card__title">Payments</h2>
+          <p class="card__subtitle">Configure payment methods, purchase orders, VIP pricing, and billable ticket reply defaults.</p>
+        </div>
+        <div class="card__collapsible-meta" aria-hidden="true">
+          <span class="card__toggle-icon"></span>
+        </div>
+      </summary>
+      <div class="card-collapsible__content">
+      <div class="form-field form-field--checkbox">
+        <label class="checkbox" for="edit-company-vip">
+          <input
+            id="edit-company-vip"
+            type="checkbox"
+            name="isVip"
+            form="company-settings-form"
+            value="1"
+            {% if form_data.is_vip %}checked{% endif %}
+          />
+          <span>VIP pricing</span>
+        </label>
+      </div>
+      <div class="form-field form-field--checkbox">
+        <label class="checkbox" for="edit-company-default-ticket-replies-billable">
+          <input
+            id="edit-company-default-ticket-replies-billable"
+            type="checkbox"
+            name="defaultTicketRepliesBillable"
+            form="company-settings-form"
+            value="1"
+            {% if form_data.default_ticket_replies_billable %}checked{% endif %}
+          />
+          <span>Default ticket replies to Billable</span>
+        </label>
+        <p class="form-help">When enabled, the Billable checkbox is ticked automatically for new technician ticket replies. Technicians can untick it on individual replies when needed.</p>
+      </div>
+      <div class="form-field">
+        <label class="form-label">Payment method</label>
+        <div class="form-checkbox-group">
+          <label class="form-checkbox__label">
+            <input
+              type="checkbox"
+              name="invoicePrepay"
+              form="company-settings-form"
+              value="1"
+              {% if 'invoice_prepay' in form_data.payment_method %}checked{% endif %}
+            />
+            <span>Invoice Prepay</span>
+          </label>
+          <label class="form-checkbox__label">
+            <input
+              type="checkbox"
+              name="invoicePostpay"
+              form="company-settings-form"
+              value="1"
+              {% if 'invoice_postpay' in form_data.payment_method %}checked{% endif %}
+            />
+            <span>Invoice Postpay</span>
+          </label>
+          <label class="form-checkbox__label">
+            <input
+              type="checkbox"
+              name="stripeEnabled"
+              form="company-settings-form"
+              value="1"
+              {% if 'stripe' in form_data.payment_method %}checked{% endif %}
+            />
+            <span>Stripe (coming soon)</span>
+          </label>
+        </div>
+        <p class="form-help">Select at least one payment method. Invoice Prepay sends an invoice before service is rendered. Invoice Postpay sends an invoice after the billing period. Stripe will take payment immediately (coming soon).</p>
+      </div>
+      <div class="form-field">
+        <label class="form-label" for="edit-company-invoice-due-days">Invoice due days</label>
+        <input
+          id="edit-company-invoice-due-days"
+          name="invoiceDueDays"
+          form="company-settings-form"
+          class="form-input"
+          type="number"
+          min="0"
+          max="3650"
+          step="1"
+          value="{{ form_data.invoice_due_days }}"
+          placeholder="Use environment default"
+        />
+        <p class="form-help">Number of calendar days after issue that Xero invoices are due. Leave blank to use <code>XERO_INVOICE_DUE_DAYS</code> (14 days by default).</p>
+      </div>
+      <div class="form-field">
+        <label class="form-label">Purchase order options</label>
+        <div class="form-checkbox-group">
+          <label class="form-checkbox__label">
+            <input
+              type="checkbox"
+              name="requirePo"
+              form="company-settings-form"
+              value="1"
+              {% if form_data.require_po %}checked{% endif %}
+            />
+            <span>Require PO</span>
+          </label>
+        </div>
+        <p class="form-help">When enabled, customers must provide a purchase order number before placing an order.</p>
+      </div>
+        <div class="form-actions">
+          <button type="submit" class="button" form="company-settings-form">Save company settings</button>
+        </div>
+      </div>
+    </details>
+    {% if is_super_admin %}
+      <details class="card card--panel card-collapsible admin-grid__full" data-staff-field-config-panel>
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Staff intake fields</h2>
+            <p class="card__subtitle">Control which staff onboarding fields are visible, required, and their display order.</p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <form action="/admin/companies/{{ company.id }}/staff-fields" method="post" class="form">
+            {% include "partials/csrf.html" %}
+            <div class="table-wrapper">
+              <table class="table staff-field-config-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Field</th>
+                    <th scope="col">Type</th>
+                    <th scope="col">Visible</th>
+                    <th scope="col">Required</th>
+                    <th scope="col">Sort</th>
+                    <th scope="col">Options (select / multiselect only)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for field in staff_field_config %}
+                    <tr>
+                      <td>{{ field.label }}</td>
+                      <td>
+                        <select
+                          class="form-input"
+                          name="field_{{ field.key }}_type"
+                          {% if field.key in ['first_name', 'last_name', 'email'] %}disabled{% endif %}
+                        >
+                          {% for value in ['text', 'select', 'multiselect', 'checkbox', 'date'] %}
+                            <option value="{{ value }}" {% if field.type == value %}selected{% endif %}>{{ value }}</option>
+                          {% endfor %}
+                        </select>
+                        {% if field.key in ['first_name', 'last_name', 'email'] %}
+                          <input type="hidden" name="field_{{ field.key }}_type" value="{{ field.type }}" />
+                        {% endif %}
+                      </td>
+                      <td>
+                        <input
+                          type="checkbox"
+                          name="field_{{ field.key }}_visible"
+                          value="1"
+                          {% if field.visible %}checked{% endif %}
+                          {% if field.key in ['first_name', 'last_name'] %}disabled{% endif %}
+                        />
+                        {% if field.key in ['first_name', 'last_name'] %}
+                          <input type="hidden" name="field_{{ field.key }}_visible" value="1" />
+                        {% endif %}
+                      </td>
+                      <td>
+                        <input
+                          type="checkbox"
+                          name="field_{{ field.key }}_required"
+                          value="1"
+                          {% if field.required %}checked{% endif %}
+                          {% if field.key in ['first_name', 'last_name'] %}disabled{% endif %}
+                        />
+                        {% if field.key in ['first_name', 'last_name'] %}
+                          <input type="hidden" name="field_{{ field.key }}_required" value="1" />
+                        {% endif %}
+                      </td>
+                      <td>
+                        <input
+                          class="form-input"
+                          type="number"
+                          name="field_{{ field.key }}_sort_order"
+                          value="{{ field.sort_order }}"
+                        />
+                      </td>
+                      <td>
+                        {% if field.type in ('select', 'multiselect') %}
+                          <input
+                            class="form-input"
+                            type="text"
+                            name="field_{{ field.key }}_options"
+                            value="{% for option in field.options %}{{ option.value }}{% if option.label != option.value %}:{{ option.label }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}"
+                            placeholder="value:Label, value2:Label 2"
+                          />
+                        {% else %}
+                          <span class="text-muted">—</span>
+                        {% endif %}
+                      </td>
+                    </tr>
+                  {% else %}
+                    <tr>
+                      <td colspan="6" class="table__empty">No staff field configuration found.</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="button">Save staff field settings</button>
+            </div>
+          </form>
+        </div>
+      </details>
+
+      <details class="card card--panel card-collapsible admin-grid__full">
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Staff custom fields</h2>
+            <p class="card__subtitle">Manage company-specific custom fields captured on staff records.</p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <form action="/admin/companies/{{ company.id }}/staff-custom-fields" method="post" class="form-grid">
+            {% include "partials/csrf.html" %}
+            <div class="form-field">
+              <label class="form-label" for="new-custom-name">Key</label>
+              <input class="form-input" id="new-custom-name" name="name" placeholder="e.g. shirt_size" required />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-display-name">Label</label>
+              <input class="form-input" id="new-custom-display-name" name="display_name" placeholder="Shirt size" />
+            </div>
+            <div class="form-field admin-grid__full">
+              <label class="form-label" for="new-custom-help-text">Help text</label>
+              <input class="form-input" id="new-custom-help-text" name="help_text" maxlength="500" placeholder="Optional text shown below the field label on staff forms" />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-field-type">Type</label>
+              <select class="form-input" id="new-custom-field-type" name="field_type">
+                <option value="text">text</option>
+                <option value="select">select</option>
+                <option value="multiselect">multiselect</option>
+                <option value="checkbox">checkbox</option>
+                <option value="date">date</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-field-group">Group</label>
+              <input class="form-input" id="new-custom-field-group" name="field_group" placeholder="e.g. Uniform" />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-display-order">Sort</label>
+              <input class="form-input" id="new-custom-display-order" name="display_order" type="number" value="0" />
+            </div>
+            <div class="form-field admin-grid__full">
+              <label class="form-label" for="new-custom-options">Options (select / multiselect only)</label>
+              <input class="form-input" id="new-custom-options" name="options" placeholder="small:Small|mailbox@example.com, medium:Medium|other@example.com" />
+              <p class="form-help">For M365 multi-select sync, append <code>|UPN</code> or <code>|Group Display Name</code> to each option. Multiple alternatives can be separated with <code>|</code>.</p>
+            </div>
+            <div class="form-field admin-grid__full">
+              <label class="form-label" for="new-custom-m365-upn">M365 mailbox/group UPN (checkbox / select only)</label>
+              <input class="form-input" id="new-custom-m365-upn" name="m365_upn" placeholder="mailbox@example.com" />
+              <p class="form-help">When set, M365 mailbox sync updates this field from the staff member's mailbox memberships without creating tickets. Use <code>|</code> to add display-name alternatives such as <code>Netsuite|Netsuite Users</code>.</p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-visible-job-titles">Visible to job titles</label>
+              <input class="form-input" id="new-custom-visible-job-titles" name="visible_to_job_titles" placeholder="Manager, Department Manager" />
+              <p class="form-help">Optional comma-separated list. Leave blank to show this field to all requestors.</p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-visible-requestors">Visible to requestors</label>
+              <input class="form-input" id="new-custom-visible-requestors" name="visible_to_requester_emails" placeholder="manager@example.com, approver@example.com" />
+              <p class="form-help">Optional comma-separated requester email allow-list. Job title and requester lists are combined.</p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-condition-parent">Conditional parent field key</label>
+              <input class="form-input" id="new-custom-condition-parent" name="condition_parent_name" placeholder="e.g. needs_uniform" />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-condition-operator">Condition</label>
+              <select class="form-input" id="new-custom-condition-operator" name="condition_operator">
+                <option value="is_checked">Checkbox is checked</option>
+                <option value="is_not_checked">Checkbox is not checked</option>
+                <option value="equals">Equals value</option>
+                <option value="not_equals">Not equal to value</option>
+                <option value="one_of">One Of (comma separated)</option>
+                <option value="select_map">Select option map</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="new-custom-condition-value">Condition value</label>
+              <textarea class="form-input" id="new-custom-condition-value" name="condition_value" rows="6" placeholder='equals/not_equals example: sales&#10;one_of example: sales, support, hr&#10;select_map JSON example: {&#10;  &quot;sales&quot;: &quot;a,b,c&quot;,&#10;  &quot;support&quot;: &quot;d,e,f&quot;,&#10;  &quot;fallback&quot;: &quot;other&quot;&#10;}'></textarea>
+            </div>
+            <div class="form-actions admin-grid__full">
+              <button type="submit" class="button">Add custom field</button>
+            </div>
+          </form>
+
+          <div class="table-wrapper">
+            <table class="table staff-custom-fields-table">
+              <thead>
+                <tr>
+                  <th>Key</th>
+                  <th>Label</th>
+                  <th>Help text</th>
+                  <th>Type</th>
+                  <th>Group</th>
+                  <th>Sort</th>
+                  <th>Active</th>
+                  <th>Conditional logic</th>
+                  <th>Visibility</th>
+                  <th>Options</th>
+                  <th>M365 mapping</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for field in staff_custom_field_definitions %}
+                  <tr>
+                    <form action="/admin/companies/{{ company.id }}/staff-custom-fields/{{ field.id }}" method="post">
+                      {% include "partials/csrf.html" %}
+                      <td><code>{{ field.name }}</code></td>
+                      <td><input class="form-input" name="display_name" value="{{ field.display_name or '' }}" /></td>
+                      <td><input class="form-input" name="help_text" value="{{ field.help_text or '' }}" maxlength="500" placeholder="Optional help text" /></td>
+                      <td>
+                        <select class="form-input" name="field_type">
+                          {% for value in ['text', 'select', 'multiselect', 'checkbox', 'date'] %}
+                            <option value="{{ value }}" {% if field.field_type == value %}selected{% endif %}>{{ value }}</option>
+                          {% endfor %}
+                        </select>
+                      </td>
+                      <td><input class="form-input" name="field_group" value="{{ field.field_group or '' }}" placeholder="Optional group" /></td>
+                      <td><input class="form-input" type="number" name="display_order" value="{{ field.display_order }}" /></td>
+                      <td><input type="checkbox" name="is_active" value="1" {% if field.is_active %}checked{% endif %} /></td>
+                      <td>
+                        <div class="form-field">
+                          <input class="form-input" name="condition_parent_name" value="{{ field.condition_parent_name or '' }}" placeholder="Parent key" />
+                        </div>
+                        <div class="form-field">
+                          <select class="form-input" name="condition_operator">
+                            {% for condition in ['equals', 'not_equals', 'one_of', 'is_checked', 'is_not_checked', 'select_map'] %}
+                              <option value="{{ condition }}" {% if (field.condition_operator or 'is_checked') == condition %}selected{% endif %}>{{ condition }}</option>
+                            {% endfor %}
+                          </select>
+                        </div>
+                        <div class="form-field">
+                          <textarea class="form-input" name="condition_value" rows="6" placeholder='one_of: sales, support, hr&#10;Use JSON for select_map, e.g. {&quot;sales&quot;:&quot;a,b,c&quot;,&quot;fallback&quot;:&quot;other&quot;}'>{{ field.condition_value or '' }}</textarea>
+                        </div>
+                      </td>
+                      <td>
+                        <div class="form-field">
+                          <label class="form-label">Job titles</label>
+                          <input class="form-input" name="visible_to_job_titles" value="{{ field.visible_to_job_titles or '' }}" placeholder="Manager, Department Manager" />
+                        </div>
+                        <div class="form-field">
+                          <label class="form-label">Requestor emails</label>
+                          <input class="form-input" name="visible_to_requester_emails" value="{{ field.visible_to_requester_emails or '' }}" placeholder="manager@example.com" />
+                        </div>
+                      </td>
+                      <td><input class="form-input" name="options" value="{% for option in field.options %}{{ option.value }}{% if option.label != option.value %}:{{ option.label }}{% endif %}{% if option.m365_upn %}|{{ option.m365_upn }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}" /></td>
+                      <td><input class="form-input" name="m365_upn" value="{{ field.m365_upn or '' }}" placeholder="mailbox@example.com or Group Name" /></td>
+                      <td class="table__actions">
+                        <button type="submit" class="button button--ghost">Save</button>
+                    </form>
+                    <form action="/admin/companies/{{ company.id }}/staff-custom-fields/{{ field.id }}/delete" method="post" class="inline-form">
+                      {% include "partials/csrf.html" %}
+                      <button type="submit" class="button button--danger">Delete</button>
+                    </form>
+                      </td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="11" class="table__empty">No custom fields defined.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </details>
+
+      <details class="card card--panel card-collapsible admin-grid__full" data-billing-contacts-panel open>
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Billing contacts</h2>
+            <p class="card__subtitle">Manage staff members who receive billing notifications for this company, including subscription price changes.</p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <div class="form-field">
+            <label class="form-label" for="billing-contact-select">Add billing contact</label>
+            <select class="form-input" id="billing-contact-select" data-billing-contact-select>
+              <option value="">Select a staff member...</option>
+              {% for staff in company_staff %}
+                <option value="{{ staff.id }}" data-email="{{ staff.email }}" data-name="{{ staff.first_name }} {{ staff.last_name }}">
+                  {{ staff.email }} - {{ staff.first_name }} {{ staff.last_name }}
+                </option>
+              {% endfor %}
+            </select>
+            <p class="form-helper">Select a staff member to add as a billing contact for price change notifications.</p>
+          </div>
+          <div class="billing-contacts-list" id="billing-contacts-list">
+            {% if billing_contacts %}
+              {% for contact in billing_contacts %}
+                <div class="billing-contact-item" data-staff-id="{{ contact.staff_id }}">
+                  <div class="billing-contact-info">
+                    <span class="billing-contact-email">{{ contact.email }}</span>
+                    {% if contact.first_name or contact.last_name %}
+                      <span class="billing-contact-name">{{ contact.first_name }} {{ contact.last_name }}</span>
+                    {% endif %}
+                  </div>
+                  <button 
+                    type="button" 
+                    class="button button--ghost button--small" 
+                    data-billing-contact-remove="{{ contact.staff_id }}"
+                    title="Remove billing contact"
+                  >
+                    Remove
+                  </button>
+                </div>
+              {% endfor %}
+            {% else %}
+              <p class="text-muted" data-empty-message>No billing contacts configured yet.</p>
+            {% endif %}
+          </div>
+        </div>
+      </details>
+
+      <details class="card card--panel card-collapsible admin-grid__full" data-m365-credentials-panel>
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Microsoft 365</h2>
+            <p class="card__subtitle">Link this company to a Microsoft 365 tenant for license synchronisation.</p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <div class="form-field form-field--checkbox">
+            <label class="checkbox" for="edit-company-offboarding-email-forwarding">
+              <input
+                id="edit-company-offboarding-email-forwarding"
+                type="checkbox"
+                name="offboardingEmailForwardingEnabled"
+                form="company-settings-form"
+                value="1"
+                {% if form_data.offboarding_email_forwarding_enabled %}checked{% endif %}
+              />
+              <span>Enable email forwarding on offboarding requests</span>
+            </label>
+            <p class="form-help">When enabled, admins can select a staff member to forward emails to when submitting an offboarding request. Disable if your company uses a fixed forwarding address configured in the workflow step.</p>
+          </div>
+          {% if m365_credential %}
+          <dl class="definition-list">
+            <div class="definition-list__item">
+              <dt>Tenant ID</dt>
+              <dd>{{ m365_credential.tenant_id }}</dd>
+            </div>
+            <div class="definition-list__item">
+              <dt>Client ID</dt>
+              <dd>{{ m365_credential.client_id }}</dd>
+            </div>
+            <div class="definition-list__item">
+              <dt>Token expires</dt>
+              <dd>{{ m365_credential.token_expires_at or 'Not authorised yet' }}</dd>
+            </div>
+          </dl>
+          {% else %}
+          <p class="text-muted">No Microsoft 365 credentials linked to this company.</p>
+          {% endif %}
+          <form action="/admin/companies/{{ company.id }}/m365-credentials" method="post" class="form" autocomplete="off">
+            {% include "partials/csrf.html" %}
+            <div class="form-field">
+              <label class="form-label" for="m365-tenant-id">Tenant ID</label>
+              <input
+                id="m365-tenant-id"
+                name="tenantId"
+                class="form-input"
+                value="{{ m365_credential.tenant_id if m365_credential else '' }}"
+                maxlength="255"
+                required
+              />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="m365-client-id">Client ID</label>
+              <input
+                id="m365-client-id"
+                name="clientId"
+                class="form-input"
+                value="{{ m365_credential.client_id if m365_credential else '' }}"
+                maxlength="255"
+                required
+              />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="m365-client-secret">Client secret</label>
+              <input
+                id="m365-client-secret"
+                name="clientSecret"
+                type="password"
+                class="form-input"
+                placeholder="{% if m365_credential %}Enter new secret to rotate{% else %}Required{% endif %}"
+                {% if not m365_credential %}required{% endif %}
+              />
+              <p class="form-help">Secrets are encrypted at rest. Leave blank to keep the existing secret.</p>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="button">Save credentials</button>
+            </div>
+          </form>
+          {% if m365_credential %}
+          <form action="/admin/companies/{{ company.id }}/m365-credentials/delete" method="post" class="form" style="margin-top: 1rem;">
+            {% include "partials/csrf.html" %}
+            <button
+              type="submit"
+              class="button button--ghost"
+              onclick="return confirm('Remove Microsoft 365 credentials for this company?');"
+            >Remove credentials</button>
+          </form>
+          {% endif %}
+          <hr class="divider" style="margin: 1.5rem 0;" />
+          <div class="form-field">
+            <label class="form-label" for="edit-company-onedrive-export-site">OneDrive export SharePoint site</label>
+            {% if m365_has_credentials %}
+              <div class="form-field__group">
+                <select
+                  id="edit-company-onedrive-export-site"
+                  name="onedriveExportSite"
+                  class="form-input"
+                  data-onedrive-export-sites-select
+                  form="company-settings-form"
+                >
+                  <option value="">Do not enable manual OneDrive exports</option>
+                  {% if form_data.onedrive_export_drive_id %}
+                    {% set saved_site_payload = {
+                      'site_id': form_data.onedrive_export_site_id,
+                      'site_name': form_data.onedrive_export_site_name,
+                      'drive_id': form_data.onedrive_export_drive_id
+                    } %}
+                    <option value="{{ saved_site_payload | tojson | forceescape }}" selected>
+                      Current: {{ form_data.onedrive_export_site_name or form_data.onedrive_export_drive_id }}
+                    </option>
+                  {% endif %}
+                </select>
+                <button
+                  type="button"
+                  class="button button--ghost"
+                  data-lookup-onedrive-export-sites
+                  title="Lookup SharePoint sites for OneDrive exports"
+                  aria-label="Lookup SharePoint sites for OneDrive exports from Microsoft Graph"
+                >
+                  <span class="button__icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
+                      <path d="M20 12h2a10 10 0 0 0-10-10v2a8 8 0 0 1 8 8z"/>
+                      <path d="M12 20v2a10 10 0 0 0 10-10h-2a8 8 0 0 1-8 8z"/>
+                      <path d="M4 12H2a10 10 0 0 0 10 10v-2a8 8 0 0 1-8-8z"/>
+                    </svg>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="button button--ghost"
+                  data-create-offboarded-staff-site
+                  title="Create the Offboarded Staff SharePoint site for OneDrive exports"
+                  aria-label="Create Offboarded Staff SharePoint site"
+                  hidden
+                >
+                  Create Offboarded Staff
+                </button>
+              </div>
+              <p class="form-help">Click the lookup button to load SharePoint sites/default document libraries, then select the destination that will receive OneDrive export folders. If Offboarded Staff is missing after lookup, use the create button to add it.</p>
+              {% if form_data.onedrive_export_drive_id %}
+                <p class="form-help">Current saved export site: {{ form_data.onedrive_export_site_name or form_data.onedrive_export_drive_id }}</p>
+              {% endif %}
+              <p class="form-help form-help--error" data-onedrive-export-sites-error hidden></p>
+            {% else %}
+              <input class="form-input" id="edit-company-onedrive-export-site" value="Configure Microsoft 365 credentials first" readonly />
+              <p class="form-help">Complete this company's Microsoft 365 configuration before selecting a OneDrive export destination.</p>
+            {% endif %}
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button" form="company-settings-form">Save company settings</button>
+          </div>
+          {% if true %}
+          <hr class="divider" style="margin: 1.5rem 0;" />
+          <div>
+            <p class="form-help">Auto-provision creates a dedicated enterprise app registration in the tenant and configures the required permissions automatically.</p>
+            <div style="margin-top: 0.5rem;">
+              <a href="/admin/companies/{{ company.id }}/m365-discover" class="button button--ghost">Sign in as Global Admin</a>
+              <span class="form-help" style="display: block; margin-top: 0.25rem;">Discovers the Tenant ID automatically, then provisions the app in one step.</span>
+            </div>
+            <details style="margin-top: 1rem;">
+              <summary class="form-help" style="cursor: pointer;">Already know the Tenant ID? Enter it manually</summary>
+              <form method="get" action="/admin/companies/{{ company.id }}/m365-provision" class="form-field__group" style="margin-top: 0.5rem;">
+                <input
+                  type="text"
+                  name="tenant_id"
+                  class="form-input"
+                  placeholder="Tenant ID"
+                  value="{{ m365_credential.tenant_id if m365_credential else '' }}"
+                  required
+                />
+                <button type="submit" class="button button--ghost">Auto-provision</button>
+              </form>
+            </details>
+          </div>
+          {% endif %}
+        </div>
+      </details>
+
+      <details class="card card--panel card-collapsible admin-grid__full" data-tray-panel>
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Tray icon</h2>
+            <p class="card__subtitle">Enrol tokens and tray icon settings for this company. <a href="/admin/companies/{{ company.id }}/tray">Open full tray settings</a></p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          {% if tray_tokens %}
+            <div class="table-wrapper">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Label</th><th>Prefix</th><th>Status</th><th>Uses</th><th>Created</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for token in tray_tokens %}
+                    <tr>
+                      <td>{{ token.label }}</td>
+                      <td><code>{{ token.token_prefix }}…</code></td>
+                      <td>
+                        {% if token.revoked_at %}
+                          <span class="status status--danger">Revoked</span>
+                        {% else %}
+                          <span class="status status--success">Active</span>
+                        {% endif %}
+                      </td>
+                      <td>{{ token.use_count }}</td>
+                      <td><span data-utc="{{ token.created_at }}">{{ token.created_at }}</span></td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="text-muted">No enrol tokens yet for this company.</p>
+          {% endif %}
+          <div class="form-actions">
+            <a class="button button--primary" href="/admin/companies/{{ company.id }}/tray">Manage tray settings &amp; tokens</a>
+          </div>
+        </div>
+      </details>
+
+      <details class="card card--panel card-collapsible admin-grid__full" data-company-automations open>
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Company automations</h2>
+            <p class="card__subtitle">Schedule and monitor automations dedicated to this company.</p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <div class="card__controls">
+            <input
+              type="search"
+              class="form-input"
+              placeholder="Filter automations"
+              aria-label="Filter company automations"
+              data-table-filter="company-automation-tasks"
+            />
+            <button 
+              type="button" 
+              class="button button--ghost" 
+              id="toggle-inactive-tasks"
+              data-show-inactive="{{ 'true' if show_inactive_tasks else 'false' }}"
+            >
+              {{ 'Hide' if show_inactive_tasks else 'Show' }} inactive
+            </button>
+            <button type="button" class="button button--primary" data-task-create>New automation</button>
+          </div>
+          <div class="table-wrapper">
+            <table class="table" id="company-automation-tasks" data-table data-table-id="company-automation-tasks">
+              <thead>
+                <tr>
+                  <th scope="col" data-sort="string">Name</th>
+                  <th scope="col" data-sort="string">Command</th>
+                  <th scope="col" data-sort="string">Cron</th>
+                  <th scope="col" data-sort="string">Active</th>
+                  <th scope="col" data-sort="date">Last run</th>
+                  <th scope="col" data-sort="string">Status</th>
+                  <th scope="col" class="table__actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% if company_automation_tasks %}
+                  {% for task in company_automation_tasks %}
+                    <tr data-task='{{ task | tojson }}'>
+                      <td data-label="Name">{{ task.name }}</td>
+                      <td data-label="Command">{{ task.command }}</td>
+                      <td data-label="Cron">{{ task.cron }}</td>
+                      <td data-label="Active">
+                        <span class="tag {{ 'tag--success' if task.active else 'tag--muted' }}">{{ 'Yes' if task.active else 'No' }}</span>
+                      </td>
+                      <td data-label="Last run" data-value="{{ task.last_run_iso or '' }}">
+                        {% if task.last_run_iso %}
+                          <span data-utc="{{ task.last_run_iso }}"></span>
+                        {% else %}
+                          <span class="text-muted">Never</span>
+                        {% endif %}
+                      </td>
+                      <td data-label="Status">{{ task.last_status or '—' }}</td>
+                      <td class="table__actions">
+                        <div class="table__action-buttons">
+                          <button type="button" class="button button--ghost" data-task-edit>Edit</button>
+                          <button type="button" class="button button--ghost" data-task-run>Run now</button>
+                          <button type="button" class="button button--ghost" data-task-logs>View logs</button>
+                        </div>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                {% else %}
+                  <tr>
+                    <td colspan="7" class="table__empty">No automations are configured for this company yet.</td>
+                  </tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+          <div class="table-pagination" data-pagination="company-automation-tasks">
+            <div class="table-pagination__group">
+              <button type="button" class="button button--ghost table-pagination__button" data-page-prev disabled>
+                Previous
+              </button>
+              <button type="button" class="button button--ghost table-pagination__button" data-page-next>
+                Next
+              </button>
+            </div>
+            <p class="table-pagination__status" data-page-info aria-live="polite"></p>
+          </div>
+        </div>
+      </details>
+
+      <details class="card card--panel card-collapsible admin-grid__full" data-recurring-invoice-items-panel>
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Recurring invoice items</h2>
+            <p class="card__subtitle">
+              Configure items that will be automatically added to Xero invoices when the sync automation runs.
+            </p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <div class="card__controls">
+            <input
+              type="search"
+              class="form-input"
+              placeholder="Filter items"
+              aria-label="Filter recurring invoice items"
+              data-table-filter="recurring-invoice-items-table"
+            />
+            <button type="button" class="button button--primary" data-recurring-item-create>Add item</button>
+          </div>
+          <div class="table-wrapper">
+            <table class="table" id="recurring-invoice-items-table" data-table data-table-id="recurring-invoice-items">
+              <thead>
+                <tr>
+                  <th scope="col" data-sort="string">Product Code</th>
+                  <th scope="col" data-sort="string">Description</th>
+                  <th scope="col" data-sort="string">Qty Expression</th>
+                  <th scope="col" data-sort="number">Price Override</th>
+                  <th scope="col" data-sort="string">Billing limit</th>
+                  <th scope="col" data-sort="string">Window</th>
+                  <th scope="col" data-sort="string">Last billed</th>
+                  <th scope="col" data-sort="string">Active</th>
+                  <th scope="col" class="table__actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% if recurring_invoice_items %}
+                  {% for item in recurring_invoice_items %}
+                    <tr data-recurring-item='{{ item | tojson | e }}'>
+                      <td data-label="Product Code">{{ item.product_code }}</td>
+                      <td data-label="Description" class="text-truncate" style="max-width: 300px;">
+                        {{ item.description_template }}
+                      </td>
+                      <td data-label="Qty Expression">{{ item.qty_expression }}</td>
+                      <td data-label="Price Override">
+                        {% if item.price_override %}
+                          ${{ "%.2f"|format(item.price_override) }}
+                        {% else %}
+                          <span class="text-muted">Use Xero default</span>
+                        {% endif %}
+                      </td>
+                      <td data-label="Billing limit">
+                        {% set frequency_labels = {
+                          'every_run': 'Every run',
+                          'once': 'Once only',
+                          'weekly': 'Once per week',
+                          'monthly': 'Once per month',
+                          'quarterly': 'Once per quarter',
+                          'yearly': 'Once per year',
+                          'times_per_year': (item.billing_interval|string) ~ ' times per year' if item.billing_interval else 'Times per year'
+                        } %}
+                        {{ frequency_labels.get(item.billing_frequency or 'every_run', item.billing_frequency or 'Every run') }}
+                      </td>
+                      <td data-label="Window">
+                        {{ item.start_date or 'Any start' }} – {{ item.end_date or 'No end' }}
+                      </td>
+                      <td data-label="Last billed">{{ item.last_billed_at or 'Never' }}</td>
+                      <td data-label="Active">
+                        <span class="tag {{ 'tag--success' if item.active else 'tag--muted' }}">
+                          {{ 'Yes' if item.active else 'No' }}
+                        </span>
+                      </td>
+                      <td class="table__actions">
+                        <div class="table__action-buttons">
+                          <button type="button" class="button button--ghost" data-recurring-item-edit>Edit</button>
+                          <button type="button" class="button button--ghost button--danger" data-recurring-item-delete>Delete</button>
+                        </div>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                {% else %}
+                  <tr>
+                    <td colspan="9" class="table__empty">No recurring invoice items configured yet.</td>
+                  </tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+          <div class="table-pagination" data-pagination="recurring-invoice-items-table">
+            <div class="table-pagination__group">
+              <button type="button" class="button button--ghost table-pagination__button" data-page-prev disabled>
+                Previous
+              </button>
+              <button type="button" class="button button--ghost table-pagination__button" data-page-next>
+                Next
+              </button>
+            </div>
+            <p class="table-pagination__status" data-page-info aria-live="polite"></p>
+          </div>
+          <div class="card__help">
+            <h3 class="card__help-title">Variable Substitution</h3>
+            <p class="card__help-text">
+              Use variables in the description and quantity fields to dynamically populate invoice data.
+              Wrap variable names in curly braces: <code>{variable_name}</code>.
+            </p>
+            <p class="card__help-text">
+              <strong>Standard variables:</strong>
+            </p>
+            <ul class="card__help-list">
+              <li><code>{company_name}</code> - Name of the company</li>
+              <li><code>{active_agents}</code> - Count of assets synced within the last 30 days</li>
+              <li><code>{active_workstations}</code> - Count of active Workstation-type assets</li>
+              <li><code>{active_servers}</code> - Count of active Server-type assets</li>
+              <li><code>{active_users}</code> - Count of active User-type assets</li>
+              <li><code>{total_assets}</code> - Same as <code>{active_agents}</code></li>
+            </ul>
+            <p class="card__help-text">
+              <strong>Asset custom field counts</strong> (checkbox fields only):
+            </p>
+            <ul class="card__help-list">
+              <li><code>{cf_total_FIELDNAME}</code> - Total assets where the checkbox field is ticked</li>
+              <li><code>{cf_active_FIELDNAME}</code> - Assets synced within 30 days where the checkbox field is ticked</li>
+            </ul>
+            <p class="card__help-text">
+              Replace <code>FIELDNAME</code> with the custom field name, converting spaces, hyphens and other
+              punctuation to underscores (consecutive separators collapse to a single underscore).
+              For example: <em>threatlocker-installed</em> → <code>{cf_active_threatlocker_installed}</code>,
+              and <em>Bit Defender EDR</em> → <code>{cf_active_Bit_Defender_EDR}</code>.
+            </p>
+            <p class="card__help-text">
+              <strong>Saved report variables:</strong> dynamic template variables such as
+              <code>{{ '{{ report.billable-assets.count }}' }}</code> and
+              <code>{{ '{{ report.billable-assets.list }}' }}</code> can be used where dynamic variables are supported.
+              Reports can filter to the current invoice company with <code>{{ '{{current.company}}' }}</code> in the saved SQL.
+            </p>
+            <p class="card__help-text">
+              If no price override is specified, the price will be retrieved from Xero using the product code.
+            </p>
+          </div>
+        </div>
+      </details>
+      <details class="card card--panel card-collapsible admin-grid__full">
+        <summary class="card__header card__header--collapsible card__header--stacked">
+          <div>
+            <h2 class="card__title">Assign staff access</h2>
+            <p class="card__subtitle">
+              Grant or update company permissions for existing team members without sending invitations.
+            </p>
+          </div>
+          <div class="card__collapsible-meta" aria-hidden="true">
+            <span class="card__toggle-icon"></span>
+          </div>
+        </summary>
+        <div class="card-collapsible__content">
+          <form
+            action="/admin/companies/assign"
+            method="post"
+            class="form-grid"
+            autocomplete="off"
+            data-company-assign-form
+            data-initial-company-id="{{ assign_form.company_id }}"
+            data-initial-user-id="{{ assign_form.user_value or '' }}"
+          >
+            {% include "partials/csrf.html" %}
+            <input type="hidden" name="sourceCompanyId" value="{{ company.id }}" />
+            <div class="form-field">
+              <label class="form-label" for="assign-company">Company</label>
+              <select
+                id="assign-company"
+                name="companyId"
+                class="form-input"
+                required
+                data-company-select
+              >
+                {% for managed in managed_companies %}
+                  <option value="{{ managed.id }}" {% if managed.id == assign_form.company_id %}selected{% endif %}>
+                    {{ managed.name }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="assign-user">User</label>
+              <select id="assign-user" name="userId" class="form-input" required data-user-select>
+                <option
+                  value=""
+                  disabled
+                  {% if not assign_form.user_value %}selected{% endif %}
+                  data-placeholder
+                >
+                  Select a user
+                </option>
+                {% for option in assign_user_options %}
+                  <option
+                    value="{{ option.value }}"
+                    {% if option.value == assign_form.user_value %}selected{% endif %}
+                    {% if option.staff_id is not none %}data-staff-id="{{ option.staff_id }}"{% endif %}
+                    {% if option.user_id is not none %}data-user-id="{{ option.user_id }}"{% endif %}
+                    data-has-user="{% if option.has_user %}1{% else %}0{% endif %}"
+                  >
+                    {{ option.label }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+            {% if role_options %}
+              <div class="form-field">
+                <label class="form-label" for="assign-role">Membership role</label>
+                <select id="assign-role" name="role_id" class="form-input">
+                  <option value="" {% if not assign_form.role_id %}selected{% endif %}>Default membership role</option>
+                  {% for role in role_options %}
+                    <option value="{{ role.id }}" {% if role.id == assign_form.role_id %}selected{% endif %}>
+                      {{ role.name }}
+                    </option>
+                  {% endfor %}
+                </select>
+              </div>
+            {% endif %}
+            <div class="form-field">
+              <label class="form-label" for="assign-staff-permission">Staff access level</label>
+              <select id="assign-staff-permission" name="staffPermission" class="form-input">
+                {% for option in staff_permission_options %}
+                  <option value="{{ option.value }}" {% if option.value == assign_form.staff_permission %}selected{% endif %}>
+                    {{ option.label }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="form-actions form-field--wide">
+              <button type="submit" class="button">Save access</button>
+            </div>
+          </form>
+        </div>
+      </details>
+
+    <details class="card card--panel card-collapsible admin-grid__full" data-company-memberships-panel>
+      <summary class="card__header card__header--collapsible card__header--stacked">
+        <div>
+          <h2 class="card__title">Company memberships</h2>
+          <p class="card__subtitle">Manage staff access and permissions for this company.</p>
+        </div>
+        <div class="card__collapsible-meta" aria-hidden="true">
+          <span class="card__toggle-icon"></span>
+        </div>
+      </summary>
+      <div class="card-collapsible__content">
+        <div class="card__controls card__controls--align-end">
+          <input
+            type="search"
+            class="form-input"
+            placeholder="Filter memberships"
+            aria-label="Filter memberships"
+            data-table-filter="company-assignments"
+          />
+        </div>
+        <div class="table-wrapper">
+          <table class="table" id="company-assignments" data-table data-table-id="company-assignments">
+            <thead>
+              <tr>
+                <th scope="col" data-sort="string">User</th>
+                <th scope="col" data-sort="string">Role</th>
+                <th scope="col" data-sort="string">Staff</th>
+                <th scope="col" class="table__actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% if assignments %}
+                {% for assignment in assignments %}
+                  <tr>
+                    <td data-label="User">
+                      <div class="stacked">
+                        <strong>{{ assignment.email }}</strong>
+                        <span class="text-muted">{{ assignment.first_name or '' }} {{ assignment.last_name or '' }}</span>
+                        {% if assignment.is_pending %}
+                          <span class="badge badge--warning">Pending staff access</span>
+                          {% if assignment.pending_requires_account %}
+                            <span class="text-muted">Awaiting portal account</span>
+                          {% endif %}
+                        {% endif %}
+                      </div>
+                    </td>
+                    <td data-label="Role">
+                      {% if assignment.is_pending %}
+                        {% if assignment.membership_role_name %}
+                          <span>{{ assignment.membership_role_name }}</span>
+                        {% elif assignment.membership_role_id %}
+                          <span>Role ID {{ assignment.membership_role_id }}</span>
+                        {% else %}
+                          <span class="text-muted">Pending role assignment</span>
+                        {% endif %}
+                      {% elif assignment.membership_id and role_options %}
+                        <select
+                          class="form-input"
+                          data-membership-role
+                          data-company-id="{{ assignment.company_id }}"
+                          data-user-id="{{ assignment.user_id }}"
+                          data-membership-id="{{ assignment.membership_id }}"
+                          data-current-role="{{ assignment.membership_role_id or '' }}"
+                        >
+                          {% for role in role_options %}
+                            <option value="{{ role.id }}" {% if role.id == assignment.membership_role_id %}selected{% endif %}>
+                              {{ role.name }}
+                            </option>
+                          {% endfor %}
+                        </select>
+                      {% elif assignment.membership_id %}
+                        <span>{{ assignment.membership_role_name or 'Role unavailable' }}</span>
+                      {% else %}
+                        <span class="text-muted">No membership record</span>
+                      {% endif %}
+                    </td>
+                    <td data-label="Staff">
+                      {% if assignment.is_pending %}
+                        <span class="text-muted">{{ assignment.staff_permission_label }}</span>
+                      {% else %}
+                        <select
+                          class="form-input"
+                          data-staff-permission
+                          data-company-id="{{ assignment.company_id }}"
+                          data-user-id="{{ assignment.user_id }}"
+                        >
+                          {% for option in staff_permission_options %}
+                            <option value="{{ option.value }}" {% if option.value == assignment.staff_permission %}selected{% endif %}>
+                              {{ option.label }}
+                            </option>
+                          {% endfor %}
+                        </select>
+                      {% endif %}
+                    </td>
+                    <td class="table__actions">
+                      {% if assignment.is_pending %}
+                        <div class="stacked">
+                          {% if assignment.pending_requires_account %}
+                            <span class="text-muted">Awaiting sign-up</span>
+                          {% elif assignment.user_id and assignment.user_id != current_user.id %}
+                            <form action="/admin/impersonation" method="post" class="inline-form" style="margin-bottom: 0.5rem;">
+                              {% include "partials/csrf.html" %}
+                              <input type="hidden" name="userId" value="{{ assignment.user_id }}" />
+                              <button type="submit" class="button button--small">
+                                Impersonate
+                              </button>
+                            </form>
+                          {% endif %}
+                          {% if assignment.staff_id %}
+                            <button
+                              type="button"
+                              class="button button--danger button--small"
+                              data-remove-pending-assignment
+                              data-company-id="{{ assignment.company_id }}"
+                              data-staff-id="{{ assignment.staff_id }}"
+                            >
+                              Cancel pending access
+                            </button>
+                          {% endif %}
+                        </div>
+                      {% else %}
+                        <div class="table__action-buttons">
+                          {% if assignment.user_id and assignment.user_id != current_user.id %}
+                            <form action="/admin/impersonation" method="post" class="inline-form">
+                              {% include "partials/csrf.html" %}
+                              <input type="hidden" name="userId" value="{{ assignment.user_id }}" />
+                              <button type="submit" class="button button--ghost">
+                                Impersonate
+                              </button>
+                            </form>
+                          {% endif %}
+                          {% if assignment.membership_id %}
+                            <button
+                              type="button"
+                              class="button button--ghost"
+                              data-edit-user-permissions
+                              data-membership-id="{{ assignment.membership_id }}"
+                              data-company-id="{{ assignment.company_id }}"
+                              data-user-id="{{ assignment.user_id }}"
+                              data-user-email="{{ assignment.email }}"
+                              data-user-name="{{ assignment.first_name or '' }} {{ assignment.last_name or '' }}"
+                            >
+                              Permissions
+                            </button>
+                          {% endif %}
+                          <button
+                            type="button"
+                            class="button button--danger"
+                            data-remove-assignment
+                            data-company-id="{{ assignment.company_id }}"
+                            data-user-id="{{ assignment.user_id }}"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="4" class="table__empty">
+                    No memberships are assigned to this company yet.
+                  </td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+    <details class="card card--panel card-collapsible admin-grid__full" id="shop-visibility-panel">
+      <summary class="card__header card__header--collapsible card__header--stacked">
+        <div>
+          <h2 class="card__title">Shop item visibility</h2>
+          <p class="card__subtitle">Items are visible to this company by default. Tick an item to hide it from their store.</p>
+        </div>
+        <div class="card__collapsible-meta" aria-hidden="true">
+          <span class="card__toggle-icon"></span>
+        </div>
+      </summary>
+      <div class="card-collapsible__content">
+        <p class="form-helper" id="shop-visibility-loading">Loading products…</p>
+        <form
+          id="shop-visibility-form"
+          method="post"
+          action="/admin/companies/{{ company.id }}/shop-visibility"
+        >
+          {% include "partials/csrf.html" %}
+          <div id="shop-visibility-grid" class="visibility-grid"></div>
+          <div class="form-actions">
+            <button type="submit" class="button">Save visibility</button>
+          </div>
+        </form>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+  {% if is_super_admin %}
+    <script type="application/json" id="company-assign-user-options">
+      {{ company_user_options | tojson | safe }}
+    </script>
+    <div class="modal" id="task-editor-modal" role="dialog" aria-modal="true" hidden>
+      <div class="modal__content" role="document">
+        <button type="button" class="modal__close" data-modal-close>
+          <span class="visually-hidden">Close automation editor</span>
+        </button>
+        <h2 class="modal__title">Company automation</h2>
+        <div class="modal__body">
+          <form id="scheduled-task-form" class="form" autocomplete="off">
+            <input type="hidden" name="task_id" id="task-id" />
+            <div class="form-field">
+              <label class="form-label" for="task-name-display">Automation name</label>
+              <input
+                class="form-input"
+                id="task-name-display"
+                type="text"
+                value=""
+                readonly
+                aria-readonly="true"
+                tabindex="-1"
+                data-initial-focus
+              />
+              <p class="form-help">Generated from the selected command for this company.</p>
+              <input type="hidden" id="task-name" name="name" />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="task-command">Command</label>
+              <select class="form-input" id="task-command" name="command" required>
+                {% for option in automation_command_options %}
+                  <option value="{{ option.value }}">{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="task-company-display">Company</label>
+              <input
+                class="form-input"
+                id="task-company-display"
+                type="text"
+                value="{{ (automation_company_options[0].label if automation_company_options else 'All companies') }}"
+                readonly
+                aria-readonly="true"
+                tabindex="-1"
+              />
+              <p class="form-help">Automations created here run only for this company.</p>
+              <input
+                type="hidden"
+                id="task-company"
+                name="companyId"
+                value="{{ (automation_company_options[0].value if automation_company_options else '') }}"
+                data-company-name="{{ (automation_company_options[0].label if automation_company_options else 'All companies') }}"
+                data-default-value="{{ (automation_company_options[0].value if automation_company_options else '') }}"
+                data-default-name="{{ (automation_company_options[0].label if automation_company_options else 'All companies') }}"
+              />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="task-cron">Cron expression</label>
+              <input
+                class="form-input"
+                id="task-cron"
+                name="cron"
+                required
+                placeholder="0 2 * * *"
+                pattern="^[^\s]+(\s+[^\s]+){4,5}$"
+              />
+              <p class="form-help">Crontab syntax in UTC. Use five fields for minute through weekday.</p>
+            </div>
+            <div class="form-field" id="task-description-field">
+              <label class="form-label" for="task-description">Description</label>
+              <textarea class="form-input form-input--textarea" id="task-description" name="description" rows="3"></textarea>
+              <p class="form-help" id="task-description-help">Optional description or notes about this automation.</p>
+            </div>
+            <div class="form-field" id="task-json-payload-field" style="display: none;">
+              <label class="form-label" for="task-json-payload">JSON Payload</label>
+              <textarea class="form-input form-input--textarea" id="task-json-payload" name="jsonPayload" rows="8" placeholder='{"subject": "Example ticket", "description": "Ticket details", "priority": "normal", "status": "open"}'></textarea>
+              <p class="form-help">JSON configuration for ticket creation. Required fields: subject. Optional: description, priority, status, category, requester_id, assigned_user_id.</p>
+            </div>
+            <div class="form-field form-field--inline">
+              <label class="form-label" for="task-max-retries">Max retries</label>
+              <input class="form-input" id="task-max-retries" name="maxRetries" type="number" min="0" value="12" />
+            </div>
+            <div class="form-field form-field--inline">
+              <label class="form-label" for="task-backoff">Retry backoff (seconds)</label>
+              <input class="form-input" id="task-backoff" name="retryBackoffSeconds" type="number" min="30" value="300" />
+            </div>
+            <div class="form-field form-field--checkbox">
+              <label class="form-checkbox">
+                <input type="checkbox" id="task-active" name="active" checked />
+                <span>Automation active</span>
+              </label>
+            </div>
+            <div class="form-field form-field--checkbox">
+              <label class="form-checkbox">
+                <input type="checkbox" id="task-exclude-calendar" name="excludeFromCalendar" />
+                <span>Hide from cron calendar</span>
+              </label>
+              <p class="form-help">Use for high-frequency jobs that would otherwise fill the calendar.</p>
+            </div>
+            <div class="form-actions">
+              <div class="form-actions__group">
+                <button type="submit" class="button">Save automation</button>
+                <button type="button" class="button button--ghost" data-task-reset>Clear form</button>
+              </div>
+              <button
+                type="button"
+                class="button button--danger"
+                data-task-delete-modal
+                hidden
+                aria-hidden="true"
+              >
+                Delete automation
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+    <div class="modal" id="task-logs-modal" role="dialog" aria-modal="true" hidden>
+      <div class="modal__content" role="document">
+        <button type="button" class="modal__close" data-modal-close>
+          <span class="visually-hidden">Close automation logs</span>
+        </button>
+        <h2 class="modal__title" id="task-logs-title">Automation run history</h2>
+        <div class="modal__body">
+          <p id="task-logs-description" class="modal__subtitle text-muted">
+            View the most recent executions for this automation. All timestamps are displayed in your local timezone.
+          </p>
+          <div class="modal__controls">
+            <input
+              type="search"
+              class="form-input"
+              placeholder="Filter runs"
+              aria-label="Filter automation runs"
+              data-table-filter="task-logs-table"
+            />
+          </div>
+          <div class="table-wrapper">
+            <table class="table" id="task-logs-table" data-table data-table-id="task-logs">
+              <thead>
+                <tr>
+                  <th scope="col" data-sort="string">Status</th>
+                  <th scope="col" data-sort="date">Started</th>
+                  <th scope="col" data-sort="date">Finished</th>
+                  <th scope="col" data-sort="number">Duration (ms)</th>
+                  <th scope="col" data-sort="string">Details</th>
+                </tr>
+              </thead>
+              <tbody id="task-logs-body">
+                <tr>
+                  <td colspan="5" class="table__empty" id="task-logs-empty">Select an automation to view its recent runs.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal" id="recurring-item-editor-modal" role="dialog" aria-modal="true" hidden>
+      <div class="modal__content" role="document">
+        <button type="button" class="modal__close" data-modal-close>
+          <span class="visually-hidden">Close recurring item editor</span>
+        </button>
+        <h2 class="modal__title">Recurring invoice item</h2>
+        <div class="modal__body">
+          <form id="recurring-item-form" class="form" autocomplete="off">
+            <input type="hidden" name="item_id" id="recurring-item-id" />
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-product-code">Product code</label>
+              <input
+                class="form-input"
+                id="recurring-item-product-code"
+                name="product_code"
+                type="text"
+                required
+                placeholder="LABOR-MANAGED-SERVICES"
+                data-initial-focus
+              />
+              <p class="form-help">The product code from your Xero account.</p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-description">Description template</label>
+              <textarea
+                class="form-input form-input--textarea"
+                id="recurring-item-description"
+                name="description_template"
+                rows="3"
+                required
+                placeholder="Monthly managed services for {company_name}"
+              ></textarea>
+              <p class="form-help">Supports variable substitution using {variable_name} syntax. See the usage notes below for all available variables.</p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-qty">Quantity expression</label>
+              <input
+                class="form-input"
+                id="recurring-item-qty"
+                name="qty_expression"
+                type="text"
+                required
+                placeholder="1"
+              />
+              <p class="form-help">
+                Static number (e.g., "5") or a variable wrapped in curly braces (e.g., "{active_agents}").
+                See the usage notes below for all available variables.
+              </p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-price">Price override (optional)</label>
+              <input
+                class="form-input"
+                id="recurring-item-price"
+                name="price_override"
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="Leave empty to use Xero default"
+              />
+              <p class="form-help">Override the price from Xero, or leave blank to use the default price.</p>
+            </div>
+
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-frequency">Billing limit</label>
+              <select class="form-input" id="recurring-item-frequency" name="billing_frequency">
+                <option value="every_run">Every automatic run</option>
+                <option value="once">Once only</option>
+                <option value="weekly">Once per week</option>
+                <option value="monthly">Once per month</option>
+                <option value="quarterly">Once per quarter</option>
+                <option value="yearly">Once per year</option>
+                <option value="times_per_year">X times per year</option>
+              </select>
+              <p class="form-help">Limits repeat billing when invoice generation runs frequently.</p>
+            </div>
+            <div class="form-field" id="recurring-item-interval-field" hidden>
+              <label class="form-label" for="recurring-item-interval">Times per year</label>
+              <input class="form-input" id="recurring-item-interval" name="billing_interval" type="number" min="1" max="365" placeholder="12" />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-start-date">Start date (optional)</label>
+              <input class="form-input" id="recurring-item-start-date" name="start_date" type="date" />
+              <p class="form-help">Stored and evaluated as a UTC date.</p>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="recurring-item-end-date">End date (optional)</label>
+              <input class="form-input" id="recurring-item-end-date" name="end_date" type="date" />
+            </div>
+            <div class="form-field form-field--checkbox">
+              <label class="checkbox">
+                <input type="checkbox" id="recurring-item-active" name="active" checked />
+                <span>Item active</span>
+              </label>
+            </div>
+            <div class="form-actions">
+              <div class="form-actions__group">
+                <button type="submit" class="button">Save item</button>
+                <button type="button" class="button button--ghost" data-recurring-item-reset>Clear form</button>
+                <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+              </div>
+              <button
+                type="button"
+                class="button button--danger"
+                data-recurring-item-delete-modal
+                hidden
+                aria-hidden="true"
+              >
+                Delete item
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal" id="user-permissions-modal" role="dialog" aria-modal="true" hidden>
+      <div class="modal__content modal__content--large" role="document">
+        <button type="button" class="modal__close" data-modal-close>
+          <span class="visually-hidden">Close user permissions editor</span>
+        </button>
+        <h2 class="modal__title" id="user-permissions-title">User Permissions</h2>
+        <p class="modal__subtitle" id="user-permissions-subtitle">
+          Select additional permissions for this user. These are cumulative with their role-based permissions.
+        </p>
+        <div class="modal__body">
+          <form id="user-permissions-form" class="form" autocomplete="off">
+            <input type="hidden" name="membership_id" id="user-permissions-membership-id" />
+            <input type="hidden" name="company_id" id="user-permissions-company-id" />
+            <input type="hidden" name="user_id" id="user-permissions-user-id" />
+            
+            <div class="form-field">
+              <label class="form-label">Role Permissions (from assigned role)</label>
+              <div id="user-permissions-role-list" class="permissions-display">
+                <p class="text-muted">Loading...</p>
+              </div>
+            </div>
+
+            <div class="form-field">
+              <label class="form-label">Additional User-Specific Permissions</label>
+              <div class="form-checkboxes permissions-grid" id="user-permissions-group" role="group">
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="company.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Company Management</span>
+                  <span class="permission-card__description">Configure company profiles, contact details, and operational settings</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="membership.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Membership Management</span>
+                  <span class="permission-card__description">Invite, approve, suspend, or reassign company members</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="billing.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Billing Management</span>
+                  <span class="permission-card__description">Access subscription, invoicing, and payment methods</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="audit.view" data-user-permission-checkbox />
+                  <span class="permission-card__title">Audit View</span>
+                  <span class="permission-card__description">Read-only visibility into security and activity audit trails</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="portal.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Portal Access</span>
+                  <span class="permission-card__description">Sign in and use the general portal experience</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="marketing.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Marketing Access</span>
+                  <span class="permission-card__description">Manage marketing pages and review submitted marketing contacts</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="licenses.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Manage Licenses</span>
+                  <span class="permission-card__description">Manage company licenses and subscriptions</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="licenses.order" data-user-permission-checkbox />
+                  <span class="permission-card__title">Order Licenses</span>
+                  <span class="permission-card__description">Place orders for new licenses</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="staff.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Manage Staff</span>
+                  <span class="permission-card__description">Manage company staff members</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="staff.request" data-user-permission-checkbox />
+                  <span class="permission-card__title">Request New User</span>
+                  <span class="permission-card__description">Submit new staff onboarding requests for approval</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="shop.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Shop Access</span>
+                  <span class="permission-card__description">Access the company shop</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="cart.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Cart Access</span>
+                  <span class="permission-card__description">Access and manage shopping cart</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="orders.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Orders Access</span>
+                  <span class="permission-card__description">View and manage company orders</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="forms.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Forms Access</span>
+                  <span class="permission-card__description">Access and submit company forms</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="assets.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Manage Assets</span>
+                  <span class="permission-card__description">Manage company assets and inventory</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="invoices.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Manage Invoices</span>
+                  <span class="permission-card__description">View and manage company invoices</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="office_groups.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Manage Office Groups</span>
+                  <span class="permission-card__description">Manage company office groups and locations</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="issues.manage" data-user-permission-checkbox />
+                  <span class="permission-card__title">Manage Issues</span>
+                  <span class="permission-card__description">Manage company issues and support tickets</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="company.admin" data-user-permission-checkbox />
+                  <span class="permission-card__title">Company Administrator</span>
+                  <span class="permission-card__description">Full administrative access to company resources</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="compliance.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Compliance Access</span>
+                  <span class="permission-card__description">Access to view and manage compliance requirements</span>
+                </label>
+                <label class="form-checkbox permission-card">
+                  <input type="checkbox" name="user_permission" value="continuity.access" data-user-permission-checkbox />
+                  <span class="permission-card__title">Continuity Access</span>
+                  <span class="permission-card__description">Access to view and manage business continuity plans</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" class="button">Save Permissions</button>
+              <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/admin.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/company_edit_sections.js') }}" defer></script>
+  {% if is_super_admin %}
+    <script src="{{ static_url('/static/js/action-payload-editor.js') }}" defer></script>
+    <script src="{{ static_url('/static/js/automation.js') }}" defer></script>
+    <script>
+      function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }
+
+      // Billing contacts management
+      document.addEventListener('DOMContentLoaded', function() {
+        const companyId = {{ company.id }};
+        const select = document.getElementById('billing-contact-select');
+        const list = document.getElementById('billing-contacts-list');
+        
+        if (!select || !list) return;
+        
+        // Handle adding billing contact
+        select.addEventListener('change', async function() {
+          const staffId = this.value;
+          if (!staffId) return;
+          
+          const option = this.options[this.selectedIndex];
+          const email = option.dataset.email || '';
+          const name = option.dataset.name || '';
+          
+          try {
+            const response = await fetch(`/admin/companies/${companyId}/billing-contacts/add`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': document.querySelector('input[name="_csrf"]')?.value || ''
+              },
+              body: JSON.stringify({ staff_id: staffId })
+            });
+            
+            if (response.ok) {
+              const data = await response.json();
+              addBillingContactToList(data.contact);
+              this.value = '';  // Reset select
+            } else {
+              const error = await response.json();
+              alert(error.detail || 'Failed to add billing contact');
+            }
+          } catch (err) {
+            console.error('Error adding billing contact:', err);
+            alert('Failed to add billing contact');
+          }
+        });
+        
+        // Handle removing billing contact
+        list.addEventListener('click', async function(e) {
+          const btn = e.target.closest('[data-billing-contact-remove]');
+          if (!btn) return;
+          
+          const staffId = btn.dataset.billingContactRemove;
+          const item = btn.closest('.billing-contact-item');
+          
+          try {
+            const response = await fetch(`/admin/companies/${companyId}/billing-contacts/${staffId}/remove`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': document.querySelector('input[name="_csrf"]')?.value || ''
+              }
+            });
+            
+            if (response.ok) {
+              item.remove();
+              // Show empty message if no contacts left
+              if (list.querySelectorAll('.billing-contact-item').length === 0) {
+                list.innerHTML = '<p class="text-muted" data-empty-message>No billing contacts configured yet.</p>';
+              }
+            } else {
+              alert('Failed to remove billing contact');
+            }
+          } catch (err) {
+            console.error('Error removing billing contact:', err);
+            alert('Failed to remove billing contact');
+          }
+        });
+        
+        function addBillingContactToList(contact) {
+          // Remove empty message if it exists
+          const emptyMsg = list.querySelector('[data-empty-message]');
+          if (emptyMsg) emptyMsg.remove();
+          
+          const fullName = [contact.first_name, contact.last_name].filter(Boolean).join(' ');
+          const item = document.createElement('div');
+          item.className = 'billing-contact-item';
+          item.dataset.staffId = contact.staff_id;
+          item.innerHTML = `
+            <div class="billing-contact-info">
+              <span class="billing-contact-email">${escapeHtml(contact.email)}</span>
+              ${fullName ? `<span class="billing-contact-name">${escapeHtml(fullName)}</span>` : ''}
+            </div>
+            <button 
+              type="button" 
+              class="button button--ghost button--small" 
+              data-billing-contact-remove="${contact.staff_id}"
+              title="Remove billing contact"
+            >
+              Remove
+            </button>
+          `;
+          list.appendChild(item);
+        }
+      });
+
+      // Toggle inactive tasks visibility
+      document.addEventListener('DOMContentLoaded', function() {
+        const toggleBtn = document.getElementById('toggle-inactive-tasks');
+        if (!toggleBtn) return;
+        
+        toggleBtn.addEventListener('click', function() {
+          const currentShowInactive = toggleBtn.dataset.showInactive === 'true';
+          const newShowInactive = !currentShowInactive;
+          
+          // Build the new URL with the show_inactive parameter
+          const url = new URL(window.location.href);
+          if (newShowInactive) {
+            url.searchParams.set('show_inactive', 'true');
+          } else {
+            url.searchParams.delete('show_inactive');
+          }
+          
+          // Navigate to the new URL
+          window.location.href = url.toString();
+        });
+      });
+
+      // User permissions modal management
+      document.addEventListener('DOMContentLoaded', function() {
+        const companyId = {{ company.id }};
+        const modal = document.getElementById('user-permissions-modal');
+        const form = document.getElementById('user-permissions-form');
+        const roleList = document.getElementById('user-permissions-role-list');
+        const titleEl = document.getElementById('user-permissions-title');
+        const subtitleEl = document.getElementById('user-permissions-subtitle');
+        
+        if (!modal || !form) return;
+
+        // Open permissions modal
+        document.addEventListener('click', async function(e) {
+          const btn = e.target.closest('[data-edit-user-permissions]');
+          if (!btn) return;
+
+          const membershipId = btn.dataset.membershipId;
+          const userId = btn.dataset.userId;
+          const userEmail = btn.dataset.userEmail || 'User';
+          const userName = btn.dataset.userName?.trim() || userEmail;
+
+          // Update modal title
+          titleEl.textContent = `Permissions for ${userName}`;
+          subtitleEl.textContent = `Manage permissions for ${userEmail}. User-specific permissions are cumulative with role-based permissions.`;
+
+          // Set form data
+          document.getElementById('user-permissions-membership-id').value = membershipId;
+          document.getElementById('user-permissions-company-id').value = companyId;
+          document.getElementById('user-permissions-user-id').value = userId;
+
+          try {
+            // Fetch membership details to get role permissions
+            const membershipResponse = await fetch(`/api/companies/${companyId}/memberships`, {
+              headers: {
+                'Authorization': `Bearer ${localStorage.getItem('auth_token') || ''}`
+              }
+            });
+            
+            if (!membershipResponse.ok) throw new Error('Failed to fetch memberships');
+            
+            const memberships = await membershipResponse.json();
+            const membership = memberships.find(m => m.id === parseInt(membershipId));
+            
+            if (membership) {
+              // Display role permissions (read-only)
+              const rolePermissions = membership.permissions || [];
+              if (rolePermissions.length > 0) {
+                roleList.innerHTML = '<div class="tag-list">' +
+                  rolePermissions.map(p => `<span class="tag tag--muted">${escapeHtml(p)}</span>`).join('') +
+                  '</div>';
+              } else {
+                roleList.innerHTML = '<p class="text-muted">No role permissions assigned</p>';
+              }
+            }
+
+            // Fetch and display current user permissions
+            const userPermsResponse = await fetch(
+              `/api/companies/${companyId}/memberships/${membershipId}/user-permissions`,
+              {
+                headers: {
+                  'Authorization': `Bearer ${localStorage.getItem('auth_token') || ''}`
+                }
+              }
+            );
+
+            if (!userPermsResponse.ok) throw new Error('Failed to fetch user permissions');
+            
+            const userPermissions = await userPermsResponse.json();
+            
+            // Clear all checkboxes
+            form.querySelectorAll('[data-user-permission-checkbox]').forEach(cb => {
+              cb.checked = false;
+            });
+
+            // Check boxes for current user permissions
+            userPermissions.forEach(perm => {
+              const checkbox = form.querySelector(`[data-user-permission-checkbox][value="${perm}"]`);
+              if (checkbox) checkbox.checked = true;
+            });
+
+            // Show modal
+            modal.hidden = false;
+            modal.setAttribute('aria-hidden', 'false');
+            
+          } catch (err) {
+            console.error('Error loading permissions:', err);
+            alert('Failed to load user permissions. Please try again.');
+          }
+        });
+
+        // Handle form submission
+        form.addEventListener('submit', async function(e) {
+          e.preventDefault();
+
+          const membershipId = document.getElementById('user-permissions-membership-id').value;
+          const checkedBoxes = form.querySelectorAll('[data-user-permission-checkbox]:checked');
+          const permissions = Array.from(checkedBoxes).map(cb => cb.value);
+
+          try {
+            const response = await fetch(
+              `/api/companies/${companyId}/memberships/${membershipId}/user-permissions`,
+              {
+                method: 'PUT',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${localStorage.getItem('auth_token') || ''}`,
+                  'X-CSRF-Token': document.querySelector('input[name="_csrf"]')?.value || ''
+                },
+                body: JSON.stringify({ permissions })
+              }
+            );
+
+            if (!response.ok) {
+              const error = await response.json();
+              throw new Error(error.detail || 'Failed to update permissions');
+            }
+
+            // Close modal
+            modal.hidden = true;
+            modal.setAttribute('aria-hidden', 'true');
+
+            // Show success message (optional - could add a toast notification)
+            alert('User permissions updated successfully!');
+            
+            // Optionally reload the page to reflect changes
+            window.location.reload();
+
+          } catch (err) {
+            console.error('Error saving permissions:', err);
+            alert(err.message || 'Failed to save user permissions. Please try again.');
+          }
+        });
+
+        // Handle modal close
+        modal.addEventListener('click', function(e) {
+          if (e.target.closest('[data-modal-close]') || e.target === modal) {
+            modal.hidden = true;
+            modal.setAttribute('aria-hidden', 'true');
+          }
+        });
+
+      });
+
+      // Shop item visibility
+      (function () {
+        const panel = document.getElementById('shop-visibility-panel');
+        const grid = document.getElementById('shop-visibility-grid');
+        const loadingMsg = document.getElementById('shop-visibility-loading');
+        const companyId = {{ company.id }};
+        let loaded = false;
+
+        if (!panel || !grid) return;
+
+        panel.addEventListener('toggle', async function () {
+          if (!panel.open || loaded) return;
+          loaded = true;
+
+          if (loadingMsg) loadingMsg.hidden = false;
+
+          try {
+            const response = await fetch(`/api/admin/companies/${companyId}/shop-items`);
+            if (!response.ok) throw new Error('Failed to load shop items');
+            const products = await response.json();
+
+            if (loadingMsg) loadingMsg.hidden = true;
+
+            if (!products.length) {
+              grid.innerHTML = '<p class="text-muted">No products are available.</p>';
+              return;
+            }
+
+            let currentCategory = null;
+            let html = '';
+            for (const product of products) {
+              const cat = product.category_name || 'Uncategorised';
+              if (cat !== currentCategory) {
+                if (currentCategory !== null) html += '</div>';
+                html += `<div class="visibility-grid__group"><h3 class="visibility-grid__group-label">${escapeHtml(cat)}</h3>`;
+                currentCategory = cat;
+              }
+              const checked = product.is_hidden ? ' checked' : '';
+              html += `<label class="checkbox visibility-grid__item">
+                <input type="checkbox" name="hidden" value="${product.id}"${checked} />
+                <span>${escapeHtml(product.name)}</span>
+                ${product.sku ? `<span class="text-muted visibility-grid__sku">${escapeHtml(product.sku)}</span>` : ''}
+              </label>`;
+            }
+            if (currentCategory !== null) html += '</div>';
+            grid.innerHTML = html;
+          } catch (err) {
+            if (loadingMsg) {
+              loadingMsg.textContent = 'Unable to load products. Please refresh and try again.';
+              loadingMsg.hidden = false;
+            }
+          }
+        });
+      })();
+    </script>
+  {% endif %}
+{% endblock %}

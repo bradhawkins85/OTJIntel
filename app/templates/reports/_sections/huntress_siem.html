@@ -1,0 +1,23 @@
+{% if module_enabled.get('huntress', false) %}
+{% from "macros/counters.html" import counter_strip %}
+<section class="card card--panel" data-report-section="huntress_siem">
+  <header class="card__header report-section__header">
+    <h2>Huntress Managed SIEM</h2>
+    <span class="report-section__meta">
+      {% if section.data.window_start and section.data.window_end %}
+        <span data-utc="{{ section.data.window_start }}">{{ section.data.window_start }}</span>
+        &nbsp;→&nbsp;
+        <span data-utc="{{ section.data.window_end }}">{{ section.data.window_end }}</span>
+      {% else %}
+        Trailing 30 days
+      {% endif %}
+    </span>
+  </header>
+  <div class="card__body">
+    {{ counter_strip(items=[
+      {'label': 'Logs collected (last 30 days)', 'value': section.data.data_collected_bytes_30d or 0, 'variant': 'info'}
+    ]) }}
+  </div>
+</section>
+
+{% endif %}

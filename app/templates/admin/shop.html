@@ -1,0 +1,624 @@
+{% extends "base.html" %}
+
+{% block extra_head %}
+  {{ super() }}
+  <link rel="stylesheet" href="{{ static_url('/static/css/suneditor.min.css') }}" />
+{% endblock %}
+
+{% block header_title %}
+  <div class="header-title-menu">
+    <span class="header-title-menu__label">Shop admin</span>
+    <details class="header-title-menu__dropdown" data-header-menu>
+      <summary class="header-title-menu__toggle" data-header-menu-toggle aria-haspopup="true">
+        Shop tools
+        <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" class="header-title-menu__icon">
+          <path d="M6.2 8.2a1 1 0 0 1 1.4 0L12 12.6l4.4-4.4a1 1 0 0 1 1.4 1.4l-5.1 5.1a1 1 0 0 1-1.4 0L6.2 9.6a1 1 0 0 1 0-1.4z" />
+        </svg>
+        <span class="visually-hidden">Toggle shop tools menu</span>
+      </summary>
+      <ul class="header-title-menu__list" role="menu">
+        <li class="header-title-menu__item" role="none">
+          <a href="/admin/shop/optional-accessories" class="header-title-menu__link" role="menuitem">Optional accessories</a>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <a href="/admin/shop/categories" class="header-title-menu__link" role="menuitem">Product categories</a>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <a href="/admin/shop/subscription-categories" class="header-title-menu__link" role="menuitem">Subscription categories</a>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <a href="/admin/shop/freight-rules" class="header-title-menu__link" role="menuitem">Freight rules</a>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <a href="/admin/shop/packages" class="header-title-menu__link" role="menuitem">Package admin</a>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <button type="button" class="header-title-menu__link" role="menuitem" data-create-product-modal-open>Add product</button>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <button type="button" class="header-title-menu__link" role="menuitem" data-create-subscription-modal-open>Add subscription</button>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <form
+            action="/shop/admin/products/bulk-refresh-descriptions"
+            method="post"
+            class="header-title-menu__form"
+            data-confirm="Refresh descriptions for all {{ 'active and archived' if show_archived else 'active' }} catalogue products (subscriptions excluded)? This may take several minutes."
+          >
+            {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+            {% if show_archived %}<input type="hidden" name="include_archived" value="1" />{% endif %}
+            <button type="submit" class="header-title-menu__link" role="menuitem">Bulk Refresh Descriptions</button>
+          </form>
+        </li>
+        <li class="header-title-menu__item" role="none">
+          <button
+            type="button"
+            class="header-title-menu__link"
+            role="menuitem"
+            data-import-product-modal-open
+            aria-haspopup="dialog"
+            aria-controls="import-product-modal"
+          >
+            Import product
+          </button>
+        </li>
+      </ul>
+    </details>
+  </div>
+{% endblock %}
+
+{% block content %}
+<div class="admin-grid">
+  <section class="card card--panel">
+    <header class="card__header card__header--stacked">
+      <div>
+        <h2 class="card__title">Product catalogue</h2>
+        <p class="card__subtitle">Filter, sort, and manage catalogue items with real-time previews.</p>
+      </div>
+      <div class="card__controls">
+        <input
+          type="search"
+          class="form-input card__control"
+          placeholder="Search products"
+          aria-label="Search products"
+          name="search"
+          value="{{ search_term }}"
+          data-admin-product-search
+        />
+        <select class="form-input card__control" id="stock-filter">
+          <option value="">All stock</option>
+          <option value="in">In stock</option>
+          <option value="out">Out of stock</option>
+        </select>
+        <select class="form-input card__control" id="category-filter">
+          <option value="">All categories</option>
+          {% for category in filter_categories %}
+            <option value="{{ category.id }}">{{ '— ' if category.parent_id else '' }}{{ category.name }}</option>
+          {% endfor %}
+        </select>
+        <label class="checkbox card__control">
+          <input type="checkbox" id="show-archived" {% if show_archived %}checked{% endif %} />
+          <span>Show archived</span>
+        </label>
+        <div class="dropdown card__control" id="columns-dropdown">
+          <button
+            type="button"
+            class="button button--ghost"
+            id="columns-toggle"
+            aria-haspopup="true"
+            aria-expanded="false"
+            aria-controls="columns-menu"
+          >
+            Columns
+          </button>
+          <div class="dropdown__menu columns-menu" id="columns-menu" role="menu">
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="image" checked /> Image
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="name" checked /> Name
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="sku" checked /> SKU
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="vendor-sku" checked /> Vendor SKU
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="dbp" checked /> DBP
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="price" checked /> Price
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="vip" checked /> VIP
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="profit" checked /> Profit
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="vip-profit" checked /> VIP Profit
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="category" checked /> Category
+            </label>
+            <label class="dropdown__item dropdown__item--checkbox">
+              <input type="checkbox" data-column-toggle="stock" checked /> Stock
+            </label>
+          </div>
+        </div>
+      </div>
+    </header>
+    <div class="table-wrapper">
+      <table class="table" id="admin-products-table" data-table data-table-id="products">
+        <thead>
+          <tr>
+            <th scope="col" data-column="image">Image</th>
+            <th scope="col" data-sort="string" data-column="name">Name</th>
+            <th scope="col" data-sort="string" data-column="sku">SKU</th>
+            <th scope="col" data-sort="string" data-column="vendor-sku">Vendor SKU</th>
+            <th scope="col" data-sort="number" data-column="dbp">DBP</th>
+            <th scope="col" data-sort="number" data-column="price">Price</th>
+            <th scope="col" data-sort="number" data-column="vip">VIP</th>
+            <th scope="col" data-sort="number" data-column="profit">Profit</th>
+            <th scope="col" data-sort="number" data-column="vip-profit">VIP Profit</th>
+            <th scope="col" data-sort="string" data-column="category">Category</th>
+            <th scope="col" data-sort="number" data-column="stock">Stock</th>
+            <th scope="col" class="table__actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for product in products %}
+            <tr data-product-id="{{ product.id }}" data-stock="{{ product.stock }}" data-archived="{{ 'true' if product.archived else 'false' }}" data-category="{{ product.category_id or '' }}">
+              <td data-label="Image" data-column="image">
+                {% if product.image_url %}
+                  <img src="{{ product.image_url }}" alt="" class="product-thumb" loading="lazy" />
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td data-label="Name" data-column="name">{{ product.name }}</td>
+              <td data-label="SKU" data-column="sku">{{ product.sku }}</td>
+              <td data-label="Vendor SKU" data-column="vendor-sku">
+                {{ product.vendor_sku }}
+                {% if product.duplicate_sku_import %}
+                  <span class="badge badge--warning" title="The latest stock feed import contained {{ product.duplicate_sku_count }} records for this vendor SKU. Review this item manually before updating from the feed.">Duplicate in feed</span>
+                {% endif %}
+              </td>
+              <td data-label="DBP" data-column="dbp" data-value="{{ product.buy_price if product.buy_price is not none else '' }}">
+                {% if product.buy_price is not none %}
+                  ${{ '%.2f'|format(product.buy_price) }}
+                  {% if product.dbp_trend == 'up' %}
+                    <span class="text-danger" title="Price increased in the last 30 days">&#9650;</span>
+                  {% elif product.dbp_trend == 'down' %}
+                    <span class="text-success" title="Price decreased in the last 30 days">&#9660;</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td data-label="Price" data-column="price" data-value="{{ product.price }}">
+                {% if product.price_below_threshold %}
+                  <span class="text-danger">${{ '%.2f'|format(product.price) }}</span>
+                {% else %}
+                  ${{ '%.2f'|format(product.price) }}
+                {% endif %}
+              </td>
+              <td data-label="VIP" data-column="vip" data-value="{{ product.vip_price if product.vip_price is not none else '' }}">
+                {% if product.vip_price is not none %}
+                  {% if product.vip_price_below_threshold %}
+                    <span class="text-danger">${{ '%.2f'|format(product.vip_price) }}</span>
+                  {% else %}
+                    ${{ '%.2f'|format(product.vip_price) }}
+                  {% endif %}
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td data-label="Profit" data-column="profit" data-value="{{ '%.4f'|format(product.profit) if product.profit is not none else '' }}">
+                {% if product.profit is not none %}
+                  {% if product.profit >= 0 %}
+                    <span class="text-success">${{ '%.2f'|format(product.profit) }}</span>
+                  {% else %}
+                    <span class="text-danger">-${{ '%.2f'|format(product.profit | abs) }}</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td data-label="VIP Profit" data-column="vip-profit" data-value="{{ '%.4f'|format(product.vip_profit) if product.vip_profit is not none else '' }}">
+                {% if product.vip_profit is not none %}
+                  {% if product.vip_profit >= 0 %}
+                    <span class="text-success">${{ '%.2f'|format(product.vip_profit) }}</span>
+                  {% else %}
+                    <span class="text-danger">-${{ '%.2f'|format(product.vip_profit | abs) }}</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td data-label="Category" data-column="category">{{ product.category_name or '—' }}</td>
+              <td data-label="Stock" data-column="stock" data-value="{{ product.stock }}">{{ product.stock }}</td>
+              <td class="table__actions">
+                {%- set row_menu_id = 'product-actions-menu-' ~ product.id -%}
+                <div class="header-menu" data-header-menu>
+                  <button type="button"
+                          class="button button--ghost button--small header-menu__button"
+                          data-header-menu-toggle
+                          aria-haspopup="menu"
+                          aria-expanded="false"
+                          aria-controls="{{ row_menu_id }}">
+                    <span>Actions</span>
+                    <svg class="header-menu__chevron" aria-hidden="true" viewBox="0 0 20 20" width="14" height="14">
+                      <path fill="currentColor" d="M5.5 7.5 10 12l4.5-4.5z" />
+                    </svg>
+                  </button>
+                  <div id="{{ row_menu_id }}"
+                       class="header-menu__panel"
+                       role="menu"
+                       data-header-menu-panel
+                       hidden>
+                    <button type="button" class="header-menu__item" role="menuitem" data-product-edit="{{ product.id }}">Edit</button>
+                    <button type="button" class="header-menu__item" role="menuitem" data-product-visibility="{{ product.id }}">Visibility</button>
+                    <button type="button" class="header-menu__item" role="menuitem" data-product-featured="{{ product.id }}">Feature product</button>
+                    <button type="button" class="header-menu__item" role="menuitem" data-product-price-history="{{ product.id }}" data-product-sku="{{ product.vendor_sku or product.sku }}">Price History</button>
+                    <form action="/shop/admin/product/{{ product.id }}/refresh-description" method="post" class="header-menu__form">
+                      {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+                      <button type="submit" class="header-menu__item" role="menuitem">Refresh description</button>
+                    </form>
+                    <form action="/shop/admin/product/{{ product.id }}/{{ 'unarchive' if product.archived else 'archive' }}" method="post" class="header-menu__form">
+                      {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+                      <button type="submit" class="header-menu__item" role="menuitem">{{ 'Unarchive' if product.archived else 'Archive' }}</button>
+                    </form>
+                    <form action="/shop/admin/product/{{ product.id }}/delete" method="post" class="header-menu__form" data-confirm="Delete this product?" onsubmit="return confirm('Delete this product?');">
+                      {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+                      <button type="submit" class="header-menu__item header-menu__item--danger" role="menuitem">Delete</button>
+                    </form>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="12" class="table__empty">No products found.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if total_count > 0 %}
+      <p class="table-pagination__status" aria-live="polite">Showing all {{ total_count }} products.</p>
+    {% endif %}
+  </section>
+</div>
+
+<div class="modal" id="create-product-modal" role="dialog" aria-modal="true" aria-labelledby="create-product-title" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close><span class="visually-hidden">Close product form</span>&times;</button>
+    <h2 class="modal__title" id="create-product-title">Add product</h2>
+    <p class="modal__subtitle">Create a stocked catalogue product.</p>
+    <form action="/shop/admin/product" method="post" enctype="multipart/form-data" class="subscription-edit-form">
+      {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+
+      <section class="subscription-form-section" aria-labelledby="create-product-details-heading">
+        <h3 id="create-product-details-heading" class="form-section-title">Basic details</h3>
+        <div class="product-basic-grid">
+          <div class="form-field form-field--full"><label class="form-label" for="create-product-name">Name <span aria-hidden="true">*</span></label><input class="form-input" id="create-product-name" name="name" required aria-required="true" /></div>
+          <div class="form-field"><label class="form-label" for="create-product-category">Category <span class="field-optional">(optional)</span></label><select class="form-input" id="create-product-category" name="category_id"><option value="">No category</option>{% for category in categories %}<option value="{{ category.id }}">{{ '└─ ' if category.parent_id else '' }}{{ category.name }}</option>{% endfor %}</select></div>
+          <div class="form-field"><label class="form-label" for="create-product-sku">SKU <span aria-hidden="true">*</span></label><input class="form-input" id="create-product-sku" name="sku" required aria-required="true" /></div>
+          <div class="form-field"><label class="form-label" for="create-product-vendor-sku">Vendor SKU <span aria-hidden="true">*</span></label><input class="form-input" id="create-product-vendor-sku" name="vendor_sku" required aria-required="true" /></div>
+          <div class="form-field form-field--link"><label class="form-label" for="create-product-product-link">Product link <span class="field-optional">(optional)</span></label><input class="form-input" id="create-product-product-link" name="product_link" type="url" placeholder="https://example.com/product" aria-describedby="create-product-link-help" /><p class="form-helper" id="create-product-link-help">Vendor or product page URL shown on PDF quotes.</p></div>
+        </div>
+      </section>
+
+      <section class="subscription-form-section" aria-labelledby="create-product-content-heading">
+        <h3 id="create-product-content-heading" class="form-section-title">Product content</h3>
+        <div class="product-content-grid">
+          <div class="product-content-copy"><div class="form-field description-field"><label class="form-label" for="create-product-description">Description <span class="field-optional">(optional)</span></label><textarea class="form-input form-input--textarea" id="create-product-description" name="description" rows="10"></textarea></div></div>
+          <div class="form-field image-upload-field"><label class="form-label" for="create-product-image">Product image <span class="field-optional">(optional)</span></label><div class="image-upload-actions"><input class="form-input" id="create-product-image" name="image" type="file" accept="image/*" /></div></div>
+        </div>
+      </section>
+
+      <section class="subscription-form-section" aria-labelledby="create-product-pricing-heading">
+        <h3 id="create-product-pricing-heading" class="form-section-title">Pricing and inventory</h3>
+        <div class="product-pricing-grid">
+          <div class="form-field"><label class="form-label" for="create-product-price">Price <span aria-hidden="true">*</span></label><div class="input-with-unit"><span aria-hidden="true">$</span><input class="form-input" id="create-product-price" name="price" type="number" min="0" step="0.01" required /></div></div>
+          <div class="form-field"><label class="form-label" for="create-product-vip">VIP price <span class="field-optional">(optional)</span></label><div class="input-with-unit"><span aria-hidden="true">$</span><input class="form-input" id="create-product-vip" name="vip_price" type="number" min="0" step="0.01" /></div></div>
+          <div class="form-field"><label class="form-label" for="create-product-stock">Stock quantity <span aria-hidden="true">*</span></label><input class="form-input" id="create-product-stock" name="stock" type="number" min="0" step="1" value="0" required aria-describedby="create-product-stock-help" /><p class="form-helper" id="create-product-stock-help">The number of physical units available.</p></div>
+        </div>
+      </section>
+
+      <details class="subscription-form-section form-section-collapsible" aria-labelledby="create-product-related-heading"><summary><h3 id="create-product-related-heading" class="form-section-title">Product recommendations</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div class="related-products-grid">
+        {% for relation, label, help in [('cross-sell', 'Cross-sell products', 'Complementary products suggested at checkout.'), ('upsell', 'Up-sell products', 'Upgrade options suggested at checkout.')] %}
+          <div class="related-product-group"><label class="form-label" for="create-product-{{ relation }}-sku">{{ label }}</label><div class="form-quick-add"><input class="form-input form-input--inline" id="create-product-{{ relation }}-sku" type="search" placeholder="Search products by name or SKU" autocomplete="off" data-sku-lookup="true" /><button type="button" class="button button--small button--secondary" data-create-relation="{{ relation }}" data-prefix="create-product">Add</button></div><p id="create-product-{{ relation }}-error" class="form-help form-help--error" hidden></p><ul class="tag-list" id="create-product-{{ relation }}-list" aria-label="{{ label }}"></ul><p class="form-helper">{{ help }}</p></div>
+        {% endfor %}
+      </div></details>
+
+      <details class="subscription-form-section form-section-collapsible" aria-labelledby="create-product-features-heading"><summary><h3 id="create-product-features-heading" class="form-section-title">Features</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div data-create-features="create-product"><div class="features-toolbar"><span></span><button type="button" class="button" data-add-create-feature>Add feature</button></div><div class="table-wrapper"><table class="table features-table"><thead><tr><th>Feature</th><th>Value</th><th class="table__actions">Actions</th></tr></thead><tbody><tr data-empty-feature><td colspan="3">No features added yet.</td></tr></tbody></table></div><input type="hidden" name="features" value="[]" data-create-features-data /></div></details>
+
+      <div class="subscription-form-actions"><button type="button" class="button button--ghost" data-modal-close>Cancel</button><button type="submit" class="button">Add product</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="create-subscription-modal" role="dialog" aria-modal="true" aria-labelledby="create-subscription-title" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close><span class="visually-hidden">Close subscription form</span>&times;</button>
+    <h2 class="modal__title" id="create-subscription-title">Add subscription</h2>
+    <p class="modal__subtitle">Create a non-stocked subscription with one or more billing options.</p>
+    <form action="/shop/admin/product" method="post" enctype="multipart/form-data" class="subscription-edit-form">
+      {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+      <input type="hidden" name="price" value="0" /><input type="hidden" name="stock" value="1" />
+
+      <section class="subscription-form-section" aria-labelledby="create-subscription-details-heading">
+        <h3 id="create-subscription-details-heading" class="form-section-title">Basic details</h3>
+        <div class="product-basic-grid">
+          <div class="form-field form-field--full"><label class="form-label" for="create-subscription-name">Name <span aria-hidden="true">*</span></label><input class="form-input" id="create-subscription-name" name="name" required aria-required="true" /></div>
+          <div class="form-field"><label class="form-label" for="create-subscription-sku">SKU <span aria-hidden="true">*</span></label><input class="form-input" id="create-subscription-sku" name="sku" required aria-required="true" /></div>
+          <div class="form-field"><label class="form-label" for="create-subscription-vendor-sku">Vendor SKU <span aria-hidden="true">*</span></label><input class="form-input" id="create-subscription-vendor-sku" name="vendor_sku" required aria-required="true" /></div>
+          <div class="form-field form-field--link"><label class="form-label" for="create-subscription-product-link">Product link <span class="field-optional">(optional)</span></label><input class="form-input" id="create-subscription-product-link" name="product_link" type="url" placeholder="https://example.com/product" aria-describedby="create-subscription-product-link-help" /><p class="form-helper" id="create-subscription-product-link-help">Vendor or product page URL shown on PDF quotes.</p></div>
+        </div>
+      </section>
+
+      <section class="subscription-form-section" aria-labelledby="create-subscription-content-heading">
+        <h3 id="create-subscription-content-heading" class="form-section-title">Product content</h3>
+        <div class="product-content-grid">
+          <div class="product-content-copy">
+            <div class="form-field description-field"><label class="form-label" for="create-subscription-description">Description <span class="field-optional">(optional)</span></label><textarea class="form-input form-input--textarea" id="create-subscription-description" name="description" rows="10"></textarea></div>
+            <div class="form-field"><label class="form-label" for="create-subscription-invoice-description">Invoice description <span class="field-optional">(optional)</span></label><textarea class="form-input form-input--textarea" id="create-subscription-invoice-description" name="invoice_description" rows="4" aria-describedby="create-subscription-invoice-help"></textarea><p class="form-helper" id="create-subscription-invoice-help">Used on invoices. When blank, the product name is used.</p></div>
+          </div>
+          <div class="form-field image-upload-field"><label class="form-label" for="create-subscription-image">Product image <span class="field-optional">(optional)</span></label><div class="image-upload-actions"><input class="form-input" id="create-subscription-image" name="image" type="file" accept="image/*" /></div></div>
+        </div>
+      </section>
+
+      <section class="subscription-form-section subscription-settings-section" aria-labelledby="create-subscription-settings-heading">
+        <h3 id="create-subscription-settings-heading" class="form-section-title">Subscription settings</h3>
+        <div class="subscription-form-grid">
+          <div class="form-field"><label class="form-label" for="create-subscription-category">Subscription category <span aria-hidden="true">*</span></label><select class="form-input" id="create-subscription-category" name="subscription_category_id" required aria-required="true" aria-describedby="create-subscription-category-help"><option value="">Choose a subscription category</option>{% for category in subscription_categories %}<option value="{{ category.id }}">{{ category.name }}</option>{% endfor %}</select><p class="form-helper" id="create-subscription-category-help">Subscriptions in the same category can co-term together.</p></div>
+          <div class="form-field"><label class="form-label" for="create-subscription-calls">Voice Monitor calls per day</label><div class="input-with-unit"><input class="form-input" id="create-subscription-calls" name="voice_monitor_calls_per_day" type="number" min="1" max="24" step="1" aria-describedby="create-subscription-calls-help" /><span>calls/day</span></div><p class="form-helper" id="create-subscription-calls-help">Required only for Voice Monitor plans.</p></div>
+        </div>
+        <div class="subscription-form-grid subscription-price-grid">
+          <div class="form-field"><label class="form-label" for="create-subscription-monthly">Monthly commitment — monthly payment</label><div class="input-with-unit"><span>$</span><input class="form-input" id="create-subscription-monthly" name="price_monthly_commitment" type="number" min="0" step="0.01" /><span>/month</span></div></div>
+          <div class="form-field"><label class="form-label" for="create-subscription-annual-monthly">Annual commitment — monthly payment</label><div class="input-with-unit"><span>$</span><input class="form-input" id="create-subscription-annual-monthly" name="price_annual_monthly_payment" type="number" min="0" step="0.01" /><span>/month</span></div></div>
+          <div class="form-field"><label class="form-label" for="create-subscription-annual">Annual commitment — annual payment</label><div class="input-with-unit"><span>$</span><input class="form-input" id="create-subscription-annual" name="price_annual_annual_payment" type="number" min="0" step="0.01" /><span>/year</span></div></div>
+        </div>
+      </section>
+
+      <details class="subscription-form-section form-section-collapsible" aria-labelledby="create-subscription-related-heading"><summary><h3 id="create-subscription-related-heading" class="form-section-title">Product recommendations</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div class="related-products-grid">
+        {% for relation, label, help in [('cross-sell', 'Cross-sell products', 'Complementary products suggested at checkout.'), ('upsell', 'Up-sell products', 'Upgrade options suggested at checkout.')] %}
+          <div class="related-product-group"><label class="form-label" for="create-subscription-{{ relation }}-sku">{{ label }}</label><div class="form-quick-add"><input class="form-input form-input--inline" id="create-subscription-{{ relation }}-sku" type="text" placeholder="Enter product SKU" autocomplete="off" data-sku-lookup="true" /><button type="button" class="button button--small button--secondary" data-create-relation="{{ relation }}" data-prefix="create-subscription">Add</button></div><p id="create-subscription-{{ relation }}-error" class="form-help form-help--error" hidden></p><ul class="tag-list" id="create-subscription-{{ relation }}-list" aria-label="{{ label }}"></ul><p class="form-helper">{{ help }}</p></div>
+        {% endfor %}
+      </div></details>
+
+      <details class="subscription-form-section form-section-collapsible" aria-labelledby="create-subscription-features-heading"><summary><h3 id="create-subscription-features-heading" class="form-section-title">Features</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div data-create-features="create-subscription"><div class="features-toolbar"><span></span><button type="button" class="button" data-add-create-feature>Add feature</button></div><div class="table-wrapper"><table class="table features-table"><thead><tr><th>Feature</th><th>Value</th><th class="table__actions">Actions</th></tr></thead><tbody><tr data-empty-feature><td colspan="3">No features added yet.</td></tr></tbody></table></div><input type="hidden" name="features" value="[]" data-create-features-data /></div></details>
+
+      <div class="subscription-form-actions"><button type="button" class="button button--ghost" data-modal-close>Cancel</button><button type="submit" class="button">Add subscription</button></div>
+    </form>
+  </div>
+</div>
+
+<div
+  class="modal"
+  id="import-product-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="import-product-modal-title"
+  hidden
+>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close product import</span>
+      &times;
+    </button>
+    <h2 class="modal__title" id="import-product-modal-title">Import product</h2>
+    <p class="modal__subtitle">Pull catalogue data from upstream vendors via their SKU.</p>
+    <form action="/shop/admin/product/import" method="post" class="form-grid">
+      {% if csrf_token %}
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+      {% endif %}
+      <div class="form-field">
+        <label class="form-label" for="import-vendor-sku">Vendor SKU</label>
+        <input class="form-input" id="import-vendor-sku" name="vendor_sku" required />
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="button">Import</button>
+        <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="product-edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-product-title" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close product editor</span>
+      &times;
+    </button>
+    <h2 class="modal__title" id="edit-product-title">Edit product</h2>
+    <p class="modal__subtitle" id="edit-product-subtitle">Update this catalogue product.</p>
+    <p class="form-helper" id="edit-product-loading-status" hidden>Loading product details…</p>
+    <form id="product-edit-form" method="post" enctype="multipart/form-data" class="subscription-edit-form">
+      {% if csrf_token %}<input type="hidden" name="_csrf" value="{{ csrf_token }}" />{% endif %}
+      <input type="hidden" id="edit-product-id" />
+
+      <section class="subscription-form-section" aria-labelledby="edit-product-details-heading">
+        <h3 id="edit-product-details-heading" class="form-section-title">Basic details</h3>
+        <div class="product-basic-grid">
+          <div class="form-field form-field--full"><label class="form-label" for="edit-product-name">Name <span aria-hidden="true">*</span></label><input class="form-input" id="edit-product-name" name="name" required aria-required="true" /></div>
+          <div class="form-field"><label class="form-label" for="edit-product-category">Category <span class="field-optional">(optional)</span></label><select class="form-input" id="edit-product-category" name="category_id"><option value="">No category</option>{% for category in categories %}<option value="{{ category.id }}">{% if category.parent_id %}└─ {% endif %}{{ category.name }}</option>{% endfor %}</select></div>
+          <div class="form-field"><label class="form-label" for="edit-product-sku">SKU <span aria-hidden="true">*</span></label><input class="form-input" id="edit-product-sku" name="sku" required aria-required="true" /></div>
+          <div class="form-field"><label class="form-label" for="edit-product-vendor">Vendor SKU <span aria-hidden="true">*</span></label><input class="form-input" id="edit-product-vendor" name="vendor_sku" required aria-required="true" /></div>
+          <div class="form-field form-field--link"><label class="form-label" for="edit-product-link">Product link <span class="field-optional">(optional)</span></label><input class="form-input" id="edit-product-link" name="product_link" type="url" placeholder="https://example.com/product" aria-describedby="edit-product-link-help" /><p class="form-helper" id="edit-product-link-help">Vendor or product page URL shown on PDF quotes.</p></div>
+        </div>
+      </section>
+
+      <section class="subscription-form-section" aria-labelledby="edit-content-heading">
+        <h3 id="edit-content-heading" class="form-section-title">Product content</h3>
+        <div class="product-content-grid">
+          <div class="product-content-copy">
+            <div class="form-field description-field"><div class="form-label-row"><label class="form-label" for="edit-product-description">Description <span class="field-optional">(optional)</span></label><button type="button" class="button button--ghost button--small" id="edit-description-expand">Expand editor</button></div><textarea class="form-input form-input--textarea" id="edit-product-description" name="description" rows="10"></textarea></div>
+            <div class="form-field" id="edit-product-invoice-description-field" hidden><label class="form-label" for="edit-product-invoice-description">Invoice description <span class="field-optional">(optional)</span></label><textarea class="form-input form-input--textarea" id="edit-product-invoice-description" name="invoice_description" rows="4" aria-describedby="edit-invoice-help"></textarea><p class="form-helper" id="edit-invoice-help">Used on invoices. When blank, the product name is used.</p></div>
+          </div>
+          <div class="form-field image-upload-field"><span class="form-label">Product image <span class="field-optional">(optional)</span></span><div id="edit-product-image-preview" class="image-upload-preview" hidden><img alt="Current product image preview" /></div><div class="image-upload-actions"><label class="button button--small button--secondary" for="edit-product-image">Replace image</label><input class="visually-hidden" id="edit-product-image" name="image" type="file" accept="image/*" aria-describedby="edit-product-image-filename" /><label class="button button--small button--ghost" id="edit-product-remove-image-option" hidden><input type="checkbox" name="remove_image" value="true" id="edit-product-remove-image" /> Remove image</label></div><p class="visually-hidden" id="edit-product-image-filename" hidden></p></div>
+        </div>
+      </section>
+
+      <section class="subscription-form-section" aria-labelledby="edit-pricing-heading">
+        <h3 id="edit-pricing-heading" class="form-section-title">Pricing and inventory</h3>
+        <div class="product-pricing-grid">
+          <div class="form-field" data-field-type="standard-price"><label class="form-label" for="edit-product-price">Price <span aria-hidden="true">*</span></label><div class="input-with-unit"><span aria-hidden="true">$</span><input class="form-input" id="edit-product-price" name="price" type="number" min="0" step="0.01" required /></div></div>
+          <div class="form-field" data-field-type="standard-price"><label class="form-label" for="edit-product-vip">VIP price <span class="field-optional">(optional)</span></label><div class="input-with-unit"><span aria-hidden="true">$</span><input class="form-input" id="edit-product-vip" name="vip_price" type="number" min="0" step="0.01" /></div></div>
+          <div class="form-field"><label class="form-label" id="edit-product-stock-label" for="edit-product-stock">Stock quantity <span aria-hidden="true">*</span></label><select class="form-input" id="edit-product-availability" disabled hidden><option value="1">Available</option><option value="0">Unavailable</option></select><input class="form-input" id="edit-product-stock" name="stock" type="number" min="0" step="1" required aria-describedby="edit-product-stock-help" /><p class="form-helper" id="edit-product-stock-help">The number of physical units available.</p></div>
+        </div>
+        <details class="form-collapsible price-schedule"><summary class="form-collapsible__summary"><span class="form-collapsible__title">Schedule price change</span><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div class="form-collapsible__content subscription-form-grid">
+          <div class="form-field"><label class="form-label" for="edit-product-scheduled-price">New price</label><div class="input-with-unit"><span>$</span><input class="form-input" id="edit-product-scheduled-price" name="scheduled_price" type="number" min="0" step="0.01" /></div></div>
+          <div class="form-field"><label class="form-label" for="edit-product-scheduled-vip-price">New VIP price <span class="field-optional">(optional)</span></label><div class="input-with-unit"><span>$</span><input class="form-input" id="edit-product-scheduled-vip-price" name="scheduled_vip_price" type="number" min="0" step="0.01" /></div></div>
+          <div class="form-field"><label class="form-label" for="edit-product-scheduled-buy-price">New buy price</label><div class="input-with-unit"><span>$</span><input class="form-input" id="edit-product-scheduled-buy-price" name="scheduled_buy_price" type="number" min="0" step="0.01" /></div></div>
+          <div class="form-field"><label class="form-label" for="edit-product-price-change-date">Effective date</label><input class="form-input" id="edit-product-price-change-date" name="price_change_date" type="date" /></div>
+        </div></details>
+      </section>
+
+      <section class="subscription-form-section subscription-settings-section" aria-labelledby="edit-subscription-heading">
+        <h3 id="edit-subscription-heading" class="form-section-title">Subscription settings</h3>
+        <div class="subscription-form-grid">
+          <div class="form-field"><label class="form-label" for="edit-product-subscription-category">Subscription category <span class="field-optional">(optional)</span></label><select class="form-input" id="edit-product-subscription-category" name="subscription_category_id" aria-describedby="edit-sub-category-help"><option value="">No subscription category</option>{% for sub_category in subscription_categories %}<option value="{{ sub_category.id }}">{{ sub_category.name }}</option>{% endfor %}</select><p class="form-helper" id="edit-sub-category-help">Subscriptions in the same category can co-term together.</p></div>
+          <div class="form-field" data-field-type="subscription"><label class="form-label" for="edit-product-voice-monitor-calls-per-day">Voice Monitor calls per day</label><div class="input-with-unit"><input class="form-input" id="edit-product-voice-monitor-calls-per-day" name="voice_monitor_calls_per_day" type="number" min="1" max="24" step="1" aria-describedby="edit-voice-help" /><span>calls/day</span></div><p class="form-helper" id="edit-voice-help">Required only for Voice Monitor plans.</p></div>
+        </div>
+        <div class="subscription-form-grid subscription-price-grid">
+          <div class="form-field" data-field-type="subscription"><label class="form-label" for="edit-product-price-monthly-commitment">Monthly commitment — monthly payment</label><div class="input-with-unit"><span>$</span><input class="form-input" id="edit-product-price-monthly-commitment" name="price_monthly_commitment" type="number" min="0" step="0.01" /><span>/month</span></div></div>
+          <div class="form-field" data-field-type="subscription"><label class="form-label" for="edit-product-price-annual-monthly">Annual commitment — monthly payment</label><div class="input-with-unit"><span>$</span><input class="form-input" id="edit-product-price-annual-monthly" name="price_annual_monthly_payment" type="number" min="0" step="0.01" /><span>/month</span></div></div>
+          <div class="form-field" data-field-type="subscription"><label class="form-label" for="edit-product-price-annual-annual">Annual commitment — annual payment</label><div class="input-with-unit"><span>$</span><input class="form-input" id="edit-product-price-annual-annual" name="price_annual_annual_payment" type="number" min="0" step="0.01" /><span>/year</span></div></div>
+        </div>
+      </section>
+
+      <details class="subscription-form-section form-section-collapsible" aria-labelledby="edit-related-heading"><summary><h3 id="edit-related-heading" class="form-section-title">Product recommendations</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div class="related-products-grid">
+        <div class="related-product-group"><label class="form-label" for="edit-product-cross-sell-sku">Cross-sell products</label><div class="form-quick-add"><input type="search" class="form-input form-input--inline" id="edit-product-cross-sell-sku" placeholder="Search products by name or SKU" autocomplete="off" data-sku-lookup="true" aria-describedby="edit-cross-help edit-cross-sell-error" /><button type="button" class="button button--small button--secondary" data-sku-add="cross-sell" data-form="edit">Add</button></div><p id="edit-cross-sell-error" class="form-help form-help--error" hidden></p><ul class="tag-list" id="edit-product-cross-sell-list" aria-label="Added cross-sell products"></ul><p class="form-helper" id="edit-cross-help">Complementary products suggested at checkout.</p></div>
+        <div class="related-product-group"><label class="form-label" for="edit-product-upsell-sku">Up-sell products</label><div class="form-quick-add"><input type="search" class="form-input form-input--inline" id="edit-product-upsell-sku" placeholder="Search products by name or SKU" autocomplete="off" data-sku-lookup="true" aria-describedby="edit-upsell-help edit-upsell-error" /><button type="button" class="button button--small button--secondary" data-sku-add="upsell" data-form="edit">Add</button></div><p id="edit-upsell-error" class="form-help form-help--error" hidden></p><ul class="tag-list" id="edit-product-upsell-list" aria-label="Added up-sell products"></ul><p class="form-helper" id="edit-upsell-help">Upgrade options suggested at checkout.</p></div>
+      </div></details>
+
+      <details class="subscription-form-section form-section-collapsible" open aria-labelledby="edit-linked-heading"><summary><h3 id="edit-linked-heading" class="form-section-title">Linked to</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><p class="form-helper">Products that currently link to this item. Remove an incorrect link here without opening the source product.</p><div class="related-products-grid">
+        <div class="related-product-group"><span class="form-label">Cross-sell for</span><ul class="tag-list" id="edit-product-linked-cross-sell-list" aria-label="Products linked to this item as a cross-sell"></ul><p class="form-helper" id="edit-linked-cross-sell-empty">This item is not linked as a cross-sell.</p></div>
+        <div class="related-product-group"><span class="form-label">Up-sell for</span><ul class="tag-list" id="edit-product-linked-upsell-list" aria-label="Products linked to this item as an up-sell"></ul><p class="form-helper" id="edit-linked-upsell-empty">This item is not linked as an up-sell.</p></div>
+      </div></details>
+
+      <details class="subscription-form-section form-section-collapsible" aria-labelledby="edit-features-heading"><summary><h3 id="edit-features-heading" class="form-section-title">Features</h3><span class="form-collapsible__icon" aria-hidden="true"></span></summary><div class="features-toolbar"><label class="visually-hidden" for="edit-product-features-filter">Filter features</label><input type="search" class="form-input" id="edit-product-features-filter" placeholder="Search features" data-table-filter="edit-product-features-table" /><button type="button" class="button" id="add-product-feature">Add feature</button></div><div class="table-wrapper"><table class="table features-table" id="edit-product-features-table" data-table data-table-id="edit-product-features"><thead><tr><th scope="col" data-sort="string">Feature</th><th scope="col" data-sort="string">Value</th><th scope="col" class="table__actions">Actions</th></tr></thead><tbody></tbody></table></div><input type="hidden" name="features" id="edit-product-features-data" value="[]" /></details>
+
+      <div class="subscription-form-actions"><button type="button" class="button button--ghost" data-modal-close>Cancel</button><button type="submit" class="button" id="edit-product-submit">Save subscription</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="product-featured-modal" role="dialog" aria-modal="true" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close featured product modal</span>
+      &times;
+    </button>
+    <h2 class="modal__title">Feature product</h2>
+    <p class="modal__subtitle">Tick a company to show this item in that company's featured products section when the store section is enabled.</p>
+    <p class="form-helper" id="product-featured-loading-status" hidden>Loading featured product settings…</p>
+    <form id="product-featured-form" method="post" class="form-grid">
+      {% if csrf_token %}
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+      {% endif %}
+      <div class="visibility-grid">
+        {% for company in all_companies %}
+          <label class="checkbox visibility-grid__item">
+            <input type="checkbox" name="featured" value="{{ company.id }}" />
+            <span>{{ company.name }}</span>
+          </label>
+        {% endfor %}
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="button">Save featured companies</button>
+        <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{# The editor content is moved into this dedicated shell for subscriptions. #}
+<div class="modal" id="subscription-edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-product-title" hidden></div>
+
+<div class="modal" id="product-visibility-modal" role="dialog" aria-modal="true" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close visibility modal</span>
+      &times;
+    </button>
+    <h2 class="modal__title">Product visibility</h2>
+    <p class="modal__subtitle">Items are visible to all companies by default. Tick a company to hide this item from their store.</p>
+    <p class="form-helper" id="product-visibility-loading-status" hidden>Loading visibility restrictions…</p>
+    <form id="product-visibility-form" method="post" class="form-grid">
+      {% if csrf_token %}
+      <input type="hidden" name="_csrf" value="{{ csrf_token }}" />
+      {% endif %}
+      <div class="visibility-grid">
+        {% for company in all_companies %}
+          <label class="checkbox visibility-grid__item">
+            <input type="checkbox" name="excluded" value="{{ company.id }}" />
+            <span>{{ company.name }}</span>
+          </label>
+        {% endfor %}
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="button">Save visibility</button>
+        <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<datalist id="shop-product-sku-suggestions"></datalist>
+
+<div class="modal" id="description-editor-modal" role="dialog" aria-modal="true" hidden>
+  <div class="modal__content modal__content--large" role="document">
+    <button type="button" class="modal__close" id="description-editor-close">
+      <span class="visually-hidden">Close description editor</span>
+      &times;
+    </button>
+    <h2 class="modal__title">Edit description</h2>
+    <textarea id="description-editor-field"></textarea>
+    <div class="form-actions">
+      <button type="button" class="button" id="description-editor-apply">Apply</button>
+      <button type="button" class="button button--ghost" id="description-editor-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="price-history-modal" role="dialog" aria-modal="true" aria-labelledby="price-history-modal-title" hidden>
+  <div class="modal__content" role="document">
+    <button type="button" class="modal__close" data-modal-close>
+      <span class="visually-hidden">Close price history</span>
+      &times;
+    </button>
+    <h2 class="modal__title" id="price-history-modal-title">DBP Price History</h2>
+    <p class="form-helper" id="price-history-sku-label"></p>
+    <p class="form-helper" id="price-history-loading-status" hidden>Loading price history…</p>
+    <div class="table-wrapper" id="price-history-table-wrapper" hidden>
+      <table class="table" id="price-history-table">
+        <thead>
+          <tr>
+            <th scope="col">Date</th>
+            <th scope="col">DBP (ex-GST)</th>
+          </tr>
+        </thead>
+        <tbody id="price-history-tbody"></tbody>
+      </table>
+    </div>
+    <p id="price-history-empty" hidden>No price history recorded for this item yet.</p>
+    <div class="form-actions">
+      <button type="button" class="button button--ghost" data-modal-close>Close</button>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/purify.min.js') }}"></script>
+  <script src="{{ static_url('/static/js/suneditor.min.js') }}"></script>
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/shop_admin.js') }}" defer></script>
+{% endblock %}

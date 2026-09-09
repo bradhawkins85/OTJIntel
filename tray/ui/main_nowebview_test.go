@@ -1,0 +1,157 @@
+//go:build nowebview
+
+package main
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bradhawkins85/myportal-tray/internal/api"
+	"github.com/bradhawkins85/myportal-tray/internal/ipc"
+)
+
+func TestHandleIPCMessageOpensChatMessageWithoutNotification(t *testing.T) {
+	previousNotify := showChatSessionNotificationFunc
+	previousOpen := openChatWindowFunc
+	previousRequest := requestChatTokenFunc
+	previousPortalURL := gPortalURL
+	gPortalURL = "https://portal.example.test"
+	notified := false
+	showChatSessionNotificationFunc = func(title, body, chatURL string) {
+		notified = true
+	}
+	requestChatTokenFunc = func(roomID int) string {
+		return gPortalURL + "/tray/chat?token=test-token&room=" + itoa(roomID)
+	}
+	opened := make(chan string, 1)
+	openChatWindowFunc = func(chatURL string, _ *api.ConfigResponse) {
+		opened <- chatURL
+	}
+	t.Cleanup(func() {
+		showChatSessionNotificationFunc = previousNotify
+		openChatWindowFunc = previousOpen
+		requestChatTokenFunc = previousRequest
+		gPortalURL = previousPortalURL
+	})
+
+	payload, err := json.Marshal(chatMessagePayload{
+		RoomID:  42,
+		Subject: "Printer offline",
+		Sender:  "Alex Tech",
+		Message: "Please try printing again.",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	handleIPCMessage(ipc.Message{Type: "chat_message", Payload: payload})
+
+	if notified {
+		t.Fatal("chat_message should not display a popup notification")
+	}
+	select {
+	case chatURL := <-opened:
+		if !strings.Contains(chatURL, "/tray/chat?token=test-token&room=42") {
+			t.Fatalf("opened chatURL = %q, want room-specific authenticated tray chat URL", chatURL)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected chat_message to launch the chat window automatically")
+	}
+}
+
+func TestHandleIPCMessageDoesNotLaunchChatWhenRoomTokenRejected(t *testing.T) {
+	previousNotify := showChatSessionNotificationFunc
+	previousOpen := openChatWindowFunc
+	previousRequest := requestChatTokenFunc
+	defer func() {
+		showChatSessionNotificationFunc = previousNotify
+		openChatWindowFunc = previousOpen
+		requestChatTokenFunc = previousRequest
+	}()
+
+	showChatSessionNotificationFunc = func(title, body, chatURL string) {}
+	requestChatTokenFunc = func(roomID int) string { return "" }
+	opened := make(chan string, 1)
+	openChatWindowFunc = func(chatURL string, _ *api.ConfigResponse) {
+		opened <- chatURL
+	}
+
+	payload, err := json.Marshal(chatMessagePayload{RoomID: 42})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	handleIPCMessage(ipc.Message{Type: "chat_message", Payload: payload})
+
+	select {
+	case chatURL := <-opened:
+		t.Fatalf("chat window launched with %q after room token was rejected", chatURL)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: closed/stale rooms do not launch the chat shell.
+	}
+}
+
+func TestHandleIPCMessageDispatchesChatOpenNotificationAndLaunchesChatShell(t *testing.T) {
+	previousNotify := showChatSessionNotificationFunc
+	previousOpen := openChatWindowFunc
+	previousRequest := requestChatTokenFunc
+	previousPortalURL := gPortalURL
+	gPortalURL = "https://portal.example.test"
+	defer func() {
+		showChatSessionNotificationFunc = previousNotify
+		openChatWindowFunc = previousOpen
+		requestChatTokenFunc = previousRequest
+		gPortalURL = previousPortalURL
+	}()
+
+	var gotTitle string
+	var gotBody string
+	var gotActionURL string
+	showChatSessionNotificationFunc = func(title, body, chatURL string) {
+		gotTitle = title
+		gotBody = body
+		gotActionURL = chatURL
+	}
+
+	requestChatTokenFunc = func(roomID int) string {
+		return gPortalURL + "/tray/chat?token=test-token&room=" + itoa(roomID)
+	}
+	opened := make(chan string, 1)
+	openChatWindowFunc = func(chatURL string, _ *api.ConfigResponse) {
+		opened <- chatURL
+	}
+
+	payload, err := json.Marshal(chatOpenPayload{
+		RoomID:      77,
+		Subject:     "Laptop support",
+		InitiatedBy: "Alex Tech",
+		Message:     "I am starting a support chat.",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	handleIPCMessage(ipc.Message{Type: "chat_open", Payload: payload})
+
+	select {
+	case chatURL := <-opened:
+		if !strings.Contains(chatURL, "/tray/chat?token=test-token&room=77") {
+			t.Fatalf("opened chatURL = %q, want room-specific authenticated tray chat URL", chatURL)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected chat_open to launch the chat window automatically")
+	}
+
+	if gotTitle != "New MyPortal chat" {
+		t.Fatalf("title = %q", gotTitle)
+	}
+	for _, want := range []string{"Alex Tech", "Laptop support", "I am starting a support chat."} {
+		if !strings.Contains(gotBody, want) {
+			t.Fatalf("body = %q, want it to contain %q", gotBody, want)
+		}
+	}
+	if gotActionURL == "" {
+		t.Fatalf("chat notification action URL should not be empty")
+	}
+}

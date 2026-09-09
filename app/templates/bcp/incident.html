@@ -1,0 +1,585 @@
+{% extends "bcp/layout.html" %}
+
+
+{% block header_title %}BCP — Incident Response{% endblock %}
+{% block bcp_content %}
+<div class="bcp-page page-container">
+  <!-- Success/Error Messages -->
+  <!-- Page Header -->
+  <div class="page-header">
+    <div>
+      <h1 class="page-title">Incident Console</h1>
+      <p class="page-description">Manage incident response with checklist, contacts, and event log</p>
+    </div>
+    <div class="page-actions">
+      <a href="/bcp" class="btn btn-secondary">Back to Overview</a>
+      {% if can_edit %}
+        {% if active_incident %}
+          <span class="status-badge status-active">Active Incident</span>
+          <form action="/bcp/incident/close" method="post" style="display: inline;">
+            <button type="submit" class="btn btn-warning" onclick="return confirm('Are you sure you want to close this incident?')">
+              Close Incident
+            </button>
+          </form>
+        {% else %}
+          <form action="/bcp/incident/start" method="post" style="display: inline;">
+            <button type="submit" class="btn btn-primary" onclick="return confirm('Start a new incident? This will notify the distribution list.')">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" style="margin-right: 0.5rem;">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+              </svg>
+              Start Incident
+            </button>
+          </form>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Help Text -->
+  <section class="card help-card" role="region" aria-label="Incident Console Help">
+    <div class="card-body">
+      {% if not active_incident %}
+      <h3 class="help-title">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true" focusable="false">
+          <path d="M11 17h2v-6h-2v6zm1-15C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zM11 9h2V7h-2v2z"/>
+        </svg>
+        No Active Incident
+      </h3>
+      <p class="help-text">
+        Click "Start Incident" to activate the business continuity plan. This will:
+        <ul>
+          <li>Create an active incident record</li>
+          <li>Initialize the immediate response checklist</li>
+          <li>Log the incident start in the event log</li>
+          <li>Notify the distribution list (if configured)</li>
+        </ul>
+        Once started, you can use the tabs below to track progress, contact key personnel, and log important events.
+      </p>
+      {% else %}
+      <h3 class="help-title">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true" focusable="false">
+          <path d="M11 17h2v-6h-2v6zm1-15C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zM11 9h2V7h-2v2z"/>
+        </svg>
+        Incident Management Guide
+      </h3>
+      <div class="help-text">
+        <p><strong>Checklist:</strong> Track completion of immediate response tasks. Check off items as they're completed to monitor progress.</p>
+        <p><strong>Contacts:</strong> Access key personnel and emergency contacts. Use this tab to quickly reach decision-makers and specialists during the incident.</p>
+        <p><strong>Event Log:</strong> Document significant events during the incident. Record:
+          <ul>
+            <li>Decision points and who made them</li>
+            <li>Status updates and situation changes</li>
+            <li>Communications sent (internal and external)</li>
+            <li>Resource deployments or activations</li>
+            <li>Problems encountered and resolutions</li>
+          </ul>
+        </p>
+        <p><em>Tip: Log events in real-time with your initials. This creates an audit trail for post-incident review.</em></p>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <!-- Tab Navigation -->
+  <div class="tabs" role="tablist" aria-label="Incident Console Tabs">
+    <a href="/bcp/incident?tab=checklist" 
+       class="tab {% if active_tab == 'checklist' %}active{% endif %}" 
+       role="tab" 
+       aria-selected="{% if active_tab == 'checklist' %}true{% else %}false{% endif %}"
+       aria-controls="checklist-panel">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true" focusable="false">
+        <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+      </svg>
+      Checklist
+    </a>
+    <a href="/bcp/incident?tab=contacts" 
+       class="tab {% if active_tab == 'contacts' %}active{% endif %}" 
+       role="tab" 
+       aria-selected="{% if active_tab == 'contacts' %}true{% else %}false{% endif %}"
+       aria-controls="contacts-panel">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true" focusable="false">
+        <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/>
+      </svg>
+      Contacts
+    </a>
+    <a href="/bcp/incident?tab=event-log" 
+       class="tab {% if active_tab == 'event-log' %}active{% endif %}" 
+       role="tab" 
+       aria-selected="{% if active_tab == 'event-log' %}true{% else %}false{% endif %}"
+       aria-controls="event-log-panel">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true" focusable="false">
+        <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11zM7 10h5v5H7z"/>
+      </svg>
+      Event Log
+    </a>
+  </div>
+
+  <!-- Checklist Tab -->
+  {% if active_tab == 'checklist' %}
+  <section class="card mobile-tab-content {% if active_tab == 'checklist' %}active{% endif %}" 
+           id="checklist-panel" 
+           role="tabpanel" 
+           aria-labelledby="checklist-tab">
+    <div class="card-header">
+      <h2 class="card-title">Immediate Response Checklist</h2>
+      {% if active_incident %}
+      <p class="text-sm text-muted">Incident started: {{ active_incident.started_at.strftime('%Y-%m-%d %H:%M UTC') if active_incident.started_at else 'Unknown' }}</p>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if checklist_items %}
+      <div class="checklist">
+        {% for item in checklist_items %}
+        <div class="checklist-item {% if item.tick and item.tick.is_done %}completed{% endif %}">
+          {% if active_incident and can_edit %}
+          <form action="/bcp/incident/checklist/{{ item.tick.id if item.tick else 0 }}/toggle" method="post" style="display: inline;">
+            <button type="submit" 
+                    class="checkbox {% if item.tick and item.tick.is_done %}checked{% endif %}" 
+                    {% if not item.tick %}disabled{% endif %}
+                    aria-label="{% if item.tick and item.tick.is_done %}Mark as incomplete{% else %}Mark as complete{% endif %}: {{ item.label }}"
+                    aria-pressed="{% if item.tick and item.tick.is_done %}true{% else %}false{% endif %}">
+              {% if item.tick and item.tick.is_done %}
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true" focusable="false">
+                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+              </svg>
+              {% endif %}
+            </button>
+          </form>
+          {% else %}
+          <div class="checkbox {% if item.tick and item.tick.is_done %}checked{% endif %}">
+            {% if item.tick and item.tick.is_done %}
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+            </svg>
+            {% endif %}
+          </div>
+          {% endif %}
+          <div class="checklist-content">
+            <span class="checklist-label">{{ item.label }}</span>
+            {% if item.tick and item.tick.is_done and item.tick.done_at %}
+            <span class="checklist-meta">
+              Completed {{ item.tick.done_at.strftime('%Y-%m-%d %H:%M UTC') }}
+            </span>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-muted">No checklist items found. Please contact support.</p>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  <!-- Contacts Tab -->
+  {% if active_tab == 'contacts' %}
+  <section class="card mobile-tab-content {% if active_tab == 'contacts' %}active{% endif %}" 
+           id="contacts-panel" 
+           role="tabpanel" 
+           aria-labelledby="contacts-tab">
+    <div class="card-header">
+      <h2 class="card-title">Roles & Assignments</h2>
+      <a href="/bcp/roles" class="btn btn-secondary btn-sm">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+        </svg>
+        Manage Roles
+      </a>
+    </div>
+    <div class="card-body">
+      {% if roles %}
+      <div class="roles-list">
+        {% for role in roles %}
+        <div class="role-section">
+          <h3 class="role-title">{{ role.title }}</h3>
+          {% if role.responsibilities %}
+          <div class="role-responsibilities">{{ role.responsibilities | e | replace('\n', '<br>') | safe }}</div>
+          {% endif %}
+          {% if role.assignments %}
+          <div class="role-assignments">
+            <strong>Assigned:</strong>
+            {% for assignment in role.assignments %}
+            <div class="assignment-item">
+              <span class="assignment-name">
+                {% if assignment.user.first_name or assignment.user.last_name %}
+                  {{ assignment.user.first_name }} {{ assignment.user.last_name }}
+                {% else %}
+                  {{ assignment.user.email }}
+                {% endif %}
+                {% if assignment.is_alternate %}
+                  <span class="assignment-badge">Alternate</span>
+                {% else %}
+                  <span class="assignment-badge primary">Primary</span>
+                {% endif %}
+              </span>
+              {% if assignment.contact_info %}
+              <span class="assignment-contact">{{ assignment.contact_info }}</span>
+              {% endif %}
+              {% if assignment.user.email %}
+              <a href="mailto:{{ assignment.user.email }}" class="assignment-email">{{ assignment.user.email }}</a>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="text-muted" style="font-size: 0.875rem;">No assignments yet</p>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-muted">No roles defined yet. <a href="/bcp/roles">Add roles</a> to manage incident response assignments.</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-header">
+      <h2 class="card-title">Internal Contacts</h2>
+      {% if can_edit %}
+      <button class="btn btn-primary btn-sm" onclick="showAddContactModal('Internal')">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+        </svg>
+        Add Contact
+      </button>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if internal_contacts %}
+      <div class="contacts-grid">
+        {% for contact in internal_contacts %}
+        <div class="contact-card">
+          <div class="contact-header">
+            <h3 class="contact-name">{{ contact.person_or_org }}</h3>
+            {% if can_edit %}
+            <div class="contact-actions">
+              <button class="btn-icon" onclick="editContact({{ contact.id }}, '{{ contact.kind }}', '{{ contact.person_or_org }}', '{{ contact.phones or '' }}', '{{ contact.email or '' }}', '{{ contact.responsibility_or_agency or '' }}')" title="Edit">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                  <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+                </svg>
+              </button>
+              <form action="/bcp/incident/contacts/{{ contact.id }}/delete" method="post" style="display: inline;">
+                <button type="submit" class="btn-icon btn-danger" onclick="return confirm('Delete this contact?')" title="Delete">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                    <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                  </svg>
+                </button>
+              </form>
+            </div>
+            {% endif %}
+          </div>
+          {% if contact.responsibility_or_agency %}
+          <p class="contact-role">{{ contact.responsibility_or_agency }}</p>
+          {% endif %}
+          <div class="contact-details">
+            {% if contact.phones %}
+            <div class="contact-detail">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/>
+              </svg>
+              <a href="tel:{{ contact.phones }}">{{ contact.phones }}</a>
+            </div>
+            {% endif %}
+            {% if contact.email %}
+            <div class="contact-detail">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/>
+              </svg>
+              <a href="mailto:{{ contact.email }}">{{ contact.email }}</a>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-muted">No internal contacts added yet.</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-header">
+      <h2 class="card-title">External Contacts</h2>
+      {% if can_edit %}
+      <button class="btn btn-primary btn-sm" onclick="showAddContactModal('External')">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+          <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+        </svg>
+        Add Contact
+      </button>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if external_contacts %}
+      <div class="contacts-grid">
+        {% for contact in external_contacts %}
+        <div class="contact-card">
+          <div class="contact-header">
+            <h3 class="contact-name">{{ contact.person_or_org }}</h3>
+            {% if can_edit %}
+            <div class="contact-actions">
+              <button class="btn-icon" onclick="editContact({{ contact.id }}, '{{ contact.kind }}', '{{ contact.person_or_org }}', '{{ contact.phones or '' }}', '{{ contact.email or '' }}', '{{ contact.responsibility_or_agency or '' }}')" title="Edit">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                  <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+                </svg>
+              </button>
+              <form action="/bcp/incident/contacts/{{ contact.id }}/delete" method="post" style="display: inline;">
+                <button type="submit" class="btn-icon btn-danger" onclick="return confirm('Delete this contact?')" title="Delete">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                    <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                  </svg>
+                </button>
+              </form>
+            </div>
+            {% endif %}
+          </div>
+          {% if contact.responsibility_or_agency %}
+          <p class="contact-role">{{ contact.responsibility_or_agency }}</p>
+          {% endif %}
+          <div class="contact-details">
+            {% if contact.phones %}
+            <div class="contact-detail">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/>
+              </svg>
+              <a href="tel:{{ contact.phones }}">{{ contact.phones }}</a>
+            </div>
+            {% endif %}
+            {% if contact.email %}
+            <div class="contact-detail">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/>
+              </svg>
+              <a href="mailto:{{ contact.email }}">{{ contact.email }}</a>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-muted">No external contacts added yet.</p>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  <!-- Event Log Tab -->
+  {% if active_tab == 'event-log' %}
+  <section class="card mobile-tab-content {% if active_tab == 'event-log' %}active{% endif %}" 
+           id="event-log-panel" 
+           role="tabpanel" 
+           aria-labelledby="event-log-tab">
+    <div class="card-header">
+      <h2 class="card-title">Event Log</h2>
+      {% if active_incident %}
+      <div style="display: flex; gap: 0.5rem;">
+        {% if can_edit %}
+        <button class="btn btn-primary btn-sm" onclick="showAddEventModal()">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+            <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+          </svg>
+          Add Event
+        </button>
+        {% endif %}
+        <a href="/bcp/incident/event-log/export" class="btn btn-secondary btn-sm">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+            <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+          </svg>
+          Export CSV
+        </a>
+      </div>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if active_incident %}
+        {% if event_log %}
+        <div class="event-log">
+          {% for entry in event_log %}
+          <div class="event-entry">
+            <div class="event-timestamp">
+              {{ entry.happened_at.strftime('%Y-%m-%d %H:%M UTC') if entry.happened_at else 'Unknown' }}
+            </div>
+            <div class="event-content">
+              <span class="event-initials">{{ entry.initials or 'N/A' }}</span>
+              <span class="event-notes">{{ entry.notes }}</span>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-muted">No events logged yet. Add an event to start tracking incident progress.</p>
+        {% endif %}
+      {% else %}
+      <p class="text-muted">Start an incident to begin logging events.</p>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  <!-- Quick Links -->
+  <section class="card">
+    <div class="card-header">
+      <h2 class="card-title">Emergency Preparedness</h2>
+    </div>
+    <div class="card-body">
+      <div class="quick-links">
+        <a href="/bcp/evacuation" class="quick-link-card">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+            <path d="M12 2L1 21h22L12 2zm0 3.99L19.53 19H4.47L12 5.99zM11 16h2v2h-2zm0-6h2v4h-2z"/>
+          </svg>
+          <div>
+            <strong>Evacuation Procedures</strong>
+            <p>View evacuation plan and meeting points</p>
+          </div>
+        </a>
+        
+        <a href="/bcp/emergency-kit" class="quick-link-card">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+            <path d="M20 6h-2.18c.11-.31.18-.65.18-1 0-1.66-1.34-3-3-3-1.05 0-1.96.54-2.5 1.35l-.5.67-.5-.68C10.96 2.54 10.05 2 9 2 7.34 2 6 3.34 6 5c0 .35.07.69.18 1H4c-1.11 0-1.99.89-1.99 2L2 19c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V8c0-1.11-.89-2-2-2zm-5-2c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zM9 4c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm11 15H4v-2h16v2zm0-5H4V8h5.08L7 10.83 8.62 12 11 8.76l1-1.36 1 1.36L15.38 12 17 10.83 14.92 8H20v6z"/>
+          </svg>
+          <div>
+            <strong>Emergency Kit</strong>
+            <p>Check emergency documents and equipment</p>
+          </div>
+        </a>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- Add/Edit Contact Modal -->
+<div id="contactModal" class="modal" style="display: none;">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2 id="contactModalTitle">Add Contact</h2>
+      <button class="modal-close" onclick="closeContactModal()">&times;</button>
+    </div>
+    <form id="contactForm" method="post">
+      <div class="modal-body">
+        <input type="hidden" name="kind" id="contact_kind" value="">
+        
+        <div class="form-group">
+          <label for="contact_person_or_org" class="form-label required">Name / Organization</label>
+          <input type="text" id="contact_person_or_org" name="person_or_org" required class="form-control">
+        </div>
+        
+        <div class="form-group">
+          <label for="contact_phones">Phone Number(s)</label>
+          <input type="text" id="contact_phones" name="phones" class="form-control" placeholder="e.g., +1-555-0100, +1-555-0101">
+        </div>
+        
+        <div class="form-group">
+          <label for="contact_email">Email</label>
+          <input type="email" id="contact_email" name="email" class="form-control">
+        </div>
+        
+        <div class="form-group">
+          <label for="contact_responsibility_or_agency">Role / Agency</label>
+          <input type="text" id="contact_responsibility_or_agency" name="responsibility_or_agency" class="form-control" placeholder="e.g., Emergency Coordinator, Fire Department">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeContactModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save Contact</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Add Event Modal -->
+<div id="eventModal" class="modal" style="display: none;">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>Add Event Log Entry</h2>
+      <button class="modal-close" onclick="closeEventModal()">&times;</button>
+    </div>
+    <form action="/bcp/incident/event-log" method="post">
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="event_happened_at">Timestamp (leave blank for current time)</label>
+          <input type="datetime-local" id="event_happened_at" name="happened_at" class="form-control">
+        </div>
+        
+        <div class="form-group">
+          <label for="event_notes" class="form-label required">Event Details</label>
+          <textarea id="event_notes" name="notes" required class="form-control" rows="4" placeholder="Describe what happened..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeEventModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add Event</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function showAddContactModal(kind) {
+  const modal = document.getElementById('contactModal');
+  const form = document.getElementById('contactForm');
+  const title = document.getElementById('contactModalTitle');
+  
+  form.action = '/bcp/incident/contacts';
+  title.textContent = `Add ${kind} Contact`;
+  document.getElementById('contact_kind').value = kind;
+  
+  // Clear form
+  document.getElementById('contact_person_or_org').value = '';
+  document.getElementById('contact_phones').value = '';
+  document.getElementById('contact_email').value = '';
+  document.getElementById('contact_responsibility_or_agency').value = '';
+  
+  modal.style.display = 'flex';
+}
+
+function editContact(id, kind, name, phones, email, responsibility) {
+  const modal = document.getElementById('contactModal');
+  const form = document.getElementById('contactForm');
+  const title = document.getElementById('contactModalTitle');
+  
+  form.action = `/bcp/incident/contacts/${id}/update`;
+  title.textContent = 'Edit Contact';
+  document.getElementById('contact_kind').value = kind;
+  document.getElementById('contact_person_or_org').value = name;
+  document.getElementById('contact_phones').value = phones;
+  document.getElementById('contact_email').value = email;
+  document.getElementById('contact_responsibility_or_agency').value = responsibility;
+  
+  modal.style.display = 'flex';
+}
+
+function closeContactModal() {
+  document.getElementById('contactModal').style.display = 'none';
+}
+
+function showAddEventModal() {
+  const modal = document.getElementById('eventModal');
+  
+  // Clear form
+  document.getElementById('event_happened_at').value = '';
+  document.getElementById('event_notes').value = '';
+  
+  modal.style.display = 'flex';
+}
+
+function closeEventModal() {
+  document.getElementById('eventModal').style.display = 'none';
+}
+
+// Close modals when clicking outside
+window.onclick = function(event) {
+  const contactModal = document.getElementById('contactModal');
+  const eventModal = document.getElementById('eventModal');
+  
+  if (event.target === contactModal) {
+    closeContactModal();
+  }
+  if (event.target === eventModal) {
+    closeEventModal();
+  }
+}
+</script>
+{% endblock %}

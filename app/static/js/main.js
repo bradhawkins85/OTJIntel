@@ -1,0 +1,1162 @@
+(function () {
+  'use strict';
+
+  const TOAST_CLASSES = [
+    'notification-toast--info',
+    'notification-toast--success',
+    'notification-toast--warning',
+    'notification-toast--error',
+  ];
+  const TOAST_SUCCESS_HIDE_MS = 3000;
+  const TOAST_INFO_HIDE_MS = 3000;
+  const TOAST_FAILURE_HIDE_MS = 60000;
+
+  function normaliseToastVariant(variant) {
+    const value = typeof variant === 'string' ? variant.trim().toLowerCase() : '';
+    if (value === 'success' || value === 'warning' || value === 'error') {
+      return value;
+    }
+    return 'info';
+  }
+
+  function defaultAutoHideMsForVariant(variant) {
+    const target = normaliseToastVariant(variant);
+    if (target === 'error' || target === 'warning') {
+      return TOAST_FAILURE_HIDE_MS;
+    }
+    return target === 'success' ? TOAST_SUCCESS_HIDE_MS : TOAST_INFO_HIDE_MS;
+  }
+
+  function recordToast(message, variant) {
+    if (typeof fetch !== 'function') {
+      if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+        console.warn('Fetch API unavailable; toast notification was not persisted.');
+      }
+      return;
+    }
+    const text = typeof message === 'string' ? message.trim() : '';
+    if (!text) {
+      return;
+    }
+    const targetVariant = normaliseToastVariant(variant);
+    const metadata =
+      targetVariant === 'warning' || targetVariant === 'error'
+        ? { toast_variant: targetVariant, severity: targetVariant }
+        : { toast_variant: targetVariant };
+    const csrfTokenMeta = document.querySelector('meta[name="csrf-token"]');
+    const csrfToken = csrfTokenMeta ? csrfTokenMeta.getAttribute('content') : '';
+    const headers = {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    };
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken;
+    }
+    fetch('/api/notifications', {
+      method: 'POST',
+      headers,
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        event_type: 'general',
+        message: text,
+        metadata,
+      }),
+    }).catch((error) => {
+      if (typeof console !== 'undefined' && console && typeof console.error === 'function') {
+        console.error('Failed to persist toast notification', error);
+      }
+    });
+  }
+
+  function createToastController(root) {
+    if (!root) {
+      return {
+        show() {},
+        hide() {},
+      };
+    }
+
+    const messageEl = root.querySelector('[data-notification-toast-message]');
+    const dismissButton = root.querySelector('[data-notification-toast-dismiss]');
+    let hideTimer = null;
+
+    function applyVariant(variant) {
+      const targetClass = normaliseToastVariant(variant);
+      const variantClass = `notification-toast--${targetClass}`;
+      TOAST_CLASSES.forEach((className) => {
+        if (className !== variantClass) {
+          root.classList.remove(className);
+        }
+      });
+      root.classList.add(variantClass);
+    }
+
+    function hide() {
+      if (hideTimer) {
+        window.clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+      root.setAttribute('aria-hidden', 'true');
+      root.hidden = true;
+    }
+
+    function show(message, options) {
+      if (!messageEl) {
+        return;
+      }
+
+      const settings = options || {};
+      applyVariant(settings.variant);
+
+      messageEl.textContent = message || '';
+      root.hidden = false;
+      root.setAttribute('aria-hidden', 'false');
+
+      if (hideTimer) {
+        window.clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+
+      if (settings.autoHideMs && Number.isFinite(settings.autoHideMs)) {
+        hideTimer = window.setTimeout(() => {
+          hide();
+        }, settings.autoHideMs);
+      }
+    }
+
+    if (dismissButton) {
+      dismissButton.addEventListener('click', () => {
+        hide();
+      });
+    }
+
+    return { show, hide };
+  }
+
+  function getPortalToastApi() {
+    if (typeof window !== 'undefined' && window.__portalToast) {
+      return window.__portalToast;
+    }
+    const controller = createToastController(document.querySelector('[data-global-toast]'));
+    const api = {
+      show(message, options) {
+        const settings = options || {};
+        const variant = normaliseToastVariant(settings.variant);
+        const hasCustomAutoHide = Number.isFinite(settings.autoHideMs);
+        controller.show(message, {
+          ...settings,
+          variant,
+          autoHideMs: hasCustomAutoHide ? settings.autoHideMs : defaultAutoHideMsForVariant(variant),
+        });
+        if (settings.persist !== false) {
+          recordToast(message, variant);
+        }
+      },
+      hide() {
+        controller.hide();
+      },
+    };
+    if (typeof window !== 'undefined') {
+      window.__portalToast = api;
+    }
+    return api;
+  }
+
+  function setupAutoRefresh() {
+    const body = document.body;
+    if (!body) {
+      return;
+    }
+
+    if (body.dataset.enableAutoRefresh !== 'true') {
+      return;
+    }
+
+    if (!('WebSocket' in window)) {
+      return;
+    }
+
+    const toast = getPortalToastApi();
+
+    let socket = null;
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
+    let reloadTimer = null;
+    let stop = false;
+
+    const baseDelay = 1000;
+    const maxDelay = 30000;
+
+    function resetReloadTimer() {
+      if (reloadTimer) {
+        window.clearTimeout(reloadTimer);
+        reloadTimer = null;
+      }
+    }
+
+    function shouldIgnoreRefresh(payload) {
+      const ticketDetail = document.querySelector('[data-admin-ticket-detail]');
+      if (!ticketDetail || !payload || typeof payload !== 'object') {
+        return false;
+      }
+
+      const topics = Array.isArray(payload.topics) ? payload.topics : [];
+      const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+      const action = typeof data.action === 'string' ? data.action.trim().toLowerCase() : '';
+
+      return topics.includes('tickets') && (action === 'create' || action === 'created');
+    }
+
+    function handleRefreshMessage(payload) {
+      // A newly created ticket changes ticket lists, but not an already-open ticket.
+      // Reloading this page would discard an in-progress reply and selected attachments.
+      if (shouldIgnoreRefresh(payload)) {
+        return;
+      }
+
+      const detail = {
+        ...(payload && typeof payload === 'object' ? payload : {}),
+        showToast(message, options) {
+          toast.show(message, { ...(options || {}), persist: false });
+        },
+      };
+
+      const event = new CustomEvent('realtime:refresh', {
+        detail,
+        cancelable: true,
+      });
+      const shouldReload = document.dispatchEvent(event);
+      if (!shouldReload) {
+        return;
+      }
+
+      const reason = typeof detail.reason === 'string' ? detail.reason.trim() : '';
+      const message = reason
+        ? `${reason} Refreshing to apply updates…`
+        : 'Updates are available. Refreshing to apply changes…';
+
+      toast.show(message, { variant: 'info', persist: false });
+
+      resetReloadTimer();
+      reloadTimer = window.setTimeout(() => {
+        window.location.reload();
+      }, 1500);
+    }
+
+    function scheduleReconnect() {
+      if (stop) {
+        return;
+      }
+
+      const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), maxDelay);
+      reconnectAttempts += 1;
+
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+      }
+
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    }
+
+    function connect() {
+      if (stop) {
+        return;
+      }
+
+      try {
+        if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
+          return;
+        }
+      } catch (error) {
+        // Ignore errors when inspecting the current socket state.
+      }
+
+      const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const target = `${scheme}//${window.location.host}/ws/refresh`;
+
+      let instance;
+      try {
+        instance = new WebSocket(target);
+      } catch (error) {
+        scheduleReconnect();
+        return;
+      }
+
+      socket = instance;
+
+      instance.addEventListener('open', () => {
+        reconnectAttempts = 0;
+      });
+
+      instance.addEventListener('message', (event) => {
+        if (!event || typeof event.data !== 'string') {
+          return;
+        }
+
+        let payload;
+        try {
+          payload = JSON.parse(event.data);
+        } catch (error) {
+          return;
+        }
+
+        if (!payload || payload.type !== 'refresh') {
+          return;
+        }
+
+        handleRefreshMessage(payload);
+      });
+
+      instance.addEventListener('close', () => {
+        if (stop) {
+          return;
+        }
+        scheduleReconnect();
+      });
+
+      instance.addEventListener('error', () => {
+        try {
+          if (instance.readyState !== WebSocket.CLOSED && instance.readyState !== WebSocket.CLOSING) {
+            instance.close();
+          }
+        } catch (error) {
+          // Ignore socket state errors during error handling.
+        }
+      });
+    }
+
+    window.addEventListener('beforeunload', () => {
+      stop = true;
+      resetReloadTimer();
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (socket) {
+        try {
+          socket.close();
+        } catch (error) {
+          // Ignore socket close failures.
+        }
+      }
+    });
+
+    window.addEventListener('online', () => {
+      if (!socket || socket.readyState === WebSocket.CLOSED) {
+        reconnectAttempts = 0;
+        connect();
+      }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && (!socket || socket.readyState === WebSocket.CLOSED)) {
+        reconnectAttempts = 0;
+        connect();
+      }
+    });
+
+    connect();
+  }
+
+  function setupForceRefresh() {
+    const trigger = document.querySelector('[data-force-refresh]');
+    if (!trigger) {
+      return;
+    }
+
+    const hasServiceWorker = typeof navigator !== 'undefined' && 'serviceWorker' in navigator;
+    const hasCacheAPI = typeof window !== 'undefined' && 'caches' in window;
+    const supportsEnhancedRefresh = hasServiceWorker || hasCacheAPI;
+    const shouldBroadcastRefresh = trigger.getAttribute('data-force-refresh-broadcast') === 'true';
+
+    if (!supportsEnhancedRefresh) {
+      trigger.title = 'Reloads the app to request the latest files';
+    }
+
+    const toast = getPortalToastApi();
+    let busy = false;
+
+    async function broadcastRefreshNotice() {
+      if (!shouldBroadcastRefresh || typeof fetch !== 'function') {
+        return { attempted: false, success: false };
+      }
+
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      let timeoutId = null;
+
+      if (controller && typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+        timeoutId = window.setTimeout(() => {
+          try {
+            controller.abort();
+          } catch (error) {
+            // Ignore abort errors so the refresh flow can continue.
+          }
+        }, 6000);
+      }
+
+      try {
+        const options = {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+          },
+          credentials: 'same-origin',
+        };
+        if (controller) {
+          options.signal = controller.signal;
+        }
+
+        const response = await fetch('/api/system/refresh', options);
+        if (!response || !response.ok) {
+          return {
+            attempted: true,
+            success: false,
+            status: response ? response.status : null,
+          };
+        }
+
+        return { attempted: true, success: true };
+      } catch (error) {
+        console.error('Failed to broadcast refresh request', error);
+        return {
+          attempted: true,
+          success: false,
+          error,
+        };
+      } finally {
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+        }
+      }
+    }
+
+    function waitForServiceWorkerMessage(expectedType, timeoutMs) {
+      if (!hasServiceWorker || !navigator.serviceWorker || typeof navigator.serviceWorker.addEventListener !== 'function') {
+        return Promise.resolve(null);
+      }
+
+      const timeout = typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : 7000;
+
+      return new Promise((resolve) => {
+        let settled = false;
+        let timeoutId = null;
+
+        function cleanup() {
+          if (timeoutId !== null) {
+            window.clearTimeout(timeoutId);
+            timeoutId = null;
+          }
+          navigator.serviceWorker.removeEventListener('message', handleMessage);
+        }
+
+        function handleMessage(event) {
+          const data = event && event.data;
+          if (!data || data.type !== expectedType) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          resolve(data);
+        }
+
+        navigator.serviceWorker.addEventListener('message', handleMessage);
+        timeoutId = window.setTimeout(() => {
+          if (!settled) {
+            cleanup();
+            resolve(null);
+          }
+        }, timeout);
+      });
+    }
+
+    async function clearServiceWorkerCaches() {
+      if (!hasServiceWorker || !navigator.serviceWorker) {
+        return;
+      }
+
+      let registrations = [];
+      try {
+        registrations = await navigator.serviceWorker.getRegistrations();
+      } catch (error) {
+        throw error;
+      }
+
+      if (registrations.length) {
+        await Promise.allSettled(
+          registrations.map((registration) => {
+            try {
+              return registration.update();
+            } catch (error) {
+              return Promise.reject(error);
+            }
+          })
+        );
+      }
+
+      const activeWorkers = registrations
+        .map((registration) => registration.active)
+        .filter((worker) => Boolean(worker));
+
+      const controller = navigator.serviceWorker.controller;
+      const acknowledgement = controller ? waitForServiceWorkerMessage('CACHE_CLEARED', 7000) : Promise.resolve(null);
+
+      const recipients = controller ? [controller] : activeWorkers;
+      if (recipients.length) {
+        recipients.forEach((worker) => {
+          try {
+            worker.postMessage({ type: 'CLEAR_CACHE' });
+          } catch (error) {
+            // Ignore message delivery errors so the refresh flow can continue.
+          }
+        });
+      }
+
+      await acknowledgement;
+
+      registrations.forEach((registration) => {
+        if (registration.waiting) {
+          try {
+            registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+          } catch (error) {
+            // Ignore failures when nudging waiting workers.
+          }
+        }
+      });
+    }
+
+    async function clearWindowCaches() {
+      if (!hasCacheAPI || !window.caches || typeof window.caches.keys !== 'function') {
+        return;
+      }
+
+      const keys = await window.caches.keys();
+      if (!Array.isArray(keys) || !keys.length) {
+        return;
+      }
+
+      await Promise.allSettled(keys.map((key) => window.caches.delete(key)));
+    }
+
+    async function performForceRefresh() {
+      let hadError = false;
+
+      try {
+        await clearServiceWorkerCaches();
+      } catch (error) {
+        console.error('Failed to clear service worker caches', error);
+        hadError = true;
+      }
+
+      try {
+        await clearWindowCaches();
+      } catch (error) {
+        console.error('Failed to clear Cache Storage entries', error);
+        hadError = true;
+      }
+
+      return { hadError };
+    }
+
+    trigger.addEventListener('click', async () => {
+      if (busy) {
+        return;
+      }
+
+      busy = true;
+      trigger.disabled = true;
+      trigger.setAttribute('aria-busy', 'true');
+
+      let broadcastResult = { attempted: false, success: false };
+
+      if (shouldBroadcastRefresh) {
+        toast.show('Notifying connected sessions to refresh…', { variant: 'info', persist: false });
+        broadcastResult = await broadcastRefreshNotice();
+        if (broadcastResult.success) {
+          toast.show(
+            supportsEnhancedRefresh
+              ? 'Refresh notice sent. Clearing cached assets…'
+              : 'Refresh notice sent. Reloading with a clean request…',
+            { variant: 'info', persist: false },
+          );
+        } else {
+          toast.show('Could not notify other sessions. Continuing with local refresh…', {
+            variant: 'warning',
+            persist: false,
+          });
+        }
+      } else {
+        toast.show(
+          supportsEnhancedRefresh
+            ? 'Refreshing the application and clearing cached assets…'
+            : 'Refreshing the application with a clean request…',
+          {
+            variant: 'info',
+            persist: false,
+          },
+        );
+      }
+
+      let hadError = false;
+      try {
+        const result = await performForceRefresh();
+        hadError = result.hadError;
+      } catch (error) {
+        console.error('Force refresh encountered an unexpected error', error);
+        hadError = true;
+      }
+
+      if (hadError) {
+        toast.show('Encountered issues clearing cached assets. Reloading to request the latest files…', {
+          variant: 'warning',
+          persist: false,
+        });
+      } else if (supportsEnhancedRefresh) {
+        toast.show('Cached assets cleared. Reloading with the latest version…', {
+          variant: 'success',
+          persist: false,
+        });
+      } else {
+        const message = broadcastResult.success
+          ? 'Reloading the application with the latest files…'
+          : 'Reloading the application to request the latest files…';
+        toast.show(message, {
+          variant: 'success',
+          persist: false,
+        });
+      }
+
+      window.setTimeout(() => {
+        try {
+          const currentUrl = new URL(window.location.href);
+          currentUrl.searchParams.set('_refresh', Date.now().toString(36));
+          window.location.replace(currentUrl.toString());
+        } catch (error) {
+          window.location.reload();
+        }
+      }, 700);
+    });
+  }
+
+  function setupUpdateBanner() {
+    if (typeof window !== 'undefined') {
+      window.__MYPORTAL_HAS_UPDATE_HANDLER__ = true;
+    }
+
+    const banner = document.querySelector('[data-update-banner]');
+    const messageEl = banner ? banner.querySelector('[data-update-banner-message]') : null;
+    const refreshButton = banner ? banner.querySelector('[data-update-banner-refresh]') : null;
+    const dismissButton = banner ? banner.querySelector('[data-update-banner-dismiss]') : null;
+
+    function registerFallbackPrompt() {
+      if (typeof window === 'undefined') {
+        return;
+      }
+
+      window.addEventListener('pwa:update-available', (event) => {
+        if (!event || !event.detail || typeof event.detail.applyUpdate !== 'function') {
+          return;
+        }
+
+        const confirmation = window.confirm(
+          'An update is available. Reload now to apply the latest version?'
+        );
+        if (confirmation) {
+          try {
+            event.detail.applyUpdate();
+          } catch (error) {
+            console.error('Failed to apply update via service worker', error);
+            window.location.reload();
+          }
+        }
+      });
+    }
+
+    if (!banner || !messageEl || !refreshButton) {
+      registerFallbackPrompt();
+      return;
+    }
+
+    const forceRefreshTrigger = document.querySelector('[data-force-refresh]');
+    let applyUpdate = null;
+
+    function hideBanner() {
+      banner.setAttribute('aria-hidden', 'true');
+      banner.hidden = true;
+      applyUpdate = null;
+    }
+
+    function showBanner(reason) {
+      const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+      const message =
+        trimmedReason
+          ? `${trimmedReason} Please refresh to apply the latest release.`
+          : 'A new version of the portal is ready. Refresh to apply the latest release.';
+      messageEl.textContent = message;
+      banner.hidden = false;
+      banner.setAttribute('aria-hidden', 'false');
+    }
+
+    refreshButton.addEventListener('click', () => {
+      const callback = applyUpdate;
+      hideBanner();
+
+      if (typeof callback === 'function') {
+        try {
+          callback();
+          return;
+        } catch (error) {
+          console.error('Failed to apply update via service worker', error);
+        }
+      }
+
+      if (forceRefreshTrigger) {
+        forceRefreshTrigger.click();
+      } else {
+        window.location.reload();
+      }
+    });
+
+    if (dismissButton) {
+      dismissButton.addEventListener('click', () => {
+        hideBanner();
+      });
+    }
+
+    window.addEventListener('pwa:update-available', (event) => {
+      if (!event || !event.detail || typeof event.detail.applyUpdate !== 'function') {
+        return;
+      }
+
+      applyUpdate = event.detail.applyUpdate;
+      const reason = typeof event.detail.reason === 'string' ? event.detail.reason : '';
+      showBanner(reason);
+    });
+  }
+
+  function setupModalCloseBehaviour() {
+    const modalSelector = '.modal';
+    const headerSelector = '.modal__header, .modal-header';
+    const closeControlSelector = [
+      '.modal__close',
+      '.modal-close',
+      '.btn-close',
+      '[data-modal-close]',
+      '[data-close-modal]',
+      '[data-asset-modal-close]',
+      '[data-email-recipients-close]',
+      '[data-auto-modal-close]',
+    ].join(', ');
+    const headerCloseSelector = headerSelector
+      .split(', ')
+      .flatMap((h) => closeControlSelector.split(', ').map((c) => `${h.trim()} ${c.trim()}`))
+      .join(', ');
+    const contentSelector = '.modal__content, .modal__panel, .modal__inner, .modal-content';
+
+    function isModalOpen(modal) {
+      if (!(modal instanceof HTMLElement)) {
+        return false;
+      }
+      if (modal instanceof HTMLDialogElement) {
+        return modal.open;
+      }
+      if (modal.hidden) {
+        return false;
+      }
+      const computed = window.getComputedStyle(modal);
+      return computed.display !== 'none' && computed.visibility !== 'hidden';
+    }
+
+    function getOpenModals() {
+      return Array.from(document.querySelectorAll(modalSelector)).filter(isModalOpen);
+    }
+
+    function createAutoCloseButton() {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'modal__close modal-close';
+      button.setAttribute('aria-label', 'Close');
+      button.setAttribute('data-auto-modal-close', 'true');
+      button.innerHTML = '&times;';
+      return button;
+    }
+
+    function suppressEvent(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+    }
+
+    document.querySelectorAll(modalSelector).forEach((modal) => {
+      const header = modal.querySelector(headerSelector);
+      const content = modal.querySelector(contentSelector);
+      if (!header || !content || header.querySelector(headerCloseSelector)) {
+        return;
+      }
+      header.append(createAutoCloseButton());
+    });
+
+    document.addEventListener(
+      'click',
+      (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) {
+          return;
+        }
+        const modal = target.closest(modalSelector);
+        if (!modal || !isModalOpen(modal)) {
+          return;
+        }
+        const isBackdropClick =
+          target === modal || target.matches('.modal__overlay, .modal__backdrop');
+        if (!isBackdropClick) {
+          return;
+        }
+        suppressEvent(event);
+      },
+      true,
+    );
+
+    document.addEventListener(
+      'keydown',
+      (event) => {
+        if (event.key !== 'Escape' && event.key !== 'Esc') {
+          return;
+        }
+        const openModals = getOpenModals();
+        if (!openModals.length) {
+          return;
+        }
+        const modal = openModals[openModals.length - 1];
+        const closeButton = modal.querySelector(`${headerCloseSelector}, ${closeControlSelector}`);
+
+        if (closeButton instanceof HTMLElement) {
+          suppressEvent(event);
+          closeButton.click();
+          return;
+        }
+
+        suppressEvent(event);
+        if (modal instanceof HTMLDialogElement) {
+          modal.close();
+          return;
+        }
+        modal.classList.remove('is-visible');
+        modal.hidden = true;
+        modal.setAttribute('aria-hidden', 'true');
+        modal.style.display = 'none';
+      },
+      true,
+    );
+  }
+
+  function setupHeaderMenus() {
+    const menus = Array.from(document.querySelectorAll('[data-header-menu]'));
+    if (!menus.length) {
+      return;
+    }
+
+    const toggleLookup = new Map();
+
+    function getToggle(menu) {
+      if (toggleLookup.has(menu)) {
+        return toggleLookup.get(menu);
+      }
+      const toggle = menu.querySelector('[data-header-menu-toggle]');
+      if (toggle) {
+        toggleLookup.set(menu, toggle);
+      }
+      return toggle;
+    }
+
+    function updateToggle(menu) {
+      const toggle = getToggle(menu);
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', menu.open ? 'true' : 'false');
+      }
+    }
+
+    function closeMenu(menu, options) {
+      const settings = options || {};
+      if (!menu.open) {
+        return;
+      }
+      menu.removeAttribute('open');
+      updateToggle(menu);
+      if (settings.focusToggle) {
+        const toggle = getToggle(menu);
+        if (toggle) {
+          try {
+            toggle.focus({ preventScroll: true });
+          } catch (error) {
+            toggle.focus();
+          }
+        }
+      }
+    }
+
+    menus.forEach((menu) => {
+      updateToggle(menu);
+
+      menu.addEventListener('toggle', () => {
+        if (menu.open) {
+          menus.forEach((other) => {
+            if (other !== menu) {
+              closeMenu(other);
+            }
+          });
+        }
+        updateToggle(menu);
+      });
+    });
+
+    document.addEventListener('click', (event) => {
+      menus.forEach((menu) => {
+        if (!menu.contains(event.target)) {
+          closeMenu(menu);
+        }
+      });
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' || event.key === 'Esc') {
+        menus.forEach((menu) => {
+          closeMenu(menu, { focusToggle: true });
+        });
+      }
+    });
+  }
+
+  function setupAutoAlerts() {
+    const toast = getPortalToastApi();
+    if (!toast) {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const successMessage = params.get('success');
+    const errorMessage = params.get('error');
+
+    if (successMessage) {
+      toast.show(successMessage, { variant: 'success' });
+      return;
+    }
+    if (errorMessage) {
+      toast.show(errorMessage, { variant: 'error' });
+      return;
+    }
+
+    const pageFlashNode = document.getElementById('page-flash-data');
+    if (!pageFlashNode) {
+      return;
+    }
+    try {
+      const payload = JSON.parse(pageFlashNode.textContent || '{}');
+      if (!payload || typeof payload !== 'object') {
+        return;
+      }
+      const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+      if (!message) {
+        return;
+      }
+      toast.show(message, { variant: normaliseToastVariant(payload.variant) });
+    } catch (error) {
+      if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+        console.warn('Malformed page_flash payload ignored', error);
+      }
+    }
+  }
+
+
+  const TICKET_REFERENCE_PATTERN = /\b(?:ticket|split to)\s+#(\d+)\b/gi;
+  const TICKET_REFERENCE_SKIP_SELECTOR = [
+    'a',
+    'button',
+    'input',
+    'select',
+    'textarea',
+    'script',
+    'style',
+    'template',
+    'code',
+    'pre',
+    '[contenteditable="true"]',
+    '[data-ticket-reference-ignore]',
+  ].join(',');
+
+  function createTicketReferenceLink(text, ticketId) {
+    const link = document.createElement('a');
+    link.href = `/tickets/${ticketId}`;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.className = 'ticket-reference-link';
+    link.textContent = text;
+    link.dataset.ticketReferenceLink = 'true';
+    return link;
+  }
+
+  function shouldLinkifyTicketReferenceTextNode(node) {
+    if (!node || node.nodeType !== Node.TEXT_NODE || !node.nodeValue) {
+      return false;
+    }
+    TICKET_REFERENCE_PATTERN.lastIndex = 0;
+    if (!TICKET_REFERENCE_PATTERN.test(node.nodeValue)) {
+      return false;
+    }
+    TICKET_REFERENCE_PATTERN.lastIndex = 0;
+    const parent = node.parentElement;
+    return Boolean(parent && !parent.closest(TICKET_REFERENCE_SKIP_SELECTOR));
+  }
+
+  function linkifyTicketReferenceTextNode(node) {
+    if (!shouldLinkifyTicketReferenceTextNode(node)) {
+      return;
+    }
+
+    const text = node.nodeValue;
+    const fragment = document.createDocumentFragment();
+    let lastIndex = 0;
+    TICKET_REFERENCE_PATTERN.lastIndex = 0;
+
+    for (const match of text.matchAll(TICKET_REFERENCE_PATTERN)) {
+      const index = match.index || 0;
+      if (index > lastIndex) {
+        fragment.append(document.createTextNode(text.slice(lastIndex, index)));
+      }
+      fragment.append(createTicketReferenceLink(match[0], match[1]));
+      lastIndex = index + match[0].length;
+    }
+
+    if (lastIndex < text.length) {
+      fragment.append(document.createTextNode(text.slice(lastIndex)));
+    }
+
+    node.replaceWith(fragment);
+  }
+
+  function linkifyTicketReferences(root) {
+    const targetRoot = root && root.nodeType === Node.ELEMENT_NODE ? root : document.body;
+    if (!targetRoot || targetRoot.closest?.(TICKET_REFERENCE_SKIP_SELECTOR)) {
+      return;
+    }
+
+    const walker = document.createTreeWalker(targetRoot, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return shouldLinkifyTicketReferenceTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    });
+    const nodes = [];
+    while (walker.nextNode()) {
+      nodes.push(walker.currentNode);
+    }
+    nodes.forEach(linkifyTicketReferenceTextNode);
+  }
+
+  function setupTicketReferenceLinks() {
+    linkifyTicketReferences(document.body);
+    if (typeof MutationObserver !== 'function' || !document.body) {
+      return;
+    }
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            linkifyTicketReferenceTextNode(node);
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            linkifyTicketReferences(node);
+          }
+        });
+      });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+
+  function setupPullToRefresh() {
+    const banner = document.querySelector('[data-pull-refresh-banner]');
+    if (!banner || !('ontouchstart' in window)) {
+      return;
+    }
+
+    const PULL_THRESHOLD_PX = 72;
+    let touchStartY = null;
+    let shouldRefresh = false;
+    let refreshing = false;
+
+    function atTop() {
+      const root = document.scrollingElement || document.documentElement;
+      return (root ? root.scrollTop : window.scrollY) <= 0;
+    }
+
+    function showRefreshingBanner() {
+      banner.hidden = false;
+      banner.setAttribute('aria-hidden', 'false');
+    }
+
+    document.addEventListener(
+      'touchstart',
+      (event) => {
+        if (refreshing || !event.touches || event.touches.length !== 1 || !atTop()) {
+          touchStartY = null;
+          shouldRefresh = false;
+          return;
+        }
+
+        touchStartY = event.touches[0].clientY;
+        shouldRefresh = false;
+      },
+      { passive: true },
+    );
+
+    document.addEventListener(
+      'touchmove',
+      (event) => {
+        if (refreshing || touchStartY === null || !event.touches || event.touches.length !== 1) {
+          return;
+        }
+
+        const pullDistance = event.touches[0].clientY - touchStartY;
+        shouldRefresh = atTop() && pullDistance >= PULL_THRESHOLD_PX;
+      },
+      { passive: true },
+    );
+
+    document.addEventListener(
+      'touchend',
+      () => {
+        if (refreshing || !shouldRefresh) {
+          touchStartY = null;
+          shouldRefresh = false;
+          return;
+        }
+
+        refreshing = true;
+        showRefreshingBanner();
+        window.setTimeout(() => {
+          window.location.reload();
+        }, 150);
+      },
+      { passive: true },
+    );
+  }
+
+  function initialise() {
+    getPortalToastApi();
+    setupAutoRefresh();
+    setupPullToRefresh();
+    setupForceRefresh();
+    setupUpdateBanner();
+    setupHeaderMenus();
+    setupModalCloseBehaviour();
+    setupAutoAlerts();
+    setupTicketReferenceLinks();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initialise, { once: true });
+  } else {
+    initialise();
+  }
+})();

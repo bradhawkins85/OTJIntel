@@ -1,0 +1,170 @@
+"""Server-side flash messaging via HMAC-signed HttpOnly cookie.
+
+Flash messages are stored in a short-lived ``_flash`` cookie instead of URL
+query parameters, so success/error text is never visible in the browser
+address bar.
+
+Usage (in a POST handler)::
+
+    from app.security.flash import flash_redirect
+
+    return flash_redirect("/admin/foo", "Saved successfully.", "success")
+
+Usage (read automatically in ``_render_template``; no action required in GET
+handlers unless the feature pack renders its own response).
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import re
+from typing import Literal
+from urllib.parse import unquote, urlparse
+
+from fastapi import Request, Response
+from fastapi.responses import RedirectResponse
+from starlette.status import HTTP_303_SEE_OTHER
+
+from app.core.config import get_settings
+
+_COOKIE_NAME = "_flash"
+_MAX_AGE = 60  # seconds – cookie is only needed until the next page load
+_VALID_VARIANTS = frozenset({"info", "success", "warning", "error"})
+
+
+def _secret() -> bytes:
+    return get_settings().secret_key.encode()
+
+
+def _sanitize_flash_message(message: str) -> str:
+    """Normalize untrusted flash text before embedding it in a cookie payload."""
+    text = str(message)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:200]
+
+
+def _sign(payload: str) -> str:
+    """Return ``payload|sig`` where *sig* is a truncated HMAC-SHA256 hex."""
+    sig = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}|{sig}"
+
+
+def _verify(signed: str) -> str | None:
+    """Return the raw payload if the signature is valid, else *None*."""
+    if "|" not in signed:
+        return None
+    payload, sig = signed.rsplit("|", 1)
+    expected_sig = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+    return payload
+
+
+def set_flash(
+    response: Response,
+    message: str,
+    variant: Literal["info", "success", "warning", "error"] = "info",
+) -> None:
+    """Attach a flash cookie to *response*.
+
+    The cookie is ``HttpOnly``, ``SameSite=Lax``, and expires after 60 s.
+    It is readable only by the server (``pop_flash``).
+    """
+    safe_variant = variant if variant in _VALID_VARIANTS else "info"
+    safe_message = _sanitize_flash_message(message)
+    payload = json.dumps({"message": safe_message, "variant": safe_variant})
+    signed = _sign(payload)
+    settings = get_settings()
+    secure = settings.environment.lower() == "production"
+    # Base64-encode so the cookie value is restricted to [A-Za-z0-9+/=]:
+    # - prevents any header-injection via special / whitespace characters
+    # - keeps the value RFC 6265-compliant
+    cookie_value = base64.b64encode(signed.encode("utf-8")).decode("utf-8")
+    response.set_cookie(
+        _COOKIE_NAME,
+        cookie_value,
+        httponly=True,
+        secure=secure,
+        max_age=_MAX_AGE,
+        samesite="lax",
+    )
+
+
+def pop_flash(request: Request) -> dict[str, str] | None:
+    """Read and validate the flash cookie from *request*.
+
+    Returns a ``{"message": ..., "variant": ...}`` dict, or *None* if the
+    cookie is absent or has an invalid signature.  The caller is responsible
+    for deleting the cookie from the response (use ``clear_flash``).
+    """
+    raw = request.cookies.get(_COOKIE_NAME)
+    if not raw:
+        return None
+    # Decode the base64 wrapper applied in set_flash; reject malformed values.
+    try:
+        raw = base64.b64decode(raw.encode("utf-8")).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    payload = _verify(raw)
+    if payload is None:
+        return None
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    message = data.get("message")
+    variant = data.get("variant", "info")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    if variant not in _VALID_VARIANTS:
+        variant = "info"
+    return {"message": message.strip(), "variant": variant}
+
+
+def clear_flash(response: Response) -> None:
+    """Delete the flash cookie from *response*."""
+    response.delete_cookie(_COOKIE_NAME)
+
+
+def _safe_redirect_target(url: str, *, fallback: str = "/") -> str:
+    """Return a local redirect target, or *fallback* when *url* is unsafe."""
+    candidate = str(url or "").strip()
+    if not candidate:
+        return fallback
+    candidate = candidate.replace("\\", "/")
+    parsed = urlparse(candidate)
+    if parsed.scheme or parsed.netloc:
+        return fallback
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return fallback
+    return candidate
+
+
+def flash_redirect(
+    url: str,
+    message: str,
+    variant: Literal["info", "success", "warning", "error"] = "info",
+    *,
+    status_code: int = HTTP_303_SEE_OTHER,
+) -> RedirectResponse:
+    """Return a ``RedirectResponse`` carrying a flash cookie.
+
+    Example::
+
+        return flash_redirect("/admin/foo", "Saved.", "success")
+    """
+    # Decode percent-encoding and normalise backslashes before validating.
+    decoded = unquote(str(url or "").strip()).replace("\\", "/")
+    parsed = urlparse(decoded)
+    if decoded and not parsed.scheme and not parsed.netloc and decoded.startswith("/") and not decoded.startswith("//"):
+        safe_url = decoded
+    else:
+        safe_url = "/"
+    response = RedirectResponse(url=safe_url, status_code=status_code)
+    set_flash(response, message, variant)
+    return response

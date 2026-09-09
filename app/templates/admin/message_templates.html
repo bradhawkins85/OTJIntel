@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_title %}<span class="header__title-text">Message templates</span>{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "New template", "type": "link", "variant": "primary", "href": "/admin/message-templates/new"}
+  ]) }}
+{% endblock %}
+
+{% block content %}
+  <div class="admin-grid">
+    <section class="card card--panel">
+      <header class="card__header card__header--actions">
+        <form method="get" class="card__controls card__controls--compact" aria-label="Filter message templates">
+          <input type="search" class="form-input" name="search" value="{{ filters.search or '' }}" placeholder="Search templates" aria-label="Search templates" />
+          <label class="visually-hidden" for="content-type-filter">Content type</label>
+          <select id="content-type-filter" class="form-input" name="content_type">
+            <option value="">All content types</option>
+            {% for option in content_type_options %}
+              <option value="{{ option.value }}" {% if option.value == filters.content_type %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="button">Apply</button>
+        </form>
+      </header>
+      <div class="table-wrapper">
+        <table class="table" id="message-templates-table" data-table data-table-id="message-templates">
+          <thead>
+            <tr>
+              <th scope="col" data-sort="string" data-column-key="slug">Slug</th>
+              <th scope="col" data-sort="string" data-column-key="name">Name</th>
+              <th scope="col" data-sort="string" data-column-key="description">Description</th>
+              <th scope="col" data-sort="string" data-column-key="content_type">Content type</th>
+              <th scope="col" data-sort="date" data-column-key="updated">Updated</th>
+              <th scope="col" class="table__actions" data-column-key="actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for template in templates %}
+              <tr
+                data-template-id="{{ template.id }}"
+                data-template-json="message-template-{{ template.id }}-data"
+              >
+                <td data-label="Slug" data-column-key="slug">{{ template.slug }}</td>
+                <td data-label="Name" data-column-key="name">{{ template.name }}</td>
+                <td data-label="Description" data-column-key="description">{{ template.description or '—' }}</td>
+                <td data-label="Content type" data-column-key="content_type">{{ template.content_type }}</td>
+                <td data-label="Updated" data-value="{{ template.updated_at_iso or '' }}" data-column-key="updated">
+                  {% if template.updated_at_iso %}
+                    <span data-utc="{{ template.updated_at_iso }}"></span>
+                  {% else %}
+                    <span class="text-muted">—</span>
+                  {% endif %}
+                </td>
+                <td class="table__actions" data-column-key="actions">
+                  <details class="header-title-menu__dropdown" data-header-menu>
+                    <summary class="header-title-menu__toggle" data-header-menu-toggle aria-haspopup="true">
+                      Actions
+                      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" class="header-title-menu__icon">
+                        <path d="M6.2 8.2a1 1 0 0 1 1.4 0L12 12.6l4.4-4.4a1 1 0 0 1 1.4 1.4l-5.1 5.1a1 1 0 0 1-1.4 0L6.2 9.6a1 1 0 0 1 0-1.4z" />
+                      </svg>
+                      <span class="visually-hidden">Toggle row actions menu</span>
+                    </summary>
+                    <ul class="header-title-menu__list" role="menu">
+                      <li class="header-title-menu__item" role="none">
+                        <a
+                          class="header-title-menu__link"
+                          role="menuitem"
+                          href="/admin/message-templates/{{ template.id }}/edit"
+                        >Edit</a>
+                      </li>
+
+                      <li class="header-title-menu__item" role="none">
+                        <button
+                          type="button"
+                          class="header-title-menu__link"
+                          role="menuitem"
+                          data-template-clone
+                        >Clone</button>
+                      </li>
+                      <li class="header-title-menu__item" role="none">
+                        <button
+                          type="button"
+                          class="header-title-menu__link header-title-menu__link--danger"
+                          role="menuitem"
+                          data-template-delete
+                        >Delete</button>
+                      </li>
+                    </ul>
+                  </details>
+                </td>
+              </tr>
+              <script type="application/json" id="message-template-{{ template.id }}-data" hidden>
+                {{ {
+                  "id": template.id,
+                  "slug": template.slug,
+                  "name": template.name,
+                  "description": template.description,
+                  "content_type": template.content_type,
+                  "content": template.content
+                } | tojson }}
+              </script>
+            {% else %}
+              <tr>
+                <td colspan="6" class="table__empty">No message templates have been created yet.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/admin.js') }}" defer></script>
+  <script>
+    // Allow row-level action dropdowns to overflow the table wrapper.
+    document.addEventListener('DOMContentLoaded', function () {
+      document.querySelectorAll('#message-templates-table [data-header-menu]').forEach(function (menu) {
+        const wrapper = menu.closest('.table-wrapper');
+        if (!wrapper) return;
+        menu.addEventListener('toggle', function () {
+          wrapper.style.overflow = menu.open ? 'visible' : '';
+        });
+      });
+    });
+  </script>
+{% endblock %}

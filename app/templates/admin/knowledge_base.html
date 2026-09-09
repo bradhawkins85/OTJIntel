@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_title %}Knowledge base admin{% endblock %}
+
+{% set scope_labels = {
+  "anonymous": "Public",
+  "user": "Specific users",
+  "company": "Company members",
+  "company_admin": "Company admins",
+  "super_admin": "Super admins"
+} %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "New article", "type": "link", "variant": "primary", "href": "/admin/knowledge-base/new"}
+  ]) }}
+{% endblock %}
+
+{% block content %}
+<div class="kb-admin">
+  <section class="card card--panel kb-admin__panel">
+    <header class="card__header card__header--stacked">
+      <div>
+        <h2 class="card__title">Knowledge base catalogue</h2>
+        <p class="card__subtitle">Review published and draft articles, filter entries, and open one in a dedicated editor.</p>
+      </div>
+      <div class="card__controls">
+        <input
+          type="search"
+          class="form-input"
+          placeholder="Filter articles"
+          aria-label="Filter articles"
+          data-table-filter="kb-admin-table"
+        />
+      </div>
+    </header>
+    <div class="table-wrapper table-wrapper--short">
+      <table class="table table--compact" id="kb-admin-table" data-table data-table-id="knowledge-base">
+        <thead>
+          <tr>
+            <th scope="col" data-sort="string" data-column-key="title">Title</th>
+            <th scope="col" data-sort="string" data-column-key="scope">Scope</th>
+            <th scope="col" data-sort="string" data-column-key="status">Status</th>
+            <th scope="col" data-sort="string" data-column-key="ai-tags">AI tags</th>
+            <th scope="col" data-sort="date" data-column-key="updated">Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for article in kb_articles %}
+          <tr
+            data-kb-row
+            data-kb-article-id="{{ article.id }}"
+            data-kb-article-slug="{{ article.slug }}"
+            data-kb-permission-scope="{{ article.permission_scope }}"
+            data-kb-is-published="{{ 'true' if article.is_published else 'false' }}"
+            data-kb-updated="{{ article.updated_at_iso or '' }}"
+          >
+            <td data-label="Title" data-column-key="title">
+              <a class="kb-admin__link" href="/admin/knowledge-base/articles/{{ article.slug }}">
+                <span class="kb-admin__title">{{ article.title }}</span>
+                {% if article.summary %}
+                  <span class="kb-admin__summary">{{ article.summary }}</span>
+                {% endif %}
+              </a>
+            </td>
+            <td data-label="Scope" data-value="{{ article.permission_scope }}" data-column-key="scope">
+              <span class="tag">{{ scope_labels.get(article.permission_scope, article.permission_scope|title) }}</span>
+            </td>
+            <td data-label="Status" data-value="{{ 'Published' if article.is_published else 'Draft' }}" data-column-key="status">
+              {% if article.is_published %}
+                <span class="status status--success">Published</span>
+              {% else %}
+                <span class="status status--warning">Draft</span>
+              {% endif %}
+            </td>
+            <td data-label="AI tags" data-value="{{ (article.ai_tags or []) | join(', ') }}" data-column-key="ai-tags">
+              {% for tag in article.ai_tags or [] %}<span class="tag tag--muted">{{ tag }}</span>{% endfor %}{% for tag in article.manual_ai_tags or [] %}<span class="tag tag--manual" title="Manual admin-added AI tag">{{ tag }}</span>{% endfor %}{% if not article.ai_tags and not article.manual_ai_tags %}<span class="text-muted">—</span>{% endif %}
+            </td>
+            <td data-label="Updated" data-value="{{ article.updated_at_iso or '' }}" data-column-key="updated">
+              <span data-utc="{{ article.updated_at_iso or '' }}">{{ article.updated_at_iso or '—' }}</span>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="5" class="table__empty">No knowledge base articles are available yet.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+{% endblock %}

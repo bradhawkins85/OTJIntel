@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_title %}Business continuity plans{% endblock %}
+
+{% set plan_type_labels = {
+  "disaster_recovery": "Disaster Recovery",
+  "incident_response": "Incident Response",
+  "business_continuity": "Business Continuity"
+} %}
+
+{% set status_labels = {
+  "draft": "Draft",
+  "active": "Active",
+  "archived": "Archived"
+} %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "New plan", "type": "link", "variant": "primary", "href": "/admin/business-continuity-plans/new"}
+  ]) }}
+{% endblock %}
+
+{% block content %}
+<div class="bc-plans-admin">
+  <section class="card card--panel bc-plans-admin__panel">
+    <header class="card__header card__header--stacked">
+      <div>
+        <h2 class="card__title">Business Continuity Plans</h2>
+        <p class="card__subtitle">Manage Disaster Recovery, Incident Response, and Business Continuity plans with version control and access permissions.</p>
+      </div>
+      <div class="card__controls">
+        <input
+          type="search"
+          class="form-input"
+          placeholder="Filter plans"
+          aria-label="Filter plans"
+          data-table-filter="bc-plans-table"
+        />
+      </div>
+    </header>
+    <div class="table-wrapper table-wrapper--short">
+      <table class="table table--compact" id="bc-plans-table" data-table data-table-id="bc-plans">
+        <thead>
+          <tr>
+            <th scope="col" data-sort="string" data-column-key="title">Title</th>
+            <th scope="col" data-sort="string" data-column-key="type">Type</th>
+            <th scope="col" data-sort="string" data-column-key="version">Version</th>
+            <th scope="col" data-sort="string" data-column-key="status">Status</th>
+            <th scope="col" data-sort="date" data-column-key="last_updated">Last Updated</th>
+            <th scope="col" data-sort="date" data-column-key="last_reviewed">Last Reviewed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for plan in bc_plans %}
+          <tr
+            data-bc-plan-row
+            data-bc-plan-id="{{ plan.id }}"
+            data-bc-plan-type="{{ plan.plan_type }}"
+            data-bc-plan-status="{{ plan.status }}"
+            data-bc-updated="{{ plan.updated_at_iso or '' }}"
+            data-bc-reviewed="{{ plan.last_reviewed_at_iso or '' }}"
+          >
+            <td data-label="Title" data-column-key="title">
+              <a class="bc-plans-admin__link" href="/admin/business-continuity-plans/{{ plan.id }}">
+                <span class="bc-plans-admin__title">{{ plan.title }}</span>
+              </a>
+            </td>
+            <td data-label="Type" data-value="{{ plan.plan_type }}" data-column-key="type">
+              <span class="tag tag--{{ plan.plan_type }}">{{ plan_type_labels.get(plan.plan_type, plan.plan_type|title) }}</span>
+            </td>
+            <td data-label="Version" data-value="{{ plan.version }}" data-column-key="version">
+              <span class="badge">{{ plan.version }}</span>
+            </td>
+            <td data-label="Status" data-value="{{ plan.status }}" data-column-key="status">
+              {% if plan.status == 'active' %}
+                <span class="status status--success">Active</span>
+              {% elif plan.status == 'draft' %}
+                <span class="status status--warning">Draft</span>
+              {% else %}
+                <span class="status status--neutral">Archived</span>
+              {% endif %}
+            </td>
+            <td data-label="Last Updated" data-value="{{ plan.updated_at_iso or '' }}" data-column-key="last_updated">
+              <span data-utc="{{ plan.updated_at_iso or '' }}">{{ plan.updated_at_iso or '—' }}</span>
+            </td>
+            <td data-label="Last Reviewed" data-value="{{ plan.last_reviewed_at_iso or '' }}" data-column-key="last_reviewed">
+              <span data-utc="{{ plan.last_reviewed_at_iso or '' }}">{{ plan.last_reviewed_at_iso or '—' }}</span>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="6" class="table__empty">No business continuity plans are available yet.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+{% endblock %}

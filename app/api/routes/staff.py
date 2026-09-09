@@ -1,0 +1,1561 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+
+from app.api.dependencies.auth import get_current_user, get_optional_user, require_super_admin
+from app.api.dependencies.api_keys import get_optional_api_key, require_api_key
+from app.api.dependencies.database import require_database
+from app.repositories import companies as company_repo
+from app.repositories import company_memberships as membership_repo
+from app.repositories import staff as staff_repo
+from app.repositories import staff_custom_fields as staff_custom_fields_repo
+from app.repositories import staff_onboarding_workflows as staff_workflow_repo
+from app.repositories import staff_requests as staff_requests_repo
+from app.schemas.staff import (
+    StaffApprovalDecision,
+    StaffCreate,
+    StaffExternalCheckpointCallback,
+    StaffExternalCheckpointResponse,
+    StaffOffboardingRequestCreate,
+    StaffWorkflowWebhookCallback,
+    StaffWorkflowManualActionRequest,
+    StaffWorkflowManualActionResponse,
+    StaffRequestCreate,
+    StaffRequestResponse,
+    StaffResponse,
+    StaffUpdate,
+)
+from app.services import audit as audit_service
+from app.services import staff_field_config as staff_field_config_service
+from app.services import staff_onboarding_workflows as staff_onboarding_workflow_service
+
+
+router = APIRouter(prefix="/api/staff", tags=["Staff"])
+STAFF_REQUEST_PERMISSION = "staff.request"
+STAFF_APPROVE_PERMISSION = "staff.approve"
+
+
+def _validate_custom_field_values(
+    values: dict[str, object], definitions: list[dict]
+) -> tuple[dict[str, object], list[str]]:
+    definitions_by_name = {
+        str(item.get("name") or "").strip(): item for item in definitions
+    }
+    errors: list[str] = []
+    normalized: dict[str, object] = {}
+    for name, value in values.items():
+        definition = definitions_by_name.get(str(name))
+        if definition is None:
+            errors.append(f"Unknown custom field: {name}")
+            continue
+        field_type = str(definition.get("field_type") or "text").lower()
+        allowed = {
+            str(option.get("value") or "")
+            for option in definition.get("options") or []
+        }
+        if field_type == "checkbox":
+            if not isinstance(value, bool):
+                errors.append(f"{name} must be true or false")
+                continue
+            normalized[name] = value
+        elif field_type == "multiselect":
+            selected = value if isinstance(value, list) else str(value or "").split(",")
+            selected = [str(item).strip() for item in selected if str(item).strip()]
+            if allowed and any(item not in allowed for item in selected):
+                errors.append(f"{name} contains an invalid option")
+                continue
+            normalized[name] = ",".join(selected) or None
+        else:
+            text_value = str(value or "").strip() or None
+            if field_type == "select" and text_value and allowed and text_value not in allowed:
+                errors.append(f"{name} has an invalid option")
+                continue
+            normalized[name] = text_value
+    return normalized, errors
+
+
+async def _ensure_company_exists(company_id: int) -> None:
+    company = await company_repo.get_company_by_id(company_id)
+    if not company:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
+
+
+async def _require_staff_request_access(current_user: dict, company_id: int) -> None:
+    if current_user.get("is_super_admin"):
+        return
+    user_id = current_user.get("id")
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions to request staff onboarding",
+        ) from exc
+    membership = await membership_repo.get_membership_by_company_user(company_id, user_id_int)
+    if not membership or str(membership.get("status", "")).lower() != "active":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Company membership required")
+    permissions = set(membership.get("combined_permissions") or membership.get("permissions") or [])
+    if "company.admin" not in permissions and STAFF_REQUEST_PERMISSION not in permissions:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions to request staff onboarding",
+        )
+
+
+async def _can_submit_group_mapped_custom_fields(current_user: dict, company_id: int) -> bool:
+    if current_user.get("is_super_admin"):
+        return True
+    user_id = current_user.get("id")
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    membership = await membership_repo.get_membership_by_company_user(company_id, user_id_int)
+    if not membership or str(membership.get("status", "")).lower() != "active":
+        return False
+    permissions = set(membership.get("combined_permissions") or membership.get("permissions") or [])
+    if "company.admin" in permissions:
+        return True
+    try:
+        staff_permission = int(membership.get("staff_permission") or 0)
+    except (TypeError, ValueError):
+        staff_permission = 0
+    return staff_permission >= 2
+
+
+async def _require_staff_approval_access(current_user: dict, company_id: int) -> None:
+    if current_user.get("is_super_admin"):
+        return
+    user_id = current_user.get("id")
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions to approve staff onboarding requests",
+        ) from exc
+    membership = await membership_repo.get_membership_by_company_user(company_id, user_id_int)
+    if not membership or str(membership.get("status", "")).lower() != "active":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Company membership required")
+    permissions = set(membership.get("combined_permissions") or membership.get("permissions") or [])
+    if "company.admin" not in permissions and STAFF_APPROVE_PERMISSION not in permissions:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions to approve staff onboarding requests",
+        )
+
+
+def _external_confirmation_fingerprint(
+    *,
+    path_staff_id: int,
+    api_key_id: int,
+    payload: StaffExternalCheckpointCallback,
+) -> str:
+    digest_payload = {
+        "path_staff_id": int(path_staff_id),
+        "body_staff_id": int(payload.staff_id),
+        "company_id": int(payload.company_id),
+        "confirmation_token": payload.confirmation_token,
+        "source": payload.source,
+        "callback_timestamp": payload.callback_timestamp.isoformat() if payload.callback_timestamp else None,
+        "proof_reference_id": payload.proof_reference_id,
+        "payload_hash": payload.payload_hash,
+        "callback_payload": payload.callback_payload or {},
+        "api_key_id": int(api_key_id),
+    }
+    encoded = json.dumps(digest_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _encode_staff_cursor(updated_at: datetime | str | None, staff_id: int | None) -> str | None:
+    if updated_at is None or staff_id is None:
+        return None
+    if isinstance(updated_at, datetime):
+        timestamp = updated_at.isoformat()
+    else:
+        timestamp = str(updated_at).strip()
+    if not timestamp:
+        return None
+    return f"{timestamp}|{int(staff_id)}"
+
+
+def _execution_action_replay_key(staff_id: int, execution_id: int, action_name: str, idempotency_key: str | None) -> str:
+    safe_key = (idempotency_key or "").strip().lower()
+    return f"{staff_id}:{execution_id}:{action_name}:{safe_key}"
+
+
+@router.get("", response_model=list[StaffResponse])
+async def list_staff(
+    response: Response,
+    company_id: int | None = Query(default=None, alias="companyId"),
+    account_action: str | None = Query(default=None, alias="accountAction"),
+    email: str | None = None,
+    onboarding_complete: bool | None = Query(default=None, alias="onboardingComplete"),
+    onboarding_status: str | None = Query(default=None, alias="onboardingStatus"),
+    offboarding_complete: bool | None = Query(default=None, alias="offboardingComplete"),
+    offboarding_status: str | None = Query(default=None, alias="offboardingStatus"),
+    created_after: datetime | None = Query(default=None, alias="createdAfter"),
+    updated_after: datetime | None = Query(default=None, alias="updatedAfter"),
+    offboarding_requested_after: datetime | None = Query(default=None, alias="offboardingRequestedAfter"),
+    offboarding_updated_after: datetime | None = Query(default=None, alias="offboardingUpdatedAfter"),
+    scheduled_from: datetime | None = Query(default=None),
+    scheduled_to: datetime | None = Query(default=None),
+    due_only: bool = Query(default=False),
+    cursor: str | None = Query(default=None, alias="cursor"),
+    page_size: int | None = Query(default=200, alias="pageSize", ge=1, le=500),
+    _: None = Depends(require_database),
+    current_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+):
+    if current_user is None and api_key_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    # API keys have full (super-admin equivalent) access
+    is_api_key_auth = api_key_record is not None and current_user is None
+    # If company_id is provided, only helpdesk technicians and super admins can access
+    if company_id is not None:
+        is_super_admin = is_api_key_auth or (current_user or {}).get("is_super_admin", False)
+        if not is_super_admin:
+            user_id = (current_user or {}).get("id")
+            try:
+                user_id_int = int(user_id)
+                has_helpdesk = await membership_repo.user_has_permission(
+                    user_id_int, "helpdesk.technician"
+                )
+                if not has_helpdesk:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Insufficient permissions to list staff"
+                    )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Insufficient permissions to list staff"
+                )
+        safe_page_size = max(1, min(int(page_size or 200), 500))
+        records = await staff_repo.list_staff(
+            company_id,
+            enabled=True,
+            onboarding_complete=onboarding_complete,
+            onboarding_status=onboarding_status,
+            offboarding_complete=offboarding_complete,
+            offboarding_status=offboarding_status,
+            created_after=created_after,
+            updated_after=updated_after,
+            offboarding_requested_after=offboarding_requested_after,
+            offboarding_updated_after=offboarding_updated_after,
+            scheduled_from=scheduled_from,
+            scheduled_to=scheduled_to,
+            due_only=due_only,
+            cursor=cursor,
+            page_size=safe_page_size + 1,
+        )
+        has_more = len(records) > safe_page_size
+        page_records = records[:safe_page_size]
+        next_cursor = None
+        if has_more and page_records:
+            last_record = page_records[-1]
+            next_cursor = _encode_staff_cursor(last_record.get("updated_at"), last_record.get("id"))
+        response.headers["X-Has-More"] = "true" if has_more else "false"
+        if next_cursor:
+            response.headers["X-Next-Cursor"] = next_cursor
+        records = page_records
+    else:
+        # Listing all staff requires super admin or API key
+        if not is_api_key_auth and not (current_user or {}).get("is_super_admin", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions to list all staff"
+            )
+        records = await staff_repo.list_all_staff(
+            account_action=account_action,
+            email=email,
+            scheduled_from=scheduled_from,
+            scheduled_to=scheduled_to,
+            due_only=due_only,
+        )
+    workflow_map = await staff_workflow_repo.list_executions_for_staff_ids(
+        [int(record["id"]) for record in records if record.get("id") is not None]
+    )
+    for record in records:
+        execution = workflow_map.get(int(record["id"])) if record.get("id") is not None else None
+        record["workflow_status"] = execution
+    return [StaffResponse.model_validate(record) for record in records]
+
+
+@router.post("", response_model=StaffResponse, status_code=status.HTTP_201_CREATED)
+async def create_staff(
+    payload: StaffCreate,
+    _: None = Depends(require_database),
+    current_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+):
+    if current_user is None and api_key_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    # Session users must be super admins; API key auth is always permitted at this level
+    if current_user is not None and not current_user.get("is_super_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
+    acting_user_id = int(current_user["id"]) if current_user and current_user.get("id") is not None else None
+    payload_data = payload.model_dump(by_alias=False)
+    custom_fields = payload_data.pop("custom_fields", None) or {}
+    payload_data.setdefault("onboarding_status", "approved")
+    payload_data.setdefault("onboarding_complete", False)
+    payload_data.setdefault("onboarding_completed_at", None)
+    payload_data.setdefault("approval_status", "approved")
+    payload_data.setdefault("approved_by_user_id", acting_user_id)
+    payload_data.setdefault("approved_at", datetime.now(tz=timezone.utc))
+    created = await staff_repo.create_staff(**payload_data)
+    await staff_custom_fields_repo.set_staff_field_values_by_name(
+        company_id=created["company_id"],
+        staff_id=created["id"],
+        values=custom_fields,
+    )
+    created = await staff_repo.get_staff_by_id(created["id"]) or created
+    await staff_onboarding_workflow_service.enqueue_staff_onboarding_workflow(
+        company_id=int(created["company_id"]),
+        staff_id=int(created["id"]),
+        initiated_by_user_id=acting_user_id,
+    )
+    created["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(int(created["id"]))
+    return StaffResponse.model_validate(created)
+
+
+@router.get("/requests", response_model=list[StaffRequestResponse])
+async def list_staff_requests(
+    company_id: int = Query(..., alias="companyId"),
+    request_status: str | None = Query(default=None, alias="status"),
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    await _ensure_company_exists(company_id)
+    await _require_staff_request_access(current_user, company_id)
+    records = await staff_requests_repo.list_requests(company_id, status=request_status)
+    return [StaffRequestResponse.model_validate(r) for r in records]
+
+
+@router.post("/requests", response_model=StaffRequestResponse, status_code=status.HTTP_201_CREATED)
+async def create_staff_request(
+    payload: StaffRequestCreate,
+    company_id: int = Query(..., alias="companyId"),
+    _: None = Depends(require_database),
+    current_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+):
+    if current_user is None and api_key_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    await _ensure_company_exists(company_id)
+    if current_user is not None:
+        await _require_staff_request_access(current_user, company_id)
+    payload_data = payload.model_dump(by_alias=False)
+    payload_data.pop("company_id", None)
+    custom_fields: dict = payload_data.pop("custom_fields", None) or {}
+    if current_user is None:
+        field_config = await staff_field_config_service.load_effective_company_staff_fields(company_id)
+        standard_values, validation_errors = staff_field_config_service.validate_staff_form_values(
+            payload_data, field_config
+        )
+        if validation_errors:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=validation_errors,
+            )
+        payload_data.update(standard_values)
+        custom_definitions = await staff_custom_fields_repo.list_field_definitions(company_id)
+        custom_fields, custom_field_errors = _validate_custom_field_values(
+            custom_fields, custom_definitions
+        )
+        if custom_field_errors:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=custom_field_errors,
+            )
+    if custom_fields and current_user is not None and not await _can_submit_group_mapped_custom_fields(current_user, company_id):
+        policy = await staff_workflow_repo.get_company_workflow_policy(company_id)
+        policy_config = policy.get("config") if isinstance(policy.get("config"), dict) else {}
+        mapped_custom_fields = set(staff_onboarding_workflow_service._normalise_custom_field_group_mappings(policy_config).keys())
+        custom_fields = {
+            field_name: value
+            for field_name, value in custom_fields.items()
+            if field_name not in mapped_custom_fields
+        }
+    requester_id = (
+        int(current_user["id"])
+        if current_user is not None and current_user.get("id") is not None
+        else None
+    )
+    created = await staff_requests_repo.create_request(
+        company_id=company_id,
+        first_name=str(payload_data.get("first_name") or "").strip(),
+        last_name=str(payload_data.get("last_name") or "").strip(),
+        email=str(payload_data.get("email") or "").strip() or None,
+        mobile_phone=str(payload_data.get("mobile_phone") or "").strip() or None,
+        date_onboarded=payload_data.get("date_onboarded"),
+        department=str(payload_data.get("department") or "").strip() or None,
+        enabled=bool(payload_data.get("enabled", True)),
+        job_title=str(payload_data.get("job_title") or "").strip() or None,
+        request_notes=str(payload_data.get("request_notes") or "").strip() or None,
+        custom_fields=custom_fields or None,
+        requested_by_user_id=requester_id,
+        requested_at=datetime.now(tz=timezone.utc),
+    )
+    approver_user_ids = await staff_onboarding_workflow_service.notify_staff_approval_requested(
+        company_id=company_id,
+        staff={
+            "id": created["id"],
+            "company_id": company_id,
+            "first_name": created.get("first_name"),
+            "last_name": created.get("last_name"),
+            "email": created.get("email"),
+            "onboarding_status": "awaiting_approval",
+            "approval_status": "pending",
+        },
+        requester_user_id=requester_id,
+    )
+    await audit_service.log_action(
+        user_id=requester_id,
+        action="staff.onboarding.requested",
+        entity_type="staff_request",
+        entity_id=int(created["id"]),
+        metadata={
+            "company_id": company_id,
+            "approval_status": "pending",
+            "approver_user_ids": approver_user_ids,
+        },
+    )
+    return StaffRequestResponse.model_validate(created)
+
+
+@router.post("/requests/{request_id}/approve", response_model=StaffRequestResponse)
+async def approve_staff_request_entry(
+    request_id: int,
+    payload: StaffApprovalDecision,
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff_request = await staff_requests_repo.get_request_by_id(request_id)
+    if not staff_request:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff request not found")
+    await _require_staff_approval_access(current_user, int(staff_request["company_id"]))
+    if str(staff_request.get("status") or "").lower() != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Staff request is not in a pending state",
+        )
+    approval_comment = str(payload.comment or payload.reason or "").strip() or None
+    approver_id = int(current_user.get("id")) if current_user.get("id") is not None else None
+    now = datetime.now(tz=timezone.utc)
+
+    # Check if a staff record already exists for this email to avoid duplicates
+    existing_staff = None
+    email = str(staff_request.get("email") or "").strip().lower()
+    if email:
+        matches = await staff_repo.list_staff_by_email(email)
+        for candidate in matches:
+            if int(candidate.get("company_id") or 0) == int(staff_request["company_id"]):
+                existing_staff = candidate
+                break
+
+    if existing_staff:
+        staff_id = int(existing_staff["id"])
+        # A request can match an inactive/ex-staff record left by an earlier
+        # lifecycle. Treat approval as a new onboarding decision rather than
+        # merely linking the request to that hidden record.
+        await staff_repo.update_staff(
+            staff_id,
+            company_id=int(staff_request["company_id"]),
+            first_name=str(staff_request.get("first_name") or existing_staff.get("first_name") or ""),
+            last_name=str(staff_request.get("last_name") or existing_staff.get("last_name") or ""),
+            email=staff_request.get("email") or existing_staff.get("email"),
+            mobile_phone=staff_request.get("mobile_phone") or existing_staff.get("mobile_phone"),
+            date_onboarded=staff_request.get("date_onboarded") or existing_staff.get("date_onboarded"),
+            date_offboarded=None,
+            enabled=bool(staff_request.get("enabled", True)),
+            is_ex_staff=False,
+            street=existing_staff.get("street"),
+            city=existing_staff.get("city"),
+            state=existing_staff.get("state"),
+            postcode=existing_staff.get("postcode"),
+            country=existing_staff.get("country"),
+            department=staff_request.get("department") or existing_staff.get("department"),
+            job_title=staff_request.get("job_title") or existing_staff.get("job_title"),
+            org_company=existing_staff.get("org_company"),
+            manager_name=existing_staff.get("manager_name"),
+            account_action=None,
+            syncro_contact_id=existing_staff.get("syncro_contact_id"),
+            onboarding_status="approved",
+            onboarding_complete=False,
+            onboarding_completed_at=None,
+            approval_status="approved",
+            requested_by_user_id=staff_request.get("requested_by_user_id"),
+            requested_at=staff_request.get("requested_at"),
+            approved_by_user_id=approver_id,
+            approved_at=now,
+            request_notes=staff_request.get("request_notes"),
+            approval_notes=approval_comment,
+        )
+    else:
+        created_staff = await staff_repo.create_staff(
+            company_id=int(staff_request["company_id"]),
+            first_name=str(staff_request.get("first_name") or ""),
+            last_name=str(staff_request.get("last_name") or ""),
+            email=str(staff_request.get("email") or ""),
+            mobile_phone=staff_request.get("mobile_phone"),
+            date_onboarded=staff_request.get("date_onboarded"),
+            department=staff_request.get("department"),
+            enabled=bool(staff_request.get("enabled", True)),
+            job_title=staff_request.get("job_title"),
+            onboarding_status="approved",
+            onboarding_complete=False,
+            approval_status="approved",
+            approved_by_user_id=approver_id,
+            approved_at=now,
+            approval_notes=approval_comment,
+            requested_by_user_id=staff_request.get("requested_by_user_id"),
+            requested_at=staff_request.get("requested_at"),
+        )
+        staff_id = int(created_staff["id"])
+
+    custom_fields = staff_request.get("custom_fields") or {}
+    if custom_fields:
+        await staff_custom_fields_repo.set_staff_field_values_by_name(
+            company_id=int(staff_request["company_id"]),
+            staff_id=staff_id,
+            values=custom_fields,
+        )
+    # Queue for both newly-created and reactivated staff. Previously the
+    # existing-record path skipped workflow execution entirely.
+    await staff_onboarding_workflow_service.enqueue_staff_onboarding_workflow(
+        company_id=int(staff_request["company_id"]),
+        staff_id=staff_id,
+        initiated_by_user_id=approver_id,
+    )
+
+    updated_request = await staff_requests_repo.update_request_status(
+        request_id,
+        status="approved",
+        approved_by_user_id=approver_id,
+        approved_at=now,
+        approval_notes=approval_comment,
+        staff_id=staff_id,
+    )
+    await audit_service.log_action(
+        user_id=approver_id,
+        action="staff.onboarding.approved",
+        entity_type="staff_request",
+        entity_id=request_id,
+        metadata={
+            "company_id": int(staff_request["company_id"]),
+            "staff_id": staff_id,
+            "comment": approval_comment,
+            "linked_existing": existing_staff is not None,
+        },
+    )
+    return StaffRequestResponse.model_validate(updated_request)
+
+
+@router.post("/requests/{request_id}/deny", response_model=StaffRequestResponse)
+async def deny_staff_request_entry(
+    request_id: int,
+    payload: StaffApprovalDecision,
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff_request = await staff_requests_repo.get_request_by_id(request_id)
+    if not staff_request:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff request not found")
+    await _require_staff_approval_access(current_user, int(staff_request["company_id"]))
+    if str(staff_request.get("status") or "").lower() != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Staff request is not in a pending state",
+        )
+    denial_reason = str(payload.reason or payload.comment or "").strip()
+    if not denial_reason:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Deny reason is required")
+    approver_id = int(current_user.get("id")) if current_user.get("id") is not None else None
+    updated_request = await staff_requests_repo.update_request_status(
+        request_id,
+        status="denied",
+        approved_by_user_id=approver_id,
+        approved_at=datetime.now(tz=timezone.utc),
+        approval_notes=denial_reason,
+    )
+    await audit_service.log_action(
+        user_id=approver_id,
+        action="staff.onboarding.denied",
+        entity_type="staff_request",
+        entity_id=request_id,
+        metadata={
+            "company_id": int(staff_request["company_id"]),
+            "reason": denial_reason,
+        },
+    )
+    return StaffRequestResponse.model_validate(updated_request)
+
+
+@router.post("/{staff_id}/approve", response_model=StaffResponse, include_in_schema=False)
+@router.post("/{staff_id}/onboarding/approve", response_model=StaffResponse)
+async def approve_staff_request(
+    staff_id: int,
+    payload: StaffApprovalDecision,
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    await _require_staff_approval_access(current_user, int(staff["company_id"]))
+    comment_text = str(payload.comment or payload.reason or "").strip() or None
+    updated = await staff_repo.update_staff(
+        staff_id,
+        company_id=staff["company_id"],
+        first_name=staff["first_name"],
+        last_name=staff["last_name"],
+        email=staff["email"],
+        mobile_phone=staff.get("mobile_phone"),
+        date_onboarded=staff.get("date_onboarded"),
+        date_offboarded=staff.get("date_offboarded"),
+        enabled=bool(staff.get("enabled", True)),
+        is_ex_staff=bool(staff.get("is_ex_staff", False)),
+        street=staff.get("street"),
+        city=staff.get("city"),
+        state=staff.get("state"),
+        postcode=staff.get("postcode"),
+        country=staff.get("country"),
+        department=staff.get("department"),
+        job_title=staff.get("job_title"),
+        org_company=staff.get("org_company"),
+        manager_name=staff.get("manager_name"),
+        account_action=staff.get("account_action"),
+        syncro_contact_id=staff.get("syncro_contact_id"),
+        onboarding_status="approved",
+        onboarding_complete=bool(staff.get("onboarding_complete", False)),
+        onboarding_completed_at=staff.get("onboarding_completed_at"),
+        approval_status="approved",
+        approved_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        approved_at=datetime.now(tz=timezone.utc),
+        approval_notes=comment_text,
+    )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.onboarding.approved",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(updated["company_id"]),
+            "comment": comment_text,
+        },
+    )
+    await staff_onboarding_workflow_service.enqueue_staff_onboarding_workflow(
+        company_id=int(updated["company_id"]),
+        staff_id=staff_id,
+        initiated_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+    )
+    updated["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    return StaffResponse.model_validate(updated)
+
+
+@router.post("/{staff_id}/deny", response_model=StaffResponse, include_in_schema=False)
+@router.post("/{staff_id}/onboarding/deny", response_model=StaffResponse)
+async def deny_staff_request(
+    staff_id: int,
+    payload: StaffApprovalDecision,
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    await _require_staff_approval_access(current_user, int(staff["company_id"]))
+    reason_text = str(payload.reason or payload.comment or "").strip()
+    if not reason_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Deny reason is required")
+    updated = await staff_repo.update_staff(
+        staff_id,
+        company_id=staff["company_id"],
+        first_name=staff["first_name"],
+        last_name=staff["last_name"],
+        email=staff["email"],
+        mobile_phone=staff.get("mobile_phone"),
+        date_onboarded=staff.get("date_onboarded"),
+        date_offboarded=staff.get("date_offboarded"),
+        enabled=bool(staff.get("enabled", True)),
+        is_ex_staff=bool(staff.get("is_ex_staff", False)),
+        street=staff.get("street"),
+        city=staff.get("city"),
+        state=staff.get("state"),
+        postcode=staff.get("postcode"),
+        country=staff.get("country"),
+        department=staff.get("department"),
+        job_title=staff.get("job_title"),
+        org_company=staff.get("org_company"),
+        manager_name=staff.get("manager_name"),
+        account_action=staff.get("account_action"),
+        syncro_contact_id=staff.get("syncro_contact_id"),
+        onboarding_status="denied",
+        onboarding_complete=False,
+        onboarding_completed_at=None,
+        approval_status="denied",
+        approved_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        approved_at=datetime.now(tz=timezone.utc),
+        approval_notes=reason_text,
+    )
+    execution = await staff_workflow_repo.get_execution_by_staff_id(staff_id)
+    if execution:
+        await staff_workflow_repo.update_execution_state(
+            int(execution["id"]),
+            state="denied",
+            current_step="denied",
+            completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            last_error=reason_text,
+        )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.onboarding.denied",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(updated["company_id"]),
+            "reason": reason_text,
+        },
+    )
+    updated["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    return StaffResponse.model_validate(updated)
+
+
+@router.post("/{staff_id}/offboarding/request", response_model=StaffResponse)
+async def request_staff_offboarding(
+    staff_id: int,
+    payload: StaffOffboardingRequestCreate,
+    _: None = Depends(require_database),
+    api_key_record: dict = Depends(require_api_key),
+):
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found"
+        )
+    company_id = int(staff["company_id"])
+    if payload.company_id is not None and payload.company_id != company_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Staff member does not belong to company",
+        )
+    if not bool(staff.get("enabled", False)) or bool(staff.get("is_ex_staff", False)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only active staff members can be offboarding requested",
+        )
+    if str(staff.get("account_action") or "").strip().lower() == "offboard requested":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An offboarding request is already pending for this staff member",
+        )
+    offboarding_type = payload.offboarding_type.strip().title()
+    if offboarding_type not in {"Resignation", "Termination"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Offboarding type must be Resignation or Termination",
+        )
+    notes = (payload.notes or "").strip() or None
+    request_notes = f"Type: {offboarding_type}" + (
+        f"\n\nNotes: {notes}" if notes else ""
+    )
+    requested_at = payload.date_offboarded
+    if requested_at.tzinfo is None:
+        requested_at = requested_at.replace(tzinfo=timezone.utc)
+    else:
+        requested_at = requested_at.astimezone(timezone.utc)
+    updated = await staff_repo.update_staff(
+        staff_id,
+        company_id=company_id,
+        first_name=staff.get("first_name") or "",
+        last_name=staff.get("last_name") or "",
+        email=staff.get("email") or "",
+        mobile_phone=staff.get("mobile_phone"),
+        date_onboarded=staff.get("date_onboarded"),
+        date_offboarded=requested_at,
+        enabled=True,
+        is_ex_staff=False,
+        street=staff.get("street"),
+        city=staff.get("city"),
+        state=staff.get("state"),
+        postcode=staff.get("postcode"),
+        country=staff.get("country"),
+        department=staff.get("department"),
+        job_title=staff.get("job_title"),
+        org_company=staff.get("org_company"),
+        manager_name=staff.get("manager_name"),
+        account_action="Offboard Requested",
+        syncro_contact_id=staff.get("syncro_contact_id"),
+        onboarding_status=staff_onboarding_workflow_service.STATE_OFFBOARDING_AWAITING_APPROVAL,
+        onboarding_complete=bool(staff.get("onboarding_complete", False)),
+        onboarding_completed_at=staff.get("onboarding_completed_at"),
+        approval_status="pending",
+        requested_by_user_id=None,
+        requested_at=datetime.now(tz=timezone.utc),
+        approved_by_user_id=None,
+        approved_at=None,
+        request_notes=request_notes,
+        approval_notes=None,
+    )
+    approvers = await staff_onboarding_workflow_service.notify_staff_approval_requested(
+        company_id=company_id,
+        staff=updated,
+        requester_user_id=None,
+        direction=staff_onboarding_workflow_service.DIRECTION_OFFBOARDING,
+    )
+    await audit_service.log_action(
+        user_id=None,
+        action="staff.offboarding.requested",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": company_id,
+            "api_key_id": api_key_record.get("id"),
+            "approver_user_ids": approvers,
+        },
+    )
+    updated["workflow_status"] = (
+        await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    )
+    return StaffResponse.model_validate(updated)
+
+
+@router.post("/{staff_id}/offboarding/approve", response_model=StaffResponse)
+async def approve_staff_offboarding(
+    staff_id: int,
+    payload: StaffApprovalDecision,
+    _: None = Depends(require_database),
+    current_user: dict = Depends(require_super_admin),
+):
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+
+    if str(staff.get("account_action") or "").strip().lower() != "offboard requested":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No pending offboarding request for this staff member",
+        )
+
+    decision_notes = str(payload.comment or payload.reason or "").strip() or None
+    updated = await staff_repo.update_staff(
+        staff_id,
+        company_id=staff["company_id"],
+        first_name=staff["first_name"],
+        last_name=staff["last_name"],
+        email=staff["email"],
+        mobile_phone=staff.get("mobile_phone"),
+        date_onboarded=staff.get("date_onboarded"),
+        date_offboarded=staff.get("date_offboarded"),
+        enabled=bool(staff.get("enabled", True)),
+        is_ex_staff=bool(staff.get("is_ex_staff", False)),
+        street=staff.get("street"),
+        city=staff.get("city"),
+        state=staff.get("state"),
+        postcode=staff.get("postcode"),
+        country=staff.get("country"),
+        department=staff.get("department"),
+        job_title=staff.get("job_title"),
+        org_company=staff.get("org_company"),
+        manager_name=staff.get("manager_name"),
+        account_action="Offboard Approved",
+        syncro_contact_id=staff.get("syncro_contact_id"),
+        onboarding_status=staff_onboarding_workflow_service.STATE_OFFBOARDING_APPROVED,
+        onboarding_complete=bool(staff.get("onboarding_complete", False)),
+        onboarding_completed_at=staff.get("onboarding_completed_at"),
+        approval_status="approved",
+        approved_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        approved_at=datetime.now(tz=timezone.utc),
+        approval_notes=decision_notes,
+    )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.offboarding.approved",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(updated["company_id"]),
+            "decision_notes": decision_notes,
+        },
+    )
+    await staff_onboarding_workflow_service.enqueue_staff_onboarding_workflow(
+        company_id=int(updated["company_id"]),
+        staff_id=staff_id,
+        initiated_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        direction=staff_onboarding_workflow_service.DIRECTION_OFFBOARDING,
+    )
+    updated["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    return StaffResponse.model_validate(updated)
+
+
+@router.post("/{staff_id}/offboarding/deny", response_model=StaffResponse)
+async def deny_staff_offboarding(
+    staff_id: int,
+    payload: StaffApprovalDecision,
+    _: None = Depends(require_database),
+    current_user: dict = Depends(require_super_admin),
+):
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+
+    if str(staff.get("account_action") or "").strip().lower() != "offboard requested":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No pending offboarding request for this staff member",
+        )
+
+    decision_notes = str(payload.reason or payload.comment or "").strip()
+    if not decision_notes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Deny reason is required")
+    updated = await staff_repo.update_staff(
+        staff_id,
+        company_id=staff["company_id"],
+        first_name=staff["first_name"],
+        last_name=staff["last_name"],
+        email=staff["email"],
+        mobile_phone=staff.get("mobile_phone"),
+        date_onboarded=staff.get("date_onboarded"),
+        date_offboarded=None,
+        enabled=bool(staff.get("enabled", True)),
+        is_ex_staff=bool(staff.get("is_ex_staff", False)),
+        street=staff.get("street"),
+        city=staff.get("city"),
+        state=staff.get("state"),
+        postcode=staff.get("postcode"),
+        country=staff.get("country"),
+        department=staff.get("department"),
+        job_title=staff.get("job_title"),
+        org_company=staff.get("org_company"),
+        manager_name=staff.get("manager_name"),
+        account_action=None,
+        syncro_contact_id=staff.get("syncro_contact_id"),
+        onboarding_status=staff_onboarding_workflow_service.STATE_OFFBOARDING_DENIED,
+        onboarding_complete=bool(staff.get("onboarding_complete", False)),
+        onboarding_completed_at=staff.get("onboarding_completed_at"),
+        approval_status="denied",
+        approved_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        approved_at=datetime.now(tz=timezone.utc),
+        approval_notes=decision_notes,
+    )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.offboarding.denied",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(updated["company_id"]),
+            "decision_notes": decision_notes,
+        },
+    )
+    updated["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    return StaffResponse.model_validate(updated)
+
+
+async def _confirm_external_checkpoint(
+    staff_id: int,
+    payload: StaffExternalCheckpointCallback,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=255),
+    api_key_record: dict = Depends(require_api_key),
+    _: None = Depends(require_database),
+):
+    company_id = int(payload.company_id)
+    body_staff_id = int(payload.staff_id)
+    if body_staff_id != staff_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Staff ID mismatch between path and body")
+    policy = await staff_workflow_repo.get_company_workflow_policy(company_id)
+    policy_config = policy.get("config") if isinstance(policy.get("config"), dict) else {}
+    allowed_api_key_ids_raw = policy_config.get("external_confirmation_api_key_ids")
+    allowed_api_key_ids: set[int] = set()
+    if isinstance(allowed_api_key_ids_raw, list):
+        for raw in allowed_api_key_ids_raw:
+            try:
+                allowed_api_key_ids.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+    api_key_id = int(api_key_record["id"])
+    if allowed_api_key_ids and api_key_id not in allowed_api_key_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API key is not allowed for this company's external checkpoint scope",
+        )
+    request_fingerprint = _external_confirmation_fingerprint(
+        path_staff_id=staff_id,
+        api_key_id=api_key_id,
+        payload=payload,
+    )
+    created = await staff_workflow_repo.try_create_external_confirmation_idempotency(
+        api_key_id=api_key_id,
+        idempotency_key=idempotency_key.strip(),
+        request_fingerprint=request_fingerprint,
+        company_id=company_id,
+        staff_id=staff_id,
+    )
+    if not created:
+        existing = await staff_workflow_repo.get_external_confirmation_idempotency(
+            api_key_id=api_key_id,
+            idempotency_key=idempotency_key.strip(),
+        )
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Callback with this Idempotency-Key is already being processed",
+            )
+        if str(existing.get("request_fingerprint") or "") != request_fingerprint:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency-Key has already been used with different callback data",
+            )
+        response_payload = existing.get("response_payload") if isinstance(existing.get("response_payload"), dict) else {}
+        if existing.get("response_status") is not None and response_payload:
+            return StaffExternalCheckpointResponse.model_validate(response_payload)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Callback with this Idempotency-Key is already being processed",
+        )
+
+    try:
+        result = await staff_onboarding_workflow_service.confirm_external_checkpoint_and_resume(
+            company_id=company_id,
+            staff_id=staff_id,
+            confirmation_token=payload.confirmation_token,
+            source=payload.source.strip(),
+            callback_timestamp=payload.callback_timestamp or datetime.now(timezone.utc),
+            proof_reference_id=payload.proof_reference_id,
+            payload_hash=payload.payload_hash,
+            callback_payload=payload.callback_payload,
+            confirmed_by_api_key_id=api_key_id,
+        )
+    except ValueError as exc:
+        await staff_workflow_repo.finalize_external_confirmation_idempotency(
+            api_key_id=api_key_id,
+            idempotency_key=idempotency_key.strip(),
+            response_status=status.HTTP_400_BAD_REQUEST,
+            response_payload={"detail": str(exc)},
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    response_payload = {
+        "state": result.get("state") or "unknown",
+        "executionId": int(result.get("execution_id") or 0),
+        "staffId": staff_id,
+        "companyId": company_id,
+    }
+    await staff_workflow_repo.finalize_external_confirmation_idempotency(
+        api_key_id=api_key_id,
+        idempotency_key=idempotency_key.strip(),
+        response_status=status.HTTP_202_ACCEPTED,
+        response_payload=response_payload,
+    )
+    return StaffExternalCheckpointResponse.model_validate(response_payload)
+
+
+@router.post(
+    "/workflow-webhooks/{webhook_public_id}",
+    response_model=StaffExternalCheckpointResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Resume a staff workflow from a Wait For Webhook step",
+    description=(
+        "Receives POST callbacks for onboarding/offboarding Wait For Webhook steps. "
+        "The unique webhook URL identifies the pending workflow checkpoint and "
+        "the request body must include the matching postKey before the workflow resumes."
+    ),
+)
+async def confirm_workflow_webhook(
+    webhook_public_id: str,
+    payload: StaffWorkflowWebhookCallback,
+    _: None = Depends(require_database),
+):
+    try:
+        result = await staff_onboarding_workflow_service.confirm_webhook_checkpoint_and_resume(
+            webhook_public_id=webhook_public_id.strip(),
+            post_key=payload.post_key,
+            source=payload.source.strip(),
+            callback_payload=payload.payload,
+            company_id=payload.company_id,
+            staff_id=payload.staff_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    response_payload = {
+        "state": result.get("state") or "unknown",
+        "executionId": int(result.get("execution_id") or 0),
+        "staffId": int(result.get("staff_id") or 0),
+        "companyId": int(result.get("company_id") or 0),
+    }
+    return StaffExternalCheckpointResponse.model_validate(response_payload)
+
+
+@router.post(
+    "/external-checkpoints/confirm",
+    response_model=StaffExternalCheckpointResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
+)
+async def confirm_external_checkpoint_legacy(
+    payload: StaffExternalCheckpointCallback,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=255),
+    api_key_record: dict = Depends(require_api_key),
+    _: None = Depends(require_database),
+):
+    return await _confirm_external_checkpoint(
+        staff_id=int(payload.staff_id),
+        payload=payload,
+        idempotency_key=idempotency_key,
+        api_key_record=api_key_record,
+        _=_,
+    )
+
+
+@router.post(
+    "/{staff_id}/onboarding/external-confirm",
+    response_model=StaffExternalCheckpointResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def confirm_external_checkpoint(
+    staff_id: int,
+    payload: StaffExternalCheckpointCallback,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=255),
+    api_key_record: dict = Depends(require_api_key),
+    _: None = Depends(require_database),
+):
+    return await _confirm_external_checkpoint(
+        staff_id=staff_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+        api_key_record=api_key_record,
+        _=_,
+    )
+
+
+async def _get_staff_execution_or_404(staff_id: int) -> tuple[dict, dict]:
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    execution = await staff_workflow_repo.get_execution_by_staff_id(staff_id)
+    if not execution:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow execution not found")
+    return staff, execution
+
+
+@router.post(
+    "/{staff_id}/workflow/rerun",
+    response_model=StaffWorkflowManualActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rerun_staff_workflow_execution(
+    staff_id: int,
+    payload: StaffWorkflowManualActionRequest | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=8, max_length=255),
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff, execution = await _get_staff_execution_or_404(staff_id)
+    await _require_staff_approval_access(current_user, int(staff["company_id"]))
+    direction = str(execution.get("direction") or staff_onboarding_workflow_service.DIRECTION_ONBOARDING).strip().lower()
+    result = await staff_onboarding_workflow_service.run_staff_onboarding_workflow(
+        company_id=int(staff["company_id"]),
+        staff_id=staff_id,
+        initiated_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        direction=direction,
+        scheduled_for_utc=execution.get("scheduled_for_utc"),
+        requested_timezone=execution.get("requested_timezone"),
+    )
+    refreshed = await staff_workflow_repo.get_execution_by_staff_id(staff_id) or execution
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.workflow.operator.rerun",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(staff["company_id"]),
+            "execution_id": int(refreshed["id"]),
+            "direction": direction,
+            "reason": (payload.reason if payload else None),
+            "idempotency_key": (idempotency_key or "").strip() or None,
+            "replay_key": _execution_action_replay_key(staff_id, int(refreshed["id"]), "rerun", idempotency_key),
+            "result_state": result.get("state"),
+        },
+    )
+    return StaffWorkflowManualActionResponse.model_validate(
+        {
+            "state": str(result.get("state") or refreshed.get("state") or "requested"),
+            "executionId": int(refreshed["id"]),
+            "staffId": staff_id,
+            "companyId": int(staff["company_id"]),
+            "idempotentReplay": False,
+            "detail": "Workflow rerun requested",
+        }
+    )
+
+
+@router.post(
+    "/{staff_id}/workflow/retry-failed-step",
+    response_model=StaffWorkflowManualActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_staff_workflow_failed_step(
+    staff_id: int,
+    payload: StaffWorkflowManualActionRequest | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=8, max_length=255),
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff, execution = await _get_staff_execution_or_404(staff_id)
+    await _require_staff_approval_access(current_user, int(staff["company_id"]))
+    execution_state = str(execution.get("state") or "").strip().lower()
+    failed_states = {
+        staff_onboarding_workflow_service.STATE_FAILED,
+        staff_onboarding_workflow_service.STATE_OFFBOARDING_FAILED,
+    }
+    if execution_state not in failed_states:
+        return StaffWorkflowManualActionResponse.model_validate(
+            {
+                "state": execution_state or "unknown",
+                "executionId": int(execution["id"]),
+                "staffId": staff_id,
+                "companyId": int(staff["company_id"]),
+                "idempotentReplay": True,
+                "detail": "Execution is not in a failed state",
+            }
+        )
+    result = await staff_onboarding_workflow_service.resume_staff_onboarding_workflow_after_external_confirmation(
+        company_id=int(staff["company_id"]),
+        staff_id=staff_id,
+        execution_id=int(execution["id"]),
+        initiated_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+    )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.workflow.operator.retry_failed_step",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(staff["company_id"]),
+            "execution_id": int(execution["id"]),
+            "reason": (payload.reason if payload else None),
+            "idempotency_key": (idempotency_key or "").strip() or None,
+            "replay_key": _execution_action_replay_key(staff_id, int(execution["id"]), "retry_failed_step", idempotency_key),
+            "result_state": result.get("state"),
+        },
+    )
+    return StaffWorkflowManualActionResponse.model_validate(
+        {
+            "state": str(result.get("state") or "requested"),
+            "executionId": int(execution["id"]),
+            "staffId": staff_id,
+            "companyId": int(staff["company_id"]),
+            "idempotentReplay": False,
+            "detail": "Failed workflow step retry requested",
+        }
+    )
+
+
+@router.post(
+    "/{staff_id}/workflow/resume",
+    response_model=StaffWorkflowManualActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def resume_staff_workflow_execution(
+    staff_id: int,
+    payload: StaffWorkflowManualActionRequest | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=8, max_length=255),
+    _: None = Depends(require_database),
+    current_user: dict = Depends(get_current_user),
+):
+    staff, execution = await _get_staff_execution_or_404(staff_id)
+    await _require_staff_approval_access(current_user, int(staff["company_id"]))
+    execution_state = str(execution.get("state") or "").strip().lower()
+    pausable_states = {
+        staff_onboarding_workflow_service.STATE_WAITING_EXTERNAL,
+        staff_onboarding_workflow_service.STATE_OFFBOARDING_WAITING_EXTERNAL,
+        staff_onboarding_workflow_service.STATE_PROVISIONING,
+        staff_onboarding_workflow_service.STATE_OFFBOARDING_IN_PROGRESS,
+    }
+    if execution_state not in pausable_states:
+        return StaffWorkflowManualActionResponse.model_validate(
+            {
+                "state": execution_state or "unknown",
+                "executionId": int(execution["id"]),
+                "staffId": staff_id,
+                "companyId": int(staff["company_id"]),
+                "idempotentReplay": True,
+                "detail": "Execution is not resumable",
+            }
+        )
+    result = await staff_onboarding_workflow_service.resume_staff_onboarding_workflow_after_external_confirmation(
+        company_id=int(staff["company_id"]),
+        staff_id=staff_id,
+        execution_id=int(execution["id"]),
+        initiated_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+    )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.workflow.operator.resume",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(staff["company_id"]),
+            "execution_id": int(execution["id"]),
+            "reason": (payload.reason if payload else None),
+            "idempotency_key": (idempotency_key or "").strip() or None,
+            "replay_key": _execution_action_replay_key(staff_id, int(execution["id"]), "resume", idempotency_key),
+            "result_state": result.get("state"),
+        },
+    )
+    return StaffWorkflowManualActionResponse.model_validate(
+        {
+            "state": str(result.get("state") or "requested"),
+            "executionId": int(execution["id"]),
+            "staffId": staff_id,
+            "companyId": int(staff["company_id"]),
+            "idempotentReplay": False,
+            "detail": "Workflow resume requested",
+        }
+    )
+
+
+@router.post(
+    "/{staff_id}/workflow/force-complete-step",
+    response_model=StaffWorkflowManualActionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def force_complete_staff_workflow_step(
+    staff_id: int,
+    payload: StaffWorkflowManualActionRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", min_length=8, max_length=255),
+    _: None = Depends(require_database),
+    current_user: dict = Depends(require_super_admin),
+):
+    staff, execution = await _get_staff_execution_or_404(staff_id)
+    step_name = str(payload.step_name or execution.get("current_step") or "").strip()
+    if ":" in step_name:
+        step_name = step_name.split(":", 1)[1].strip()
+    if not step_name or step_name in {"failed", "completed", "queued"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A valid stepName is required")
+    await staff_workflow_repo.append_step_log(
+        execution_id=int(execution["id"]),
+        step_name=step_name,
+        status="success",
+        attempt=1,
+        request_payload={"operator_forced": True, "reason": payload.reason},
+        response_payload={"forced_complete": True},
+    )
+    result = await staff_onboarding_workflow_service.resume_staff_onboarding_workflow_after_external_confirmation(
+        company_id=int(staff["company_id"]),
+        staff_id=staff_id,
+        execution_id=int(execution["id"]),
+        initiated_by_user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+    )
+    await audit_service.log_action(
+        user_id=int(current_user.get("id")) if current_user.get("id") is not None else None,
+        action="staff.workflow.operator.force_complete_step",
+        entity_type="staff",
+        entity_id=staff_id,
+        metadata={
+            "company_id": int(staff["company_id"]),
+            "execution_id": int(execution["id"]),
+            "step_name": step_name,
+            "reason": payload.reason,
+            "idempotency_key": (idempotency_key or "").strip() or None,
+            "replay_key": _execution_action_replay_key(staff_id, int(execution["id"]), f"force_complete_step:{step_name}", idempotency_key),
+            "result_state": result.get("state"),
+        },
+    )
+    return StaffWorkflowManualActionResponse.model_validate(
+        {
+            "state": str(result.get("state") or "requested"),
+            "executionId": int(execution["id"]),
+            "staffId": staff_id,
+            "companyId": int(staff["company_id"]),
+            "idempotentReplay": False,
+            "detail": f"Step '{step_name}' force-completed",
+        }
+    )
+
+
+@router.get("/{staff_id}/workflow/history")
+async def get_staff_workflow_history(
+    staff_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    _: None = Depends(require_database),
+    current_user: dict = Depends(require_super_admin),
+):
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    executions = await staff_workflow_repo.list_execution_history_for_staff(staff_id, limit=limit)
+    execution_ids = [int(ex["id"]) for ex in executions if ex.get("id")]
+    step_logs_map = await staff_workflow_repo.list_step_logs_for_execution_ids(execution_ids)
+    items = []
+    for ex in executions:
+        ex_id = int(ex["id"])
+        raw_logs = step_logs_map.get(ex_id, [])
+        steps = []
+        for log in raw_logs:
+            request_payload = log.get("request_payload")
+            response_payload = log.get("response_payload")
+            if isinstance(request_payload, str):
+                try:
+                    request_payload = json.loads(request_payload)
+                except Exception:
+                    request_payload = {}
+            if isinstance(response_payload, str):
+                try:
+                    response_payload = json.loads(response_payload)
+                except Exception:
+                    response_payload = {}
+            started_at_log = log.get("started_at")
+            completed_at_log = log.get("completed_at")
+            steps.append({
+                "id": int(log.get("id") or 0),
+                "stepName": str(log.get("step_name") or ""),
+                "status": str(log.get("status") or ""),
+                "attempt": int(log.get("attempt") or 1),
+                "requestPayload": request_payload or {},
+                "responsePayload": response_payload or {},
+                "errorMessage": log.get("error_message"),
+                "startedAt": started_at_log.isoformat() if isinstance(started_at_log, datetime) else (str(started_at_log) if started_at_log else None),
+                "completedAt": completed_at_log.isoformat() if isinstance(completed_at_log, datetime) else (str(completed_at_log) if completed_at_log else None),
+            })
+        requested_at = ex.get("requested_at")
+        started_at = ex.get("started_at")
+        completed_at = ex.get("completed_at")
+        items.append({
+            "executionId": ex_id,
+            "staffId": int(ex.get("staff_id") or staff_id),
+            "direction": str(ex.get("direction") or "onboarding"),
+            "state": str(ex.get("state") or ""),
+            "workflowKey": str(ex.get("workflow_key") or ""),
+            "currentStep": ex.get("current_step"),
+            "retriesUsed": int(ex.get("retries_used") or 0),
+            "lastError": ex.get("last_error"),
+            "helpdeskTicketId": ex.get("helpdesk_ticket_id"),
+            "requestedAt": requested_at.isoformat() if isinstance(requested_at, datetime) else (str(requested_at) if requested_at else None),
+            "startedAt": started_at.isoformat() if isinstance(started_at, datetime) else (str(started_at) if started_at else None),
+            "completedAt": completed_at.isoformat() if isinstance(completed_at, datetime) else (str(completed_at) if completed_at else None),
+            "steps": steps,
+        })
+    return {
+        "staffId": staff_id,
+        "staffName": f"{staff.get('first_name', '')} {staff.get('last_name', '')}".strip(),
+        "executions": items,
+    }
+
+
+@router.get("/{staff_id}", response_model=StaffResponse)
+async def get_staff(
+    staff_id: int,
+    _: None = Depends(require_database),
+    current_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+):
+    if current_user is None and api_key_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    staff = await staff_repo.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    staff["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    return StaffResponse.model_validate(staff)
+
+
+@router.put("/{staff_id}", response_model=StaffResponse)
+async def update_staff(
+    staff_id: int,
+    payload: StaffUpdate,
+    _: None = Depends(require_database),
+    current_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+):
+    if current_user is None and api_key_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    if current_user is not None and not current_user.get("is_super_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
+    acting_user_id = int(current_user["id"]) if current_user and current_user.get("id") is not None else None
+    existing = await staff_repo.get_staff_by_id(staff_id)
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    data = existing | payload.model_dump(exclude_unset=True, by_alias=False)
+    updated = await staff_repo.update_staff(
+        staff_id,
+        company_id=data["company_id"],
+        first_name=data["first_name"],
+        last_name=data["last_name"],
+        email=data["email"],
+        mobile_phone=data.get("mobile_phone"),
+        date_onboarded=data.get("date_onboarded"),
+        date_offboarded=data.get("date_offboarded"),
+        enabled=bool(data.get("enabled", True)),
+        is_ex_staff=bool(data.get("is_ex_staff", False)),
+        street=data.get("street"),
+        city=data.get("city"),
+        state=data.get("state"),
+        postcode=data.get("postcode"),
+        country=data.get("country"),
+        department=data.get("department"),
+        job_title=data.get("job_title"),
+        org_company=data.get("org_company"),
+        manager_name=data.get("manager_name"),
+        account_action=data.get("account_action"),
+        syncro_contact_id=data.get("syncro_contact_id"),
+        onboarding_status=data.get("onboarding_status"),
+        onboarding_complete=data.get("onboarding_complete"),
+        onboarding_completed_at=data.get("onboarding_completed_at"),
+        approval_status=data.get("approval_status"),
+        requested_by_user_id=data.get("requested_by_user_id"),
+        requested_at=data.get("requested_at"),
+        approved_by_user_id=data.get("approved_by_user_id"),
+        approved_at=data.get("approved_at"),
+        request_notes=data.get("request_notes"),
+        approval_notes=data.get("approval_notes"),
+    )
+    custom_fields = data.get("custom_fields")
+    if isinstance(custom_fields, dict):
+        await staff_custom_fields_repo.set_staff_field_values_by_name(
+            company_id=updated["company_id"],
+            staff_id=staff_id,
+            values=custom_fields,
+        )
+        updated = await staff_repo.get_staff_by_id(staff_id) or updated
+
+    status_value = str((data.get("onboarding_status") or "")).strip().lower()
+    if status_value in {
+        staff_onboarding_workflow_service.STATE_APPROVED,
+        staff_onboarding_workflow_service.STATE_OFFBOARDING_APPROVED,
+    }:
+        await staff_onboarding_workflow_service.enqueue_staff_onboarding_workflow(
+            company_id=int(updated["company_id"]),
+            staff_id=staff_id,
+            initiated_by_user_id=acting_user_id,
+            direction=(
+                staff_onboarding_workflow_service.DIRECTION_OFFBOARDING
+                if status_value == staff_onboarding_workflow_service.STATE_OFFBOARDING_APPROVED
+                else staff_onboarding_workflow_service.DIRECTION_ONBOARDING
+            ),
+        )
+
+    updated["workflow_status"] = await staff_onboarding_workflow_service.get_staff_workflow_status(staff_id)
+    return StaffResponse.model_validate(updated)
+
+
+@router.delete("/{staff_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_staff(
+    staff_id: int,
+    _: None = Depends(require_database),
+    current_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+):
+    if current_user is None and api_key_record is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    if current_user is not None and not current_user.get("is_super_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
+    existing = await staff_repo.get_staff_by_id(staff_id)
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff not found")
+    await staff_repo.delete_staff(staff_id)
+    return None

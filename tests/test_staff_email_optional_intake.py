@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app import main
+from app.features.staff import handlers as staff_handlers
+
+
+class _DummyRequest:
+    def __init__(self, form_data: dict[str, object]):
+        self._form_data = form_data
+
+    async def form(self):
+        return self._form_data
+
+
+@pytest.mark.asyncio
+async def test_create_staff_member_allows_missing_email(monkeypatch):
+    request = _DummyRequest({"first_name": "Alex", "last_name": "Rivera"})
+
+    monkeypatch.setattr(
+        staff_handlers,
+        "_load_staff_context",
+        AsyncMock(
+            return_value=(
+                {"id": 1, "is_super_admin": True},
+                {"role": "admin"},
+                {"id": 9, "name": "Acme"},
+                3,
+                9,
+                None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main.staff_field_config_service,
+        "load_effective_company_staff_fields",
+        AsyncMock(
+            return_value=[
+                {"key": "first_name", "required": True},
+                {"key": "last_name", "required": True},
+                {"key": "email", "required": False},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        main.staff_field_config_service,
+        "validate_staff_form_values",
+        lambda submitted, field_config: (
+            {
+                "first_name": "Alex",
+                "last_name": "Rivera",
+                "email": "",
+                "enabled": True,
+            },
+            [],
+        ),
+    )
+
+    create_request_mock = AsyncMock(return_value={"id": 42})
+    monkeypatch.setattr(main.staff_requests_repo, "create_request", create_request_mock)
+    monkeypatch.setattr(
+        main.staff_onboarding_workflow_service,
+        "notify_staff_approval_requested",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(main.audit_service, "log_action", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        main.staff_custom_fields_repo,
+        "list_field_definitions",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        main.staff_custom_fields_repo,
+        "set_staff_field_values_by_name",
+        AsyncMock(return_value=None),
+    )
+
+    response = await staff_handlers.create_staff_member(request)  # type: ignore[arg-type]
+
+    assert response.status_code == 303
+    create_request_mock.assert_awaited_once()
+    assert create_request_mock.await_args.kwargs["email"] is None

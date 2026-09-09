@@ -1,0 +1,682 @@
+"""Reporting handlers for the ``reporting`` feature pack."""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse
+from starlette.datastructures import FormData
+
+from app.security.flash import flash_redirect
+
+_REPORTING_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _main():
+    from app import main as main_module
+
+    return main_module
+
+
+def _reporting_message(value: str | None, *, max_length: int = 240) -> str | None:
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    return cleaned[:max_length]
+
+
+def _reporting_user_label(record: Any) -> str:
+    first = (record.get("first_name") or "").strip()
+    last = (record.get("last_name") or "").strip()
+    name = (f"{first} {last}").strip()
+    email = (record.get("email") or "").strip()
+    if name and email:
+        return f"{name} <{email}>"
+    return name or email or f"User #{record.get('id')}"
+
+
+async def _list_reporting_eligible_users() -> list[dict[str, Any]]:
+    from app.repositories import users as user_repo
+
+    rows = await user_repo.list_users()
+    eligible: list[dict[str, Any]] = []
+    for record in rows or []:
+        if record.get("is_super_admin"):
+            continue
+        try:
+            user_id = int(record.get("id"))
+        except (TypeError, ValueError):
+            continue
+        eligible.append({"id": user_id, "label": _reporting_user_label(record)})
+    eligible.sort(key=lambda item: item["label"].lower())
+    return eligible
+
+
+async def _require_reporting_access(request: Request):
+
+    user, redirect = await _main()._require_authenticated_user(request)
+    if redirect:
+        return None, False, redirect
+    is_super_admin = bool(user.get("is_super_admin"))
+    is_tech = await _main()._is_helpdesk_technician(user, request)
+    if not (is_super_admin or is_tech):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Reporting access requires super admin or helpdesk technician privileges.",
+        )
+    return user, is_super_admin, None
+
+
+async def _resolve_user_can_run_report(
+    user: Any, is_super_admin: bool, query_id: int
+) -> bool:
+    from app.core.logging import log_error
+    from app.repositories import reporting as reporting_repo
+
+    if is_super_admin:
+        return True
+    user_id = user.get("id")
+    if user_id is None:
+        return False
+    try:
+        return await reporting_repo.user_has_permission(int(query_id), int(user_id))
+    except Exception as exc:  # pragma: no cover - defensive
+        log_error("Failed to check reporting permission", error=str(exc))
+        return False
+
+
+def _parse_reporting_form(form: FormData) -> dict[str, Any]:
+    name = (form.get("name") or "").strip()
+    slug = (form.get("slug") or "").strip().lower()
+    description = (form.get("description") or "").strip() or None
+    sql_query = (form.get("sql_query") or "").strip()
+    raw_user_ids = (
+        form.getlist("permission_user_ids") if hasattr(form, "getlist") else []
+    )
+    user_ids: list[int] = []
+    for raw in raw_user_ids or []:
+        try:
+            user_ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return {
+        "name": name,
+        "slug": slug,
+        "description": description,
+        "sql_query": sql_query,
+        "user_ids": user_ids,
+    }
+
+
+def _reporting_slug(name: str) -> str:
+    """Build the stable, URL-safe identifier used when a report is created."""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")[:120]
+
+
+def _validate_reporting_input(payload: dict[str, Any]) -> str | None:
+    from app.services import reporting as reporting_service
+
+    if not payload["name"]:
+        return "Report name is required."
+    if len(payload["name"]) > 255:
+        return "Report name must be 255 characters or fewer."
+    if not payload["slug"]:
+        return "Slug is required."
+    if len(payload["slug"]) > 120:
+        return "Slug must be 120 characters or fewer."
+    if not _REPORTING_SLUG_RE.match(payload["slug"]):
+        return "Slug may only contain letters, digits, underscores, and hyphens."
+    if not payload["sql_query"]:
+        return "SQL query is required."
+    if payload["description"] and len(payload["description"]) > 1000:
+        return "Description must be 1000 characters or fewer."
+    try:
+        reporting_service.validate_select_query(payload["sql_query"])
+    except reporting_service.ReportingQueryError as exc:
+        return str(exc)
+    return None
+
+
+async def reporting_page(
+    request: Request,
+    report: int | None = Query(default=None),
+    error: str | None = Query(default=None),
+):
+    from app.repositories import reporting as reporting_repo
+    from app.services import audit as audit_service
+    from app.services import reporting as reporting_service
+
+    user, is_super_admin, redirect = await _require_reporting_access(request)
+    if redirect:
+        return redirect
+
+    user_id = int(user.get("id")) if user.get("id") is not None else 0
+    if is_super_admin:
+        available = await reporting_repo.list_queries()
+    else:
+        available = await reporting_repo.list_queries_for_user(user_id)
+    available_reports = [
+        {
+            "id": entry["id"],
+            "name": entry["name"],
+            "slug": entry.get("slug"),
+        }
+        for entry in available
+    ]
+
+    selected_report = None
+    result = None
+    error_message = _reporting_message(error)
+    generated_at_iso: str | None = None
+    if report is not None:
+        record = await reporting_repo.get_query(int(report))
+        if not record:
+            error_message = "The requested report no longer exists."
+        else:
+            allowed = await _resolve_user_can_run_report(
+                user, is_super_admin, record["id"]
+            )
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to run this report.",
+                )
+            selected_report = record
+            try:
+                result = await reporting_service.run_query_with_context(
+                    record["sql_query"],
+                    company_id=getattr(request.state, "active_company_id", None),
+                )
+                generated_at_iso = datetime.now(timezone.utc).isoformat()
+                await audit_service.record(
+                    action="reporting.report.run",
+                    request=request,
+                    user_id=user.get("id"),
+                    entity_type="reporting_query",
+                    entity_id=int(record["id"]),
+                    metadata={"slug": record.get("slug")},
+                )
+            except reporting_service.ReportingQueryError as exc:
+                error_message = f"Report query is invalid: {exc}"
+            except Exception as exc:  # pragma: no cover - defensive
+                from app.core.logging import log_error
+
+                log_error("Reporting query execution failed", error=str(exc))
+                error_message = f"Report failed to execute: {exc}"
+
+    extra = {
+        "title": "Reporting",
+        "available_reports": available_reports,
+        "selected_report": selected_report,
+        "result": result
+        or {"columns": [], "rows": [], "row_count": 0, "truncated": False},
+        "generated_at_iso": generated_at_iso,
+        "max_rows": reporting_service.MAX_RESULT_ROWS,
+        "error_message": error_message,
+        "can_admin_reporting": is_super_admin,
+    }
+    return await _main()._render_template(
+        "reporting/index.html", request, user, extra=extra
+    )
+
+
+async def reporting_export(
+    request: Request, report_id: int, format: str = Query(default="csv")
+):
+    from app.repositories import reporting as reporting_repo
+    from app.services import audit as audit_service
+    from app.services import reporting as reporting_service
+
+    user, is_super_admin, redirect = await _require_reporting_access(request)
+    if redirect:
+        return redirect
+
+    record = await reporting_repo.get_query(int(report_id))
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Report not found."
+        )
+    allowed = await _resolve_user_can_run_report(user, is_super_admin, record["id"])
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to run this report.",
+        )
+
+    fmt = (format or "csv").strip().lower()
+    if fmt not in {"csv", "json", "xml", "pdf"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported export format.",
+        )
+
+    try:
+        result = await reporting_service.run_query_with_context(
+            record["sql_query"],
+            company_id=getattr(request.state, "active_company_id", None),
+        )
+    except reporting_service.ReportingQueryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+    await audit_service.record(
+        action="reporting.report.export",
+        request=request,
+        user_id=user.get("id"),
+        entity_type="reporting_query",
+        entity_id=int(record["id"]),
+        metadata={
+            "slug": record.get("slug"),
+            "format": fmt,
+            "row_count": result["row_count"],
+        },
+    )
+
+    base_filename = record.get("slug") or f"report-{record['id']}"
+    columns = result["columns"]
+    rows = result["rows"]
+
+    if fmt == "csv":
+        body = reporting_service.export_csv(columns, rows)
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{base_filename}.csv"'
+            },
+        )
+    if fmt == "json":
+        body = reporting_service.export_json(columns, rows)
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{base_filename}.json"'
+            },
+        )
+    if fmt == "xml":
+        body = reporting_service.export_xml(columns, rows)
+        return Response(
+            content=body,
+            media_type="application/xml; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{base_filename}.xml"'
+            },
+        )
+    # PDF
+    try:
+        from weasyprint import HTML  # type: ignore
+    except (
+        ImportError,
+        OSError,
+    ) as exc:  # pragma: no cover - depends on system packages
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "PDF export requires WeasyPrint and its native dependencies. "
+                "See https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation"
+            ),
+        ) from exc
+    html = reporting_service.export_html_for_pdf(
+        record.get("name") or "Report",
+        record.get("description"),
+        columns,
+        rows,
+        datetime.now(timezone.utc),
+    )
+    pdf_bytes = HTML(string=html, base_url=str(request.base_url)).write_pdf()
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base_filename}.pdf"'},
+    )
+
+
+async def admin_reporting(
+    request: Request,
+):
+    from app.repositories import reporting as reporting_repo
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    records = await reporting_repo.list_queries()
+    reports_payload: list[dict[str, Any]] = []
+    for record in records:
+        prepared = dict(record)
+        prepared["updated_at_iso"] = _main()._to_iso(record.get("updated_at"))
+        reports_payload.append(prepared)
+    extra = {
+        "title": "Reporting · Manage reports",
+        "reports": reports_payload,
+    }
+    return await _main()._render_template(
+        "admin/reporting.html", request, user, extra=extra
+    )
+
+
+async def admin_reporting_new(request: Request):
+    from app.services import report_query_builder
+    from app.services import reporting as reporting_service
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    eligible = await _list_reporting_eligible_users()
+    extra = {
+        "title": "New report",
+        "form_heading": "New report",
+        "submit_label": "Create report",
+        "form_action": "/admin/reporting",
+        "report": {},
+        "eligible_users": eligible,
+        "granted_user_ids": set(),
+        "max_rows": reporting_service.MAX_RESULT_ROWS,
+        "builder_schema": await report_query_builder.describe_schema(),
+    }
+    return await _main()._render_template(
+        "admin/reporting_form.html", request, user, extra=extra
+    )
+
+
+async def admin_reporting_ai_query(request: Request):
+    """Generate or refine a report query with the configured LLM module."""
+    from app.services import modules as modules_service
+    from app.services import report_query_builder, reporting as reporting_service
+
+    _user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return JSONResponse({"error": "Authentication required."}, status_code=401)
+    try:
+        form = await request.form()
+    except (AssertionError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, AssertionError) and "python-multipart" not in str(exc):
+            raise
+        return JSONResponse(
+            {"error": "Unable to read the query request payload."}, status_code=400
+        )
+    instruction = str(form.get("instruction") or "").strip()
+    current_sql = str(form.get("current_sql") or "").strip()
+    if not instruction:
+        return JSONResponse({"error": "Describe the report you want."}, status_code=400)
+    try:
+        schema = await report_query_builder.describe_schema()
+        messages = report_query_builder.build_ai_messages(
+            schema, instruction[:4000], current_sql[:16000]
+        )
+        model_override = report_query_builder.configured_ai_model()
+        module_payload: dict[str, Any] = {
+            "prompt": messages[-1]["content"],
+            "messages": messages,
+            "stage": "report_query_builder",
+            "format": "json",
+        }
+        if model_override:
+            module_payload["model"] = model_override
+        response = await modules_service.trigger_module(
+            "ollama",
+            module_payload,
+            background=False,
+        )
+        if response.get("status") in {"error", "failed", "skipped"}:
+            reason = response.get("last_error") or response.get("reason")
+            raise ValueError(
+                str(reason or "The configured LLM module did not generate a query.")
+            )
+        sql, summary = report_query_builder.extract_ai_sql(response)
+        if not sql:
+            raise ValueError("The configured LLM returned no SQL query.")
+        reporting_service.validate_select_query(sql)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        return JSONResponse(
+            {
+                "error": "The AI query service is unavailable. Check that an LLM module is enabled and configured."
+            },
+            status_code=503,
+        )
+    return JSONResponse({"sql": sql, "summary": summary})
+
+
+async def admin_reporting_edit(request: Request, report_id: int):
+    from app.repositories import reporting as reporting_repo
+    from app.services import reporting as reporting_service
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    record = await reporting_repo.get_query(int(report_id))
+    if not record:
+        return flash_redirect("/admin/reporting", "Report not found", "error")
+    eligible = await _list_reporting_eligible_users()
+    granted_ids = set(await reporting_repo.list_permission_user_ids(int(report_id)))
+    extra = {
+        "title": f"Edit report · {record['name']}",
+        "form_heading": f"Edit report · {record['name']}",
+        "submit_label": "Save changes",
+        "form_action": f"/admin/reporting/{int(report_id)}",
+        "report": record,
+        "eligible_users": eligible,
+        "granted_user_ids": granted_ids,
+        "max_rows": reporting_service.MAX_RESULT_ROWS,
+        "test_action": f"/admin/reporting/{int(report_id)}",
+    }
+    return await _main()._render_template(
+        "admin/reporting_form.html", request, user, extra=extra
+    )
+
+
+async def admin_reporting_clone(request: Request, report_id: int):
+    from app.repositories import reporting as reporting_repo
+    from app.services import reporting as reporting_service
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    record = await reporting_repo.get_query(int(report_id))
+    if not record:
+        return flash_redirect("/admin/reporting", "Report not found", "error")
+
+    eligible = await _list_reporting_eligible_users()
+    granted_ids = set(await reporting_repo.list_permission_user_ids(int(report_id)))
+    clone_name = f"{record['name']} (Copy)"
+    cloned_report = {
+        **record,
+        "id": None,
+        "name": clone_name,
+        "slug": _reporting_slug(clone_name),
+    }
+    extra = {
+        "title": f"Clone report · {record['name']}",
+        "form_heading": f"Clone report · {record['name']}",
+        "submit_label": "Create cloned report",
+        "form_action": "/admin/reporting",
+        "report": cloned_report,
+        "eligible_users": eligible,
+        "granted_user_ids": granted_ids,
+        "max_rows": reporting_service.MAX_RESULT_ROWS,
+    }
+    return await _main()._render_template(
+        "admin/reporting_form.html", request, user, extra=extra
+    )
+
+
+async def admin_reporting_create(request: Request):
+    from app.repositories import reporting as reporting_repo
+    from app.services import audit as audit_service
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    form = await request.form()
+    payload = _parse_reporting_form(form)
+    payload["slug"] = _reporting_slug(payload["name"])
+    error = _validate_reporting_input(payload)
+    if error:
+        return flash_redirect("/admin/reporting/new", error, "error")
+    existing = await reporting_repo.get_query_by_slug(payload["slug"])
+    if existing:
+        return flash_redirect(
+            "/admin/reporting/new", "That slug is already in use.", "error"
+        )
+    new_id = await reporting_repo.create_query(
+        slug=payload["slug"],
+        name=payload["name"],
+        description=payload["description"],
+        sql_query=payload["sql_query"],
+        created_by=user.get("id"),
+    )
+    await reporting_repo.replace_permissions(int(new_id), payload["user_ids"])
+    await audit_service.record(
+        action="reporting.report.create",
+        request=request,
+        user_id=user.get("id"),
+        entity_type="reporting_query",
+        entity_id=int(new_id),
+        after={
+            "slug": payload["slug"],
+            "name": payload["name"],
+            "description": payload["description"],
+            "permission_user_ids": payload["user_ids"],
+        },
+    )
+    return flash_redirect("/admin/reporting", "Report created.", "success")
+
+
+async def admin_reporting_update(request: Request, report_id: int):
+    from app.repositories import reporting as reporting_repo
+    from app.services import audit as audit_service
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    record = await reporting_repo.get_query(int(report_id))
+    if not record:
+        return flash_redirect("/admin/reporting", "Report not found", "error")
+    form = await request.form()
+    payload = _parse_reporting_form(form)
+    # A report slug is a permanent identifier. Ignore any forged or stale form
+    # value so existing integrations cannot be broken by an edit.
+    payload["slug"] = record["slug"]
+    error = _validate_reporting_input(payload)
+    if form.get("action") == "test":
+        from app.services import reporting as reporting_service
+
+        test_result = None
+        test_error = error
+        if not test_error:
+            try:
+                test_result = await reporting_service.run_query_with_context(
+                    payload["sql_query"],
+                    company_id=getattr(request.state, "active_company_id", None),
+                )
+            except reporting_service.ReportingQueryError as exc:
+                test_error = f"Report query is invalid: {exc}"
+            except Exception as exc:  # pragma: no cover - defensive
+                from app.core.logging import log_error
+
+                log_error("Reporting test query execution failed", error=str(exc))
+                test_error = f"Report failed to execute: {exc}"
+
+        eligible = await _list_reporting_eligible_users()
+        preview_report = {**record, **payload}
+        extra = {
+            "title": f"Edit report · {record['name']}",
+            "form_heading": f"Edit report · {record['name']}",
+            "submit_label": "Save changes",
+            "form_action": f"/admin/reporting/{int(report_id)}",
+            "test_action": f"/admin/reporting/{int(report_id)}",
+            "report": preview_report,
+            "eligible_users": eligible,
+            "granted_user_ids": set(payload["user_ids"]),
+            "max_rows": reporting_service.MAX_RESULT_ROWS,
+            "test_result": test_result,
+            "test_error": test_error,
+        }
+        return await _main()._render_template(
+            "admin/reporting_form.html", request, user, extra=extra
+        )
+    if error:
+        return flash_redirect(f"/admin/reporting/{int(report_id)}/edit", error, "error")
+    before_snapshot = {
+        "slug": record.get("slug"),
+        "name": record.get("name"),
+        "description": record.get("description"),
+        "sql_query": record.get("sql_query"),
+    }
+    await reporting_repo.update_query(
+        int(report_id),
+        name=payload["name"],
+        description=payload["description"],
+        sql_query=payload["sql_query"],
+    )
+    await reporting_repo.replace_permissions(int(report_id), payload["user_ids"])
+    await audit_service.record(
+        action="reporting.report.update",
+        request=request,
+        user_id=user.get("id"),
+        entity_type="reporting_query",
+        entity_id=int(report_id),
+        before=before_snapshot,
+        after={
+            "slug": payload["slug"],
+            "name": payload["name"],
+            "description": payload["description"],
+            "sql_query": payload["sql_query"],
+            "permission_user_ids": payload["user_ids"],
+        },
+    )
+    return flash_redirect("/admin/reporting", "Report updated.", "success")
+
+
+async def admin_reporting_delete(request: Request, report_id: int):
+    from app.repositories import reporting as reporting_repo
+    from app.services import audit as audit_service
+
+    user, redirect = await _main()._require_super_admin_page(request)
+    if redirect:
+        return redirect
+    record = await reporting_repo.get_query(int(report_id))
+    if not record:
+        return flash_redirect("/admin/reporting", "Report not found", "error")
+    await reporting_repo.delete_query(int(report_id))
+    await audit_service.record(
+        action="reporting.report.delete",
+        request=request,
+        user_id=user.get("id"),
+        entity_type="reporting_query",
+        entity_id=int(report_id),
+        before={
+            "slug": record.get("slug"),
+            "name": record.get("name"),
+            "description": record.get("description"),
+        },
+    )
+    return flash_redirect(
+        "/admin/reporting",
+        f"Deleted report '{record.get('name')}'.",
+        "success",
+    )
+
+
+__all__ = [
+    "reporting_page",
+    "reporting_export",
+    "admin_reporting",
+    "admin_reporting_new",
+    "admin_reporting_edit",
+    "admin_reporting_clone",
+    "admin_reporting_create",
+    "admin_reporting_update",
+    "admin_reporting_delete",
+    "admin_reporting_ai_query",
+]

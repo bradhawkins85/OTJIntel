@@ -1,0 +1,4000 @@
+(function () {
+  function getCookie(name) {
+    const pattern = `(?:^|; )${name.replace(/([.$?*|{}()\[\]\\\/\+^])/g, '\\$1')}=([^;]*)`;
+    const matches = document.cookie.match(new RegExp(pattern));
+    return matches ? decodeURIComponent(matches[1]) : '';
+  }
+
+  function getMetaContent(name) {
+    const meta = document.querySelector(`meta[name="${name}"]`);
+    return meta ? meta.getAttribute('content') || '' : '';
+  }
+
+  function getCsrfToken() {
+    const metaToken = getMetaContent('csrf-token');
+    if (metaToken) {
+      return metaToken;
+    }
+    return getCookie('myportal_session_csrf');
+  }
+
+  function parseJsonScript(elementId, fallbackValue) {
+    if (!elementId) {
+      return fallbackValue;
+    }
+    const element = document.getElementById(elementId);
+    if (!element) {
+      return fallbackValue;
+    }
+    const textContent = element.textContent || element.innerText || '';
+    if (!textContent || !textContent.trim()) {
+      return fallbackValue;
+    }
+    try {
+      return JSON.parse(textContent);
+    } catch (error) {
+      return fallbackValue;
+    }
+  }
+
+  async function requestJson(url, options) {
+    const config = options || {};
+    const csrfToken = getCsrfToken();
+    const headers = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      ...(config.headers || {}),
+    };
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken;
+    }
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      headers,
+      ...config,
+    });
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const data = await response.json();
+        if (data && data.detail) {
+          detail = Array.isArray(data.detail)
+            ? data.detail.map((entry) => entry.msg || entry).join(', ')
+            : data.detail;
+        }
+      } catch (error) {
+        /* ignore json parse errors */
+      }
+      throw new Error(detail);
+    }
+    return response.status !== 204 ? response.json() : null;
+  }
+
+  async function requestForm(url, formData) {
+    const csrfToken = getCsrfToken();
+    const headers = {};
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken;
+    }
+    headers['Accept'] = 'application/json';
+    headers['X-Requested-With'] = 'XMLHttpRequest';
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+      credentials: 'same-origin',
+      headers,
+    });
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const data = await response.json();
+        if (data && data.detail) {
+          detail = Array.isArray(data.detail)
+            ? data.detail.map((entry) => entry.msg || entry).join(', ')
+            : data.detail;
+        }
+      } catch (error) {
+        /* ignore json parse errors */
+      }
+      throw new Error(detail);
+    }
+    return response.status !== 204 ? response.json() : null;
+  }
+
+  const tableRefreshHandlers = Object.create(null);
+  const tableRefreshControllers = new WeakMap();
+
+  function registerTableRefreshHandler(name, handler) {
+    if (!name || typeof handler !== 'function') {
+      return;
+    }
+    const key = String(name).trim().toLowerCase();
+    if (!key) {
+      return;
+    }
+    tableRefreshHandlers[key] = handler;
+  }
+
+  function getTableRefreshHandler(name) {
+    if (!name) {
+      return null;
+    }
+    const key = String(name).trim().toLowerCase();
+    if (!key) {
+      return null;
+    }
+    return tableRefreshHandlers[key] || null;
+  }
+
+  function parseRefreshTopics(value) {
+    if (!value) {
+      return new Set();
+    }
+    const topics = String(value)
+      .split(',')
+      .map((topic) => topic.trim().toLowerCase())
+      .filter((topic) => topic.length > 0);
+    return new Set(topics);
+  }
+
+  function shouldHandleRefresh(detail, topicSet) {
+    if (!(topicSet instanceof Set) || topicSet.size === 0) {
+      return true;
+    }
+    const detailTopics = Array.isArray(detail?.topics)
+      ? detail.topics
+          .map((topic) => String(topic || '').trim().toLowerCase())
+          .filter((topic) => topic.length > 0)
+      : [];
+    if (detailTopics.length) {
+      return detailTopics.some((topic) => topicSet.has(topic));
+    }
+    const reason = typeof detail?.reason === 'string' ? detail.reason.toLowerCase() : '';
+    if (!reason) {
+      return false;
+    }
+    return Array.from(topicSet).some((topic) => reason.includes(topic));
+  }
+
+  function setupTableRealtimeRefreshControllers() {
+    const tables = document.querySelectorAll('[data-table][data-table-refresh-url]');
+    tables.forEach((table) => {
+      if (!(table instanceof HTMLElement)) {
+        return;
+      }
+      if (tableRefreshControllers.has(table)) {
+        return;
+      }
+
+      const endpoint = table.getAttribute('data-table-refresh-url');
+      if (!endpoint) {
+        return;
+      }
+
+      const handlerName = table.getAttribute('data-table-refresh-handler');
+      const handler =
+        getTableRefreshHandler(handlerName) ||
+        getTableRefreshHandler(table.id || '') ||
+        null;
+      if (!handler) {
+        return;
+      }
+
+      const topicSet = parseRefreshTopics(table.getAttribute('data-table-refresh-topics'));
+      const successMessageAttr = table.getAttribute('data-table-refresh-success') || '';
+      const errorMessageAttr = table.getAttribute('data-table-refresh-error') || '';
+      const defaultSuccessMessage = successMessageAttr.trim();
+      const defaultErrorMessage = errorMessageAttr.trim() || 'Unable to refresh data automatically.';
+
+      let refreshing = false;
+      let queued = false;
+      let queuedDetail = null;
+
+      function setBusy(isBusy) {
+        if (isBusy) {
+          table.setAttribute('aria-busy', 'true');
+          table.dataset.refreshing = 'true';
+        } else {
+          table.removeAttribute('aria-busy');
+          delete table.dataset.refreshing;
+        }
+      }
+
+      async function perform(detail) {
+        setBusy(true);
+        let result;
+        try {
+          const currentEndpoint = table.getAttribute('data-table-refresh-url') || endpoint;
+          const response = await requestJson(currentEndpoint);
+          result =
+            (await handler({
+              table,
+              endpoint: currentEndpoint,
+              response,
+              detail: detail || null,
+              requestJson,
+              requestForm,
+              defaultSuccessMessage,
+              defaultErrorMessage,
+            })) || {};
+        } catch (error) {
+          console.error('Realtime table refresh failed', { endpoint, error });
+          if (detail && typeof detail.showToast === 'function') {
+            const message =
+              (error && typeof error === 'object' && typeof error.userMessage === 'string' && error.userMessage.trim()) ||
+              defaultErrorMessage;
+            detail.showToast(message, { variant: 'error' });
+          }
+          return;
+        } finally {
+          setBusy(false);
+        }
+
+        if (detail && typeof detail.showToast === 'function') {
+          if (result && result.skipDefaultToast) {
+            return;
+          }
+          const message =
+            (result && typeof result.successMessage === 'string' && result.successMessage.trim()) ||
+            defaultSuccessMessage;
+          if (message) {
+            detail.showToast(message, { variant: 'success' });
+          }
+        }
+      }
+
+      async function flush(detail) {
+        queuedDetail = detail || queuedDetail;
+        if (refreshing) {
+          queued = true;
+          return;
+        }
+        refreshing = true;
+        try {
+          do {
+            queued = false;
+            const currentDetail = queuedDetail;
+            queuedDetail = null;
+            await perform(currentDetail);
+          } while (queued);
+        } finally {
+          refreshing = false;
+        }
+      }
+
+      function handleRefreshEvent(event) {
+        const detail = event.detail || {};
+        if (!shouldHandleRefresh(detail, topicSet)) {
+          return;
+        }
+        event.preventDefault();
+        flush(detail);
+      }
+
+      document.addEventListener('realtime:refresh', handleRefreshEvent);
+      table.addEventListener('table:refresh-request', (event) => {
+        flush(event.detail || null);
+      });
+
+      table.dataset.tableRefreshBound = 'true';
+      tableRefreshControllers.set(table, { flush });
+    });
+  }
+
+  function requestTableRefresh(target, detail) {
+    let table = null;
+    if (target instanceof HTMLElement) {
+      table = target;
+    } else if (typeof target === 'string') {
+      table = document.getElementById(target) || document.querySelector(target);
+    }
+    if (!table) {
+      return Promise.resolve(false);
+    }
+    const controller = tableRefreshControllers.get(table);
+    if (!controller || typeof controller.flush !== 'function') {
+      return Promise.resolve(false);
+    }
+    return controller.flush(detail || null).then(
+      () => true,
+      (error) => {
+        console.error('Table refresh invocation failed', error);
+        return false;
+      },
+    );
+  }
+
+  const existingTableRefreshApi = window.MyPortalTableRefresh || {};
+  window.MyPortalTableRefresh = {
+    ...existingTableRefreshApi,
+    registerHandler: registerTableRefreshHandler,
+    bind: setupTableRealtimeRefreshControllers,
+    requestRefresh: requestTableRefresh,
+  };
+
+  function setButtonProcessing(button, isProcessing) {
+    if (!button) {
+      return;
+    }
+    const label = button.querySelector('[data-button-label]');
+    if (label) {
+      const defaultLabel = button.dataset.defaultLabel || label.textContent || '';
+      if (!button.dataset.defaultLabel) {
+        button.dataset.defaultLabel = defaultLabel;
+      }
+      const processingLabel = button.dataset.processingLabel || 'Reprocessing AI summary and AI tags…';
+      label.textContent = isProcessing ? processingLabel : button.dataset.defaultLabel;
+    }
+    button.classList.toggle('button--processing', Boolean(isProcessing));
+    if (isProcessing) {
+      button.setAttribute('aria-busy', 'true');
+      button.disabled = true;
+    } else {
+      button.removeAttribute('aria-busy');
+      button.disabled = false;
+    }
+  }
+
+  function updateTicketAiStatus(button, message, isError) {
+    const card = button ? button.closest('[data-ticket-ai-card]') : null;
+    const status = card ? card.querySelector('[data-ticket-ai-status]') : null;
+    if (!status) {
+      if (message && isError) {
+        alert(message);
+      }
+      return;
+    }
+    status.textContent = message || '';
+    status.hidden = !message;
+    status.classList.toggle('form-help--error', Boolean(isError));
+  }
+
+  function updateTicketDescriptionContent(html, raw) {
+    const panel = document.querySelector('[data-ticket-description-panel]');
+    if (panel && typeof panel.open === 'boolean') {
+      panel.open = true;
+    }
+    const viewer = panel ? panel.querySelector('[data-ticket-description-viewer]') : document.querySelector('[data-ticket-description-viewer]');
+    const emptyState = panel
+      ? panel.querySelector('[data-ticket-description-empty]')
+      : document.querySelector('[data-ticket-description-empty]');
+    const input = panel
+      ? panel.querySelector('[data-ticket-description-input]')
+      : document.querySelector('[data-ticket-description-input]');
+
+    const safeHtml = typeof html === 'string' ? html : '';
+    const rawValue = typeof raw === 'string' ? raw : '';
+
+    if (viewer) {
+      viewer.innerHTML = safeHtml;
+      viewer.hidden = !safeHtml;
+    }
+    if (emptyState) {
+      emptyState.hidden = Boolean(safeHtml);
+    }
+    if (input) {
+      input.value = rawValue;
+    }
+
+    document.dispatchEvent(new CustomEvent('ticket:description-updated', {
+      detail: {
+        html: safeHtml,
+        raw: rawValue,
+      },
+    }));
+  }
+
+  function bindTicketAiRefresh() {
+    const buttons = document.querySelectorAll('[data-ticket-ai-refresh]');
+    if (!buttons.length) {
+      return;
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        event.preventDefault();
+        const ticketId = button.getAttribute('data-ticket-id');
+        if (!ticketId || button.disabled) {
+          return;
+        }
+
+        try {
+          setButtonProcessing(button, true);
+          updateTicketAiStatus(button, 'Requesting AI regeneration. You can continue working while we update the summary.', false);
+          await requestJson(`/admin/tickets/${ticketId}/ai/reprocess`, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          });
+          updateTicketAiStatus(
+            button,
+            'AI summary and tags will be regenerated shortly. Refresh the ticket in a moment to review the updates.',
+            false,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unable to refresh AI summary and tags.';
+          updateTicketAiStatus(button, message, true);
+        } finally {
+          setButtonProcessing(button, false);
+        }
+      });
+    });
+  }
+
+  function bindTicketAiReplaceDescription() {
+    const buttons = document.querySelectorAll('[data-ticket-ai-replace-description]');
+    if (!buttons.length) {
+      return;
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        event.preventDefault();
+        if (button.disabled) {
+          return;
+        }
+
+        const ticketId = button.getAttribute('data-ticket-id');
+        if (!ticketId) {
+          return;
+        }
+
+        const confirmed = window.confirm(
+          'Replace the current ticket description with the AI summary? This will overwrite any manual edits.',
+        );
+        if (!confirmed) {
+          return;
+        }
+
+        try {
+          setButtonProcessing(button, true);
+          updateTicketAiStatus(
+            button,
+            'Replacing the ticket description with the AI summary. This may take a moment…',
+            false,
+          );
+          const response = await requestJson(`/admin/tickets/${ticketId}/description/replace`, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          });
+          const message = response && response.message
+            ? response.message
+            : 'Ticket description replaced with the AI summary.';
+          const html = response && typeof response.descriptionHtml === 'string' ? response.descriptionHtml : '';
+          const rawDescription = response && typeof response.description === 'string' ? response.description : '';
+          updateTicketDescriptionContent(html, rawDescription);
+          updateTicketAiStatus(button, message, false);
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : 'Unable to replace the ticket description.';
+          updateTicketAiStatus(button, message, true);
+        } finally {
+          setButtonProcessing(button, false);
+        }
+      });
+    });
+  }
+
+  function bindSyncroTicketImportForms() {
+    const forms = document.querySelectorAll('[data-syncro-ticket-import]');
+    if (!forms.length) {
+      return;
+    }
+
+    const statusRegion = document.querySelector('[data-syncro-ticket-import-status]');
+
+    const renderStatus = (message, isError) => {
+      if (!statusRegion) {
+        if (message) {
+          alert(message);
+        }
+        return;
+      }
+      statusRegion.innerHTML = '';
+      if (!message) {
+        statusRegion.hidden = true;
+        return;
+      }
+      const alertBox = document.createElement('div');
+      alertBox.className = isError ? 'alert alert--error' : 'alert';
+      alertBox.setAttribute('role', isError ? 'alert' : 'status');
+      if (Array.isArray(message)) {
+        const [summary, ...details] = message;
+        alertBox.appendChild(document.createTextNode(summary || 'Import completed.'));
+        if (details.length) {
+          const list = document.createElement('ul');
+          list.className = 'list list--compact';
+          details.forEach((detail) => {
+            const item = document.createElement('li');
+            item.textContent = detail;
+            list.appendChild(item);
+          });
+          alertBox.appendChild(list);
+        }
+      } else {
+        alertBox.textContent = message;
+      }
+      statusRegion.appendChild(alertBox);
+      statusRegion.hidden = false;
+    };
+
+    forms.forEach((form) => {
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const mode = form.getAttribute('data-mode') || 'single';
+        const submitButton = form.querySelector('button[type="submit"]');
+        if (submitButton) {
+          submitButton.disabled = true;
+        }
+        const payload = { mode };
+        const formData = new FormData(form);
+        payload.importBillableTimeAsBilled = formData.get('importBillableTimeAsBilled') === 'on';
+
+        const parseInteger = (value, errorMessage) => {
+          const parsed = Number(value);
+          if (!Number.isInteger(parsed) || parsed <= 0) {
+            throw new Error(errorMessage);
+          }
+          return parsed;
+        };
+
+        try {
+          if (mode === 'single') {
+            payload.ticketId = parseInteger(formData.get('ticketId'), 'Enter a valid Syncro ticket ID.');
+          } else if (mode === 'range') {
+            payload.startId = parseInteger(formData.get('startId'), 'Enter a valid starting ticket ID.');
+            payload.endId = parseInteger(formData.get('endId'), 'Enter a valid ending ticket ID.');
+            if (payload.endId < payload.startId) {
+              throw new Error('End ticket ID must be greater than or equal to the start ID.');
+            }
+          }
+
+          renderStatus('Import in progress…', false);
+          const response = await requestJson('/admin/syncro/import-tickets', {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          });
+          const fetched = Number(response?.fetched ?? 0);
+          const created = Number(response?.created ?? 0);
+          const updated = Number(response?.updated ?? 0);
+          const skipped = Number(response?.skipped ?? 0);
+          const summaryMessage = `Imported ${fetched} ticket${fetched === 1 ? '' : 's'} (created ${created}, updated ${updated}, skipped ${skipped}).`;
+          const skippedReasons = Array.isArray(response?.skipped_reasons)
+            ? response.skipped_reasons
+            : (Array.isArray(response?.skippedReasons) ? response.skippedReasons : []);
+          renderStatus(skippedReasons.length ? [summaryMessage, ...skippedReasons] : summaryMessage, false);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unable to import tickets.';
+          renderStatus(message, true);
+        } finally {
+          if (submitButton) {
+            submitButton.disabled = false;
+          }
+        }
+      });
+    });
+  }
+
+  function bindSyncroStatusMappingRows() {
+    const tbody = document.querySelector('[data-syncro-status-mapping-rows]');
+    if (!tbody) {
+      return;
+    }
+
+    const rowHasValue = (row) => Array.from(row.querySelectorAll('input, select')).some((field) => String(field.value || '').trim());
+
+    const cloneBlankRow = () => {
+      const template = Array.from(tbody.querySelectorAll('[data-syncro-status-mapping-row]')).find((row) => !rowHasValue(row));
+      if (!template) {
+        return null;
+      }
+      const clone = template.cloneNode(true);
+      clone.querySelectorAll('input, select').forEach((field) => {
+        field.value = '';
+      });
+      return clone;
+    };
+
+    const ensureOneBlankRow = () => {
+      const rows = Array.from(tbody.querySelectorAll('[data-syncro-status-mapping-row]'));
+      const blankRows = rows.filter((row) => !rowHasValue(row));
+      if (blankRows.length === 0) {
+        const row = cloneBlankRow() || rows[rows.length - 1]?.cloneNode(true);
+        if (!row) {
+          return;
+        }
+        row.querySelectorAll('input, select').forEach((field) => {
+          field.value = '';
+        });
+        tbody.appendChild(row);
+      } else if (blankRows.length > 1) {
+        blankRows.slice(1).forEach((row) => row.remove());
+      }
+    };
+
+    tbody.addEventListener('input', ensureOneBlankRow);
+    tbody.addEventListener('change', ensureOneBlankRow);
+    ensureOneBlankRow();
+  }
+
+  function bindSyncroCompanyImportForm() {
+    const form = document.querySelector('[data-syncro-company-import]');
+    if (!form) {
+      return;
+    }
+
+    const statusRegion = document.querySelector('[data-syncro-company-import-status]');
+
+    const renderStatus = (message, isError) => {
+      if (!statusRegion) {
+        if (message) {
+          alert(message);
+        }
+        return;
+      }
+      statusRegion.innerHTML = '';
+      if (!message) {
+        statusRegion.hidden = true;
+        return;
+      }
+      const alertBox = document.createElement('div');
+      alertBox.className = isError ? 'alert alert--error' : 'alert';
+      alertBox.setAttribute('role', isError ? 'alert' : 'status');
+      alertBox.textContent = message;
+      statusRegion.appendChild(alertBox);
+      statusRegion.hidden = false;
+    };
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const submitButton = form.querySelector('button[type="submit"]');
+      if (submitButton) {
+        submitButton.disabled = true;
+      }
+      try {
+        renderStatus('Import in progress…', false);
+        const response = await requestJson('/admin/syncro/import-companies', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+        const status = String(response?.status ?? '').toLowerCase();
+        if (status === 'queued') {
+          const message = response?.message || 'Syncro company import queued. Monitor the webhook monitor for updates.';
+          renderStatus(message, false);
+          return;
+        }
+        const fetched = Number(response?.fetched ?? 0);
+        const created = Number(response?.created ?? 0);
+        const updated = Number(response?.updated ?? 0);
+        const skipped = Number(response?.skipped ?? 0);
+        renderStatus(
+          `Imported ${fetched} compan${fetched === 1 ? 'y' : 'ies'} (created ${created}, updated ${updated}, skipped ${skipped}).`,
+          false,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to import companies.';
+        renderStatus(message, true);
+      } finally {
+        if (submitButton) {
+          submitButton.disabled = false;
+        }
+      }
+    });
+  }
+
+  function bindTicketBulkDelete() {
+    const form = document.querySelector('[data-bulk-delete-form]');
+    const table = document.querySelector('[data-bulk-delete-table]');
+    if (!table) {
+      return;
+    }
+
+    if (table.dataset.bulkDeleteBound === 'true') {
+      table.dispatchEvent(new CustomEvent('table:rows-updated'));
+      return;
+    }
+
+    const submitButton = document.querySelector('[data-bulk-delete-submit]');
+    const countLabel = document.querySelector('[data-bulk-delete-count]');
+    const mergeButton = document.querySelector('[data-ticket-merge-open]');
+    const mergeCountLabel = document.querySelector('[data-ticket-merge-count]');
+    const bulkEditButton = document.querySelector('[data-ticket-bulk-edit-open]');
+    const bulkEditCountLabel = document.querySelector('[data-ticket-bulk-edit-count]');
+    const selectAll = table.querySelector('[data-bulk-select-all]');
+    const filterInputs = document.querySelectorAll('[data-table-filter="tickets-table"]');
+
+    const getRowCheckboxes = () =>
+      Array.from(table.querySelectorAll('input[type="checkbox"][data-bulk-delete-checkbox]'));
+
+    const isRowVisible = (row) => {
+      if (!row) {
+        return false;
+      }
+      if (row.dataset.filterHidden === 'true' || row.dataset.pageHidden === 'true') {
+        return false;
+      }
+      if (
+        row.classList.contains('ticket-filtered-hidden') ||
+        row.classList.contains('ticket-group-hidden') ||
+        row.classList.contains('table-search-hidden')
+      ) {
+        return false;
+      }
+      if (row.hidden || row.style.display === 'none') {
+        return false;
+      }
+      return true;
+    };
+
+    const getVisibleCheckboxes = () =>
+      getRowCheckboxes().filter((checkbox) => {
+        const row = checkbox.closest('tr');
+        if (!row || checkbox.disabled) {
+          return false;
+        }
+        return isRowVisible(row);
+      });
+
+    const uncheckHiddenCheckboxes = () => {
+      getRowCheckboxes().forEach((checkbox) => {
+        const row = checkbox.closest('tr');
+        if (row && !isRowVisible(row)) {
+          checkbox.checked = false;
+        }
+      });
+    };
+
+    const updateState = () => {
+      const visible = getVisibleCheckboxes();
+      const selected = visible.filter((checkbox) => checkbox.checked);
+      if (submitButton) {
+        submitButton.disabled = selected.length === 0;
+      }
+      if (countLabel) {
+        const count = selected.length;
+        countLabel.textContent = `${count} selected`;
+        countLabel.hidden = count === 0;
+      }
+      if (mergeButton) {
+        mergeButton.disabled = selected.length < 2;
+      }
+      if (mergeCountLabel) {
+        const count = selected.length;
+        mergeCountLabel.textContent = `${count} selected`;
+        mergeCountLabel.hidden = count === 0;
+      }
+      if (bulkEditButton) {
+        bulkEditButton.disabled = selected.length === 0;
+      }
+      if (bulkEditCountLabel) {
+        const count = selected.length;
+        bulkEditCountLabel.textContent = `${count} selected`;
+        bulkEditCountLabel.hidden = count === 0;
+      }
+      if (selectAll) {
+        if (!visible.length) {
+          selectAll.checked = false;
+          selectAll.indeterminate = false;
+        } else {
+          const selectedVisible = visible.filter((checkbox) => checkbox.checked);
+          selectAll.checked = selectedVisible.length === visible.length;
+          selectAll.indeterminate =
+            selectedVisible.length > 0 && selectedVisible.length < visible.length;
+        }
+      }
+    };
+
+    table.addEventListener('change', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement)) {
+        return;
+      }
+      if (target.matches('input[type="checkbox"][data-bulk-delete-checkbox]')) {
+        window.requestAnimationFrame(updateState);
+      }
+    });
+
+    if (selectAll) {
+      selectAll.addEventListener('change', () => {
+        const visibleCheckboxes = getVisibleCheckboxes();
+        visibleCheckboxes.forEach((checkbox) => {
+          checkbox.checked = selectAll.checked;
+        });
+        updateState();
+      });
+    }
+
+    if (filterInputs.length) {
+      filterInputs.forEach((input) => {
+        input.addEventListener('input', () => {
+          // Uncheck hidden checkboxes when filter changes
+          uncheckHiddenCheckboxes();
+          window.requestAnimationFrame(updateState);
+        });
+      });
+    }
+
+    table.addEventListener('table:rows-updated', () => {
+      // Uncheck hidden checkboxes when table rows are updated
+      uncheckHiddenCheckboxes();
+      window.requestAnimationFrame(updateState);
+    });
+
+    if (form) {
+      form.addEventListener('submit', (event) => {
+        // Uncheck hidden checkboxes before validation and submission
+        uncheckHiddenCheckboxes();
+
+        const selected = getVisibleCheckboxes().filter((checkbox) => checkbox.checked);
+        const count = selected.length;
+        if (!count) {
+          event.preventDefault();
+          return;
+        }
+        const confirmationMessage =
+          count === 1
+            ? 'Delete the selected ticket? This cannot be undone.'
+            : `Delete ${count} selected tickets? This cannot be undone.`;
+        if (!window.confirm(confirmationMessage)) {
+          event.preventDefault();
+        }
+      });
+    }
+
+    if (bulkEditButton) {
+      const modal = document.querySelector('[data-ticket-bulk-edit-modal]');
+      const form = modal ? modal.querySelector('[data-ticket-bulk-edit-form]') : null;
+      const selectedContainer = modal ? modal.querySelector('[data-ticket-bulk-edit-selected]') : null;
+      const summary = modal ? modal.querySelector('[data-ticket-bulk-edit-summary]') : null;
+      const error = modal ? modal.querySelector('[data-ticket-bulk-edit-error]') : null;
+      const closeButtons = modal ? modal.querySelectorAll('[data-ticket-bulk-edit-close]') : [];
+      const closeModal = () => {
+        if (modal) modal.hidden = true;
+      };
+      closeButtons.forEach((button) => button.addEventListener('click', closeModal));
+      const populateSelectedInputs = () => {
+        const selected = getVisibleCheckboxes().filter((checkbox) => checkbox.checked);
+        if (selectedContainer) {
+          selectedContainer.replaceChildren(...selected.map((checkbox) => {
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'ticketIds';
+            input.value = checkbox.value;
+            return input;
+          }));
+        }
+        if (summary) {
+          summary.textContent = `${selected.length} selected ${selected.length === 1 ? 'ticket' : 'tickets'}`;
+        }
+        return selected.length;
+      };
+      bulkEditButton.addEventListener('click', () => {
+        if (!modal) return;
+        const count = populateSelectedInputs();
+        if (!count) return;
+        if (error) error.hidden = true;
+        modal.hidden = false;
+      });
+      if (form) {
+        form.addEventListener('submit', (event) => {
+          const count = populateSelectedInputs();
+          if (!count) {
+            event.preventDefault();
+            if (error) {
+              error.textContent = 'Select at least one ticket to update.';
+              error.hidden = false;
+            }
+          }
+        });
+      }
+    }
+
+    if (mergeButton) {
+      const modal = document.querySelector('[data-ticket-merge-modal]');
+      const list = modal ? modal.querySelector('[data-ticket-merge-list]') : null;
+      const error = modal ? modal.querySelector('[data-ticket-merge-error]') : null;
+      const submit = modal ? modal.querySelector('[data-ticket-merge-submit]') : null;
+      const closeButtons = modal ? modal.querySelectorAll('[data-ticket-merge-close]') : [];
+      const closeModal = () => {
+        if (modal) modal.hidden = true;
+      };
+      closeButtons.forEach((button) => button.addEventListener('click', closeModal));
+      mergeButton.addEventListener('click', () => {
+        const selected = getVisibleCheckboxes().filter((checkbox) => checkbox.checked);
+        if (!modal || !list || selected.length < 2) return;
+        if (error) error.hidden = true;
+        list.replaceChildren(...selected.map((checkbox, index) => {
+          const row = checkbox.closest('tr');
+          const id = checkbox.value;
+          const subject = row ? (row.querySelector('[data-column="subject"]')?.textContent || row.cells[2]?.textContent || '').trim() : '';
+          const label = document.createElement('label');
+          label.className = 'ticket-merge-list__item';
+          const radio = document.createElement('input');
+          radio.type = 'radio';
+          radio.name = 'mergeParentTicketId';
+          radio.value = id;
+          radio.checked = index === 0;
+          label.append(radio, document.createTextNode(` Ticket #${id} — ${subject || 'Untitled ticket'}`));
+          return label;
+        }));
+        modal.hidden = false;
+      });
+      if (submit) {
+        submit.addEventListener('click', async () => {
+          const selected = getVisibleCheckboxes().filter((checkbox) => checkbox.checked);
+          const parent = modal ? modal.querySelector('input[name="mergeParentTicketId"]:checked') : null;
+          if (!parent || selected.length < 2) return;
+          submit.disabled = true;
+          if (error) error.hidden = true;
+          try {
+            const response = await fetch('/api/tickets/merge', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ticket_ids: selected.map((checkbox) => Number(checkbox.value)), target_ticket_id: Number(parent.value)}),
+            });
+            if (!response.ok) throw new Error('Unable to merge selected tickets.');
+            window.location.href = `/admin/tickets/${encodeURIComponent(parent.value)}`;
+          } catch (err) {
+            if (error) {
+              error.textContent = err instanceof Error ? err.message : 'Unable to merge selected tickets.';
+              error.hidden = false;
+            }
+          } finally {
+            submit.disabled = false;
+          }
+        });
+      }
+    }
+
+    updateState();
+    table.dataset.bulkDeleteBound = 'true';
+  }
+
+  function bindTicketStatusAutoSubmit() {
+    const forms = document.querySelectorAll('[data-ticket-status-form]');
+    forms.forEach((form) => {
+      if (form.dataset.ticketStatusBound === 'true') {
+        return;
+      }
+      const select = form.querySelector('[data-ticket-status-select]');
+      if (!select) {
+        form.dataset.ticketStatusBound = 'true';
+        return;
+      }
+
+      let hasSubmitted = false;
+
+      form.dataset.ticketStatusBound = 'true';
+
+      form.addEventListener('submit', () => {
+        hasSubmitted = true;
+        select.disabled = true;
+        form.classList.add('inline-form--submitting');
+      });
+
+      select.addEventListener('change', () => {
+        if (hasSubmitted) {
+          return;
+        }
+        hasSubmitted = true;
+        if (typeof form.requestSubmit === 'function') {
+          form.requestSubmit();
+        } else {
+          form.submit();
+        }
+      });
+    });
+  }
+
+  function bindIssueStatusAutoSubmit() {
+    const forms = document.querySelectorAll('[data-issue-status-form]');
+    forms.forEach((form) => {
+      if (form.dataset.issueStatusBound === 'true') {
+        return;
+      }
+      const select = form.querySelector('[data-issue-status-select]');
+      if (!select) {
+        form.dataset.issueStatusBound = 'true';
+        return;
+      }
+
+      let hasSubmitted = false;
+
+      form.dataset.issueStatusBound = 'true';
+
+      form.addEventListener('submit', () => {
+        hasSubmitted = true;
+        select.disabled = true;
+        form.classList.add('inline-form--submitting');
+      });
+
+      select.addEventListener('change', () => {
+        if (hasSubmitted) {
+          return;
+        }
+        hasSubmitted = true;
+        if (typeof form.requestSubmit === 'function') {
+          form.requestSubmit();
+        } else {
+          form.submit();
+        }
+      });
+    });
+  }
+
+  const ticketTableStateCache = new WeakMap();
+  let ticketRefreshHandlerRegistered = false;
+
+  function getTicketTableState(table) {
+    let state = ticketTableStateCache.get(table);
+    if (state) {
+      return state;
+    }
+
+    let statusOptions = [];
+    try {
+      const parsed = JSON.parse(table.dataset.ticketStatusOptions || '[]');
+      if (Array.isArray(parsed)) {
+        statusOptions = parsed
+          .map((item) => {
+            if (!item || typeof item !== 'object') {
+              return null;
+            }
+            const value = String(item.tech_status || item.techStatus || '').trim();
+            if (!value) {
+              return null;
+            }
+            const label = String(item.tech_label || item.techLabel || '')
+              .trim()
+              || value.replace(/_/g, ' ');
+            return { value, label };
+          })
+          .filter(Boolean);
+      }
+    } catch (error) {
+      statusOptions = [];
+    }
+    if (!statusOptions.length) {
+      statusOptions = [
+        { value: 'open', label: 'Open' },
+        { value: 'in_progress', label: 'In progress' },
+        { value: 'pending', label: 'Pending' },
+        { value: 'resolved', label: 'Resolved' },
+        { value: 'closed', label: 'Closed' },
+      ];
+    }
+
+    const statusLabels = statusOptions.reduce((acc, option) => {
+      acc[option.value] = option.label;
+      return acc;
+    }, {});
+
+    const canBulkDelete = table.getAttribute('data-can-bulk-delete') === 'true';
+    const canMergeTickets = table.getAttribute('data-can-merge-tickets') === 'true';
+    const canBulkEditTickets = table.getAttribute('data-can-bulk-edit-tickets') === 'true';
+    const canSelectTickets = canBulkDelete || canMergeTickets || canBulkEditTickets;
+    const bulkDeleteFormId = table.getAttribute('data-bulk-delete-form-id') || '';
+    const emptyMessage = table.getAttribute('data-table-empty-label') || 'No records found.';
+
+    const statsContainer = document.querySelector('[data-ticket-stats]');
+    const statElements = {};
+    if (statsContainer) {
+      statsContainer.querySelectorAll('[data-ticket-stat]').forEach((element) => {
+        const key = element.getAttribute('data-ticket-stat');
+        if (key) {
+          statElements[key] = element;
+        }
+      });
+    }
+
+    let dateFormatter;
+    try {
+      dateFormatter = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+    } catch (error) {
+      dateFormatter = null;
+    }
+
+    function normaliseCounts(counts) {
+      const output = {};
+      if (!counts || typeof counts !== 'object') {
+        return output;
+      }
+      Object.entries(counts).forEach(([key, value]) => {
+        const normalisedKey = String(key || '').toLowerCase();
+        if (!normalisedKey) {
+          return;
+        }
+        const numeric = Number(value);
+        output[normalisedKey] = Number.isFinite(numeric) ? numeric : 0;
+      });
+      return output;
+    }
+
+    function updateStats(counts) {
+      const normalised = normaliseCounts(counts);
+      Object.entries(statElements).forEach(([key, element]) => {
+        if (key === 'total') {
+          return;
+        }
+        const value = Number(normalised[key] ?? 0);
+        const valueElement = element.querySelector('.stat-strip__stat-value');
+        if (valueElement) {
+          valueElement.textContent = String(Number.isFinite(value) ? value : 0);
+        }
+        const tile = element.closest('.stat-strip__stat');
+        if (tile) {
+          tile.hidden = tile.dataset.ticketStatSelected !== 'true' || !Number.isFinite(value) || value === 0;
+        }
+      });
+      if (statElements.total) {
+        const visibleTotal = Object.keys(statElements)
+          .filter((key) => key !== 'total' && statElements[key].dataset.ticketStatSelected === 'true')
+          .reduce((sum, key) => sum + Number(normalised[key] ?? 0), 0);
+        const totalValueElement = statElements.total.querySelector('.stat-strip__stat-value');
+        if (totalValueElement) {
+          totalValueElement.textContent = String(Number.isFinite(visibleTotal) ? visibleTotal : 0);
+        }
+      }
+    }
+
+    function formatReviewDate(value) {
+      if (!value) {
+        return '—';
+      }
+      const dateText = String(value).slice(0, 10);
+      return /^\d{4}-\d{2}-\d{2}$/.test(dateText) ? dateText : '—';
+    }
+
+    function reviewDateClass(value) {
+      const dateText = formatReviewDate(value);
+      if (dateText === '—') {
+        return '';
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      if (dateText < today) {
+        return ' ticket-review-date--past';
+      }
+      if (dateText > today) {
+        return ' ticket-review-date--future';
+      }
+      return '';
+    }
+
+    function formatUpdatedAt(value) {
+      if (!value) {
+        return '—';
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return '—';
+      }
+      if (dateFormatter) {
+        return dateFormatter.format(date);
+      }
+      return date.toISOString().replace('T', ' ').slice(0, 16);
+    }
+
+    function createStatusCell(currentStatus) {
+      const cell = document.createElement('td');
+      cell.dataset.label = 'Status';
+      cell.dataset.column = 'status';
+      cell.className = 'tickets-table__cell tickets-table__cell--status';
+      const normalisedStatus = String(currentStatus || 'open');
+      cell.dataset.value = normalisedStatus;
+
+      const statusText = document.createElement('span');
+      statusText.className = 'ticket-status__text';
+      statusText.textContent = statusLabels[normalisedStatus] || normalisedStatus.replace(/_/g, ' ');
+      cell.appendChild(statusText);
+      return cell;
+    }
+
+    function createLastReplyStatusCell(status) {
+      const cell = document.createElement('td');
+      cell.dataset.label = 'Last Reply Status';
+      cell.dataset.column = 'last-reply-status';
+      cell.className = 'tickets-table__cell tickets-table__cell--last-reply-status';
+
+      const badgeClasses = {
+        Bounced: 'badge--danger',
+        Read: 'badge--success',
+        Delivered: 'badge--info',
+        Sent: 'badge--muted',
+      };
+      const displayStatus = status ? String(status) : 'No email status';
+      const badge = document.createElement('span');
+      badge.className = `badge ${badgeClasses[displayStatus] || 'badge--muted'}`;
+      badge.textContent = displayStatus;
+      cell.appendChild(badge);
+      return cell;
+    }
+
+
+    function applyColumnVisibility() {
+      const toggles = Array.from(document.querySelectorAll('[data-ticket-columns] .ticket-column-toggle'));
+      if (!toggles.length) {
+        return;
+      }
+      toggles.forEach((toggle) => {
+        const column = toggle.dataset.column;
+        if (!column) {
+          return;
+        }
+        const visible = column === 'subject' || toggle.checked;
+        table.querySelectorAll(`[data-column="${column}"]`).forEach((element) => {
+          element.style.display = visible ? '' : 'none';
+        });
+      });
+    }
+
+    function buildRow(ticket) {
+      const numericId = Number(ticket.id);
+      if (!Number.isFinite(numericId) || numericId <= 0) {
+        return null;
+      }
+      const ticketId = numericId;
+      const row = document.createElement('tr');
+      row.setAttribute('data-ticket-id', String(ticketId));
+
+      if (canSelectTickets) {
+        const selectCell = document.createElement('td');
+        selectCell.dataset.label = 'Select';
+        selectCell.className = 'table__select';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.name = 'ticketIds';
+        checkbox.value = String(ticketId);
+        checkbox.setAttribute('aria-label', `Select ticket ${ticketId}`);
+        checkbox.setAttribute('data-bulk-delete-checkbox', '');
+        checkbox.setAttribute('data-ticket-select-checkbox', '');
+        if (bulkDeleteFormId) {
+          checkbox.setAttribute('form', bulkDeleteFormId);
+        }
+        selectCell.appendChild(checkbox);
+        row.appendChild(selectCell);
+      }
+
+      function appendTextCell(column, label, value, options) {
+        const cell = document.createElement('td');
+        cell.dataset.label = label;
+        cell.dataset.column = column;
+        cell.className = `tickets-table__cell tickets-table__cell--${column}${options && options.className ? options.className : ''}`;
+        if (options && options.value !== undefined) {
+          cell.dataset.value = String(options.value || '');
+        }
+        cell.textContent = value === null || value === undefined || value === '' ? '—' : String(value);
+        row.appendChild(cell);
+        return cell;
+      }
+
+      const idCell = appendTextCell('id', 'ID', ticketId, { value: ticketId });
+      idCell.textContent = String(ticketId);
+
+      const subjectCell = document.createElement('td');
+      subjectCell.dataset.label = 'Subject';
+      subjectCell.dataset.column = 'subject';
+      subjectCell.dataset.mobilePriority = 'essential';
+      subjectCell.className = 'tickets-table__cell tickets-table__cell--subject';
+      const subjectLink = document.createElement('a');
+      subjectLink.href = `/admin/tickets/${ticketId}`;
+      subjectLink.textContent = String(ticket.subject || 'Untitled ticket');
+      subjectCell.appendChild(subjectLink);
+      row.appendChild(subjectCell);
+
+      row.appendChild(createStatusCell(ticket.status));
+      appendTextCell('priority', 'Priority', ticket.priority || 'normal');
+
+      let companyDisplay = '';
+      if (ticket.company_name) {
+        companyDisplay = String(ticket.company_name);
+      } else if (ticket.company_id !== null && ticket.company_id !== undefined) {
+        companyDisplay = String(ticket.company_id);
+      }
+      appendTextCell('company', 'Company', companyDisplay);
+      const slaCell = document.createElement('td');
+      slaCell.dataset.label = 'SLA'; slaCell.dataset.column = 'sla';
+      const slaBadge = document.createElement('span');
+      slaBadge.className = `status status--${ticket.sla_state === 'breached' ? 'danger' : (ticket.sla_state === 'at_risk' ? 'warning' : (['met', 'on_track'].includes(ticket.sla_state) ? 'success' : 'neutral'))}`;
+      slaBadge.textContent = ticket.sla_label || 'No SLA'; slaBadge.title = ticket.sla_name || '';
+      slaCell.appendChild(slaBadge); row.appendChild(slaCell);
+      appendTextCell('assigned', 'Assigned', ticket.assigned_user_email || '—');
+      appendTextCell('updated', 'Updated', formatUpdatedAt(ticket.updated_at), { value: ticket.updated_at || '' });
+      row.appendChild(createLastReplyStatusCell(ticket.latest_public_reply_email_status));
+      appendTextCell('review-date', 'Review Date', formatReviewDate(ticket.review_date), { value: ticket.review_date || '', className: reviewDateClass(ticket.review_date) });
+      appendTextCell('category', 'Category', ticket.category || '—');
+      appendTextCell('requester', 'Requester', ticket.requester_label || ticket.requester_email || ticket.requester_id || '—');
+      appendTextCell('module', 'Module', ticket.module_slug || '—');
+      appendTextCell('external-ref', 'External Ref', ticket.external_reference || '—');
+      appendTextCell('created', 'Created', formatUpdatedAt(ticket.created_at), { value: ticket.created_at || '' });
+      appendTextCell('closed', 'Closed', formatUpdatedAt(ticket.closed_at), { value: ticket.closed_at || '' });
+      appendTextCell('ai-status', 'AI Status', ticket.ai_resolution_state || '—');
+      appendTextCell('ai-tags', 'AI Tags', Array.isArray(ticket.ai_tags) ? ticket.ai_tags.join(', ') : (ticket.ai_tags || '—'));
+      appendTextCell('billable-minutes', 'Billable Mins', ticket.billable_minutes ?? 0, { value: ticket.billable_minutes ?? 0 });
+      appendTextCell('non-billable-minutes', 'Non-Billable Mins', ticket.non_billable_minutes ?? 0, { value: ticket.non_billable_minutes ?? 0 });
+      appendTextCell('requester-email', 'ticket.requester_email', ticket.requester_email || '—');
+      appendTextCell('requester-display-name', 'ticket.requester_display_name', ticket.requester_display_name || ticket.requester_label || '—');
+      appendTextCell('assigned-user-email', 'ticket.assigned_user_email', ticket.assigned_user_email || '—');
+      appendTextCell('assigned-user-display-name', 'ticket.assigned_user_display_name', ticket.assigned_user_display_name || ticket.assigned_user_email || '—');
+      appendTextCell('company-id', 'ticket.company.id', ticket.company_id || '—');
+      appendTextCell('has-attachments', 'ticket.has_attachments', ticket.has_attachments ?? '—');
+      appendTextCell('attachment-count', 'ticket.attachment_count', ticket.attachment_count ?? 0, { value: ticket.attachment_count ?? 0 });
+      appendTextCell('has-tasks', 'ticket.has_tasks', ticket.has_tasks ?? '—');
+      appendTextCell('task-count', 'ticket.task_count', ticket.task_count ?? 0, { value: ticket.task_count ?? 0 });
+      appendTextCell('has-open-tasks', 'ticket.has_open_tasks', ticket.has_open_tasks ?? '—');
+      appendTextCell('open-task-count', 'ticket.open_task_count', ticket.open_task_count ?? 0, { value: ticket.open_task_count ?? 0 });
+      appendTextCell('labels', 'ticket.labels', Array.isArray(ticket.labels) ? ticket.labels.join(', ') : (ticket.labels || '—'));
+      appendTextCell('age-days', 'ticket.age_days', ticket.age_days ?? '—', { value: ticket.age_days ?? '' });
+      appendTextCell('updated-age-hours', 'ticket.updated_age_hours', ticket.updated_age_hours ?? '—', { value: ticket.updated_age_hours ?? '' });
+      appendTextCell('in-status-hours', 'ticket.in_status_age_hours', ticket.in_status_age_hours ?? '—', { value: ticket.in_status_age_hours ?? '' });
+      appendTextCell('last-reply-age-hours', 'ticket.last_reply_age_hours', ticket.last_reply_age_hours ?? '—', { value: ticket.last_reply_age_hours ?? '' });
+      appendTextCell('latest-reply-internal', 'reply.is_internal', ticket.latest_reply_is_internal ?? '—');
+      appendTextCell('latest-reply-kind', 'reply.kind', ticket.latest_reply_kind || '—');
+      appendTextCell('ticket-update-actor-type', 'ticket_update.actor_type', ticket.ticket_update_actor_type || '—');
+
+      return row;
+    }
+
+    function patchRows(items) {
+      const tbody = table.tBodies[0] || table.createTBody();
+      const rows = Array.isArray(items) ? items : [];
+      const existing = new Map();
+      Array.from(tbody.querySelectorAll('tr[data-ticket-id]')).forEach((row) => {
+        const key = row.getAttribute('data-ticket-id');
+        if (key) existing.set(key, row);
+      });
+      const seen = new Set();
+      const fragment = document.createDocumentFragment();
+      rows.forEach((ticket) => {
+        const row = buildRow(ticket);
+        if (!row) return;
+        const key = row.getAttribute('data-ticket-id');
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        const prior = existing.get(key);
+        if (prior) {
+          prior.replaceWith(row);
+        }
+        fragment.appendChild(row);
+      });
+      while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+      if (fragment.childNodes.length) {
+        tbody.appendChild(fragment);
+        applyColumnVisibility();
+        return;
+      }
+      const emptyRow = document.createElement('tr');
+      const emptyCell = document.createElement('td');
+      emptyCell.colSpan = table.querySelectorAll('thead th').length || 8;
+      emptyCell.className = 'table__empty';
+      emptyCell.textContent = emptyMessage;
+      emptyRow.appendChild(emptyCell);
+      tbody.appendChild(emptyRow);
+    }
+
+    function renderTable(items) {
+      patchRows(items);
+    }
+
+    state = {
+      renderTable,
+      updateStats,
+    };
+    ticketTableStateCache.set(table, state);
+    return state;
+  }
+
+  function registerTicketTableRefreshHandler() {
+    if (ticketRefreshHandlerRegistered) {
+      return;
+    }
+    ticketRefreshHandlerRegistered = true;
+
+    const handler = async ({ table, response }) => {
+      if (!(table instanceof HTMLTableElement)) {
+        return { skipDefaultToast: true };
+      }
+      const state = getTicketTableState(table);
+      const items = Array.isArray(response?.items) ? response.items : [];
+      state.renderTable(items);
+      state.updateStats(response?.status_counts);
+      table.dispatchEvent(new CustomEvent('table:rows-updated'));
+      bindTicketStatusAutoSubmit();
+      bindTicketBulkDelete();
+      return { successMessage: 'Tickets updated.' };
+    };
+
+    registerTableRefreshHandler('tickets', handler);
+    registerTableRefreshHandler('tickets-table', handler);
+
+    const searchInput = document.querySelector('[data-ticket-dashboard-search]');
+    const limitSelect = document.querySelector('[data-ticket-dashboard-limit]');
+    const table = document.getElementById('tickets-table');
+    const refreshWithParams = (updateParams) => {
+      if (!(table instanceof HTMLTableElement)) return;
+      const endpoint = table.getAttribute('data-table-refresh-url');
+      if (!endpoint) return;
+      const [baseUrl, queryString = ''] = endpoint.split('?');
+      const params = new URLSearchParams(queryString);
+      updateParams(params);
+      table.setAttribute('data-table-refresh-url', params.toString() ? `${baseUrl}?${params.toString()}` : baseUrl);
+      table.dispatchEvent(new CustomEvent('table:refresh-request'));
+    };
+    if (searchInput instanceof HTMLInputElement && table instanceof HTMLTableElement) {
+      let timer = null;
+      searchInput.addEventListener('input', () => {
+        if (timer) window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          refreshWithParams((params) => {
+            if (searchInput.value.trim()) params.set('search', searchInput.value.trim());
+            else params.delete('search');
+          });
+        }, 300);
+      });
+    }
+    if (limitSelect instanceof HTMLSelectElement && table instanceof HTMLTableElement) {
+      limitSelect.addEventListener('change', () => {
+        refreshWithParams((params) => {
+          if (limitSelect.value === 'all') {
+            params.set('all', 'true');
+            params.delete('limit');
+          } else {
+            params.set('limit', limitSelect.value);
+            params.delete('all');
+          }
+        });
+      });
+    }
+  }
+
+  function parsePermissions(value) {
+    return value
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+
+  function getTemplatePayload(scriptId) {
+    if (!scriptId) {
+      return null;
+    }
+    const element = document.getElementById(scriptId);
+    if (!element) {
+      return null;
+    }
+    const text = element.textContent || element.innerText || '';
+    if (!text.trim()) {
+      return null;
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function bindMessageTemplateForm() {
+    const form = document.getElementById('message-template-form');
+    if (!form) {
+      return;
+    }
+
+    const idField = form.querySelector('#message-template-id');
+    const slugField = form.querySelector('#message-template-slug');
+    const nameField = form.querySelector('#message-template-name');
+    const descriptionField = form.querySelector('#message-template-description');
+    const contentTypeField = form.querySelector('#message-template-content-type');
+    const contentField = form.querySelector('#message-template-content');
+    const editorContainer = form.querySelector('#message-template-content-editor');
+    const submitButton = form.querySelector('[data-template-submit]');
+    const formTitle = document.querySelector('[data-template-form-title]');
+    const resetButton = document.querySelector('[data-template-reset]');
+
+    let sunEditor = null;
+
+    function destroySunEditor() {
+      if (sunEditor) {
+        try {
+          sunEditor.destroy();
+        } catch (_) {}
+        sunEditor = null;
+      }
+    }
+
+    function initSunEditor(initialContent) {
+      destroySunEditor();
+      if (!editorContainer) {
+        return;
+      }
+      if (typeof SUNEDITOR === 'undefined') {
+        console.warn('SunEditor failed to load. HTML content editing is unavailable.');
+        contentField.style.display = '';
+        contentField.setAttribute('required', '');
+        if (editorContainer) {
+          editorContainer.style.display = 'none';
+        }
+        return;
+      }
+      editorContainer.innerHTML = '';
+      const sunTextarea = document.createElement('textarea');
+      sunTextarea.id = 'message-template-content-sun';
+      editorContainer.appendChild(sunTextarea);
+      sunEditor = SUNEDITOR.create(sunTextarea, {
+        width: '100%',
+        height: '300',
+        buttonList: [
+          ['undo', 'redo'],
+          ['bold', 'underline', 'italic', 'strike'],
+          ['fontColor', 'hiliteColor'],
+          ['outdent', 'indent'],
+          ['align', 'horizontalRule', 'list', 'lineHeight'],
+          ['link', 'image'],
+          ['removeFormat'],
+          ['codeView'],
+        ],
+      });
+      sunEditor.setContents(initialContent || '');
+    }
+
+    function switchEditorMode(contentType, content) {
+      if (contentType === 'text/html') {
+        contentField.style.display = 'none';
+        contentField.removeAttribute('required');
+        if (editorContainer) {
+          editorContainer.style.display = '';
+        }
+        initSunEditor(content !== undefined ? content : contentField.value);
+      } else {
+        destroySunEditor();
+        if (editorContainer) {
+          editorContainer.style.display = 'none';
+          editorContainer.innerHTML = '';
+        }
+        contentField.style.display = '';
+        contentField.setAttribute('required', '');
+        if (content !== undefined) {
+          contentField.value = content;
+        }
+      }
+    }
+
+    function getContentValue() {
+      if (sunEditor) {
+        return sunEditor.getContents();
+      }
+      return contentField.value;
+    }
+
+    function setFormState(mode, payload) {
+      if (mode === 'edit' && payload) {
+        idField.value = payload.id || '';
+        slugField.value = payload.slug || '';
+        nameField.value = payload.name || '';
+        descriptionField.value = payload.description || '';
+        contentTypeField.value = payload.content_type || 'text/plain';
+        contentField.value = payload.content || '';
+        if (formTitle) {
+          formTitle.textContent = 'Edit template';
+        }
+        if (submitButton) {
+          submitButton.textContent = 'Update template';
+        }
+      } else {
+        idField.value = '';
+        slugField.value = '';
+        nameField.value = '';
+        descriptionField.value = '';
+        contentTypeField.value = 'text/plain';
+        contentField.value = '';
+        if (formTitle) {
+          formTitle.textContent = 'New template';
+        }
+        if (submitButton) {
+          submitButton.textContent = 'Save template';
+        }
+      }
+      switchEditorMode(contentTypeField.value, payload ? payload.content || '' : '');
+    }
+
+    async function handleSubmit(event) {
+      event.preventDefault();
+      const templateId = idField.value.trim();
+      const content = getContentValue();
+      if (!content || !content.trim()) {
+        alert('Content is required.');
+        return;
+      }
+      const payload = {
+        slug: slugField.value.trim(),
+        name: nameField.value.trim(),
+        description: descriptionField.value.trim() || null,
+        content_type: contentTypeField.value,
+        content,
+      };
+
+      const method = templateId ? 'PUT' : 'POST';
+      const url = templateId
+        ? `/api/message-templates/${encodeURIComponent(templateId)}`
+        : '/api/message-templates/';
+
+      if (submitButton) {
+        submitButton.disabled = true;
+      }
+
+      try {
+        await requestJson(url, { method, body: JSON.stringify(payload) });
+        const message = templateId ? 'Template updated.' : 'Template created.';
+        window.location.href = `/admin/message-templates?success=${encodeURIComponent(message)}`;
+      } catch (error) {
+        alert(`Unable to save template: ${error.message}`);
+      } finally {
+        if (submitButton) {
+          submitButton.disabled = false;
+        }
+      }
+    }
+
+    form.addEventListener('submit', handleSubmit);
+
+    contentTypeField.addEventListener('change', () => {
+      switchEditorMode(contentTypeField.value, getContentValue());
+    });
+
+    if (resetButton) {
+      resetButton.addEventListener('click', () => {
+        setFormState('create');
+        slugField.focus();
+      });
+    }
+
+    if (!idField.value) {
+      setFormState('create');
+    } else {
+      switchEditorMode(contentTypeField.value, contentField.value);
+    }
+  }
+
+  function bindMessageTemplateCloneButtons() {
+    document.querySelectorAll('[data-template-clone]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const row = button.closest('tr');
+        if (!row) {
+          return;
+        }
+        const templateId = row.dataset.templateId;
+        if (!templateId) {
+          return;
+        }
+        const payload = getTemplatePayload(row.dataset.templateJson);
+        const templateName =
+          payload?.name || row.querySelector('[data-label="Name"]')?.textContent || 'this template';
+        if (!confirm(`Clone ${templateName.trim()}? A new template will be created with a unique slug.`)) {
+          return;
+        }
+        button.disabled = true;
+        try {
+          const cloned = await requestJson(
+            `/api/message-templates/${encodeURIComponent(templateId)}/clone`,
+            { method: 'POST' },
+          );
+          const message = `Template cloned as ${cloned.slug}.`;
+          window.location.href = `/admin/message-templates/${encodeURIComponent(
+            cloned.id,
+          )}/edit?success=${encodeURIComponent(message)}`;
+        } catch (error) {
+          alert(`Unable to clone template: ${error.message}`);
+          button.disabled = false;
+        }
+      });
+    });
+  }
+
+  function bindMessageTemplateDeleteButtons() {
+    document.querySelectorAll('[data-template-delete]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const row = button.closest('tr');
+        if (!row) {
+          return;
+        }
+        const templateId = row.dataset.templateId;
+        if (!templateId) {
+          return;
+        }
+        const payload = getTemplatePayload(row.dataset.templateJson);
+        const templateName =
+          payload?.name || row.querySelector('[data-label="Name"]')?.textContent || 'this template';
+        if (!confirm(`Delete ${templateName.trim()}? This action cannot be undone.`)) {
+          return;
+        }
+        try {
+          await requestJson(`/api/message-templates/${encodeURIComponent(templateId)}`, { method: 'DELETE' });
+          window.location.href = `/admin/message-templates?success=${encodeURIComponent('Template deleted.')}`;
+        } catch (error) {
+          alert(`Unable to delete template: ${error.message}`);
+        }
+      });
+    });
+  }
+
+  function bindRoleForm() {
+    const form = document.getElementById('role-form');
+    if (!form) {
+      return;
+    }
+    const modal = document.getElementById('role-modal');
+    const modalTitle = document.getElementById('role-modal-title');
+    const modalSubtitle = document.getElementById('role-modal-subtitle');
+    const submitButton = form.querySelector('[data-role-submit]');
+    const idField = form.querySelector('#role-id');
+    const nameField = form.querySelector('#role-name');
+    const descriptionField = form.querySelector('#role-description');
+    const permissionInputs = form.querySelectorAll('[data-permission-level]');
+    let activeRoleTrigger = null;
+
+    function getSelectedPermissions() {
+      const permissions = {};
+      permissionInputs.forEach((input) => {
+        if (!(input instanceof HTMLInputElement) || !input.checked) {
+          return;
+        }
+        const key = input.getAttribute('data-permission-key');
+        const level = input.value;
+        if (key && level && level !== 'none') {
+          permissions[key] = level;
+        }
+      });
+      return permissions;
+    }
+
+    function normalizePermissions(permissions) {
+      if (!permissions) {
+        return {};
+      }
+      if (Array.isArray(permissions)) {
+        const legacyMap = {
+          'chat.access': ['menu.chat', 'read'],
+          'helpdesk.technician': ['menu.tickets', 'write'],
+          'marketing.access': ['menu.marketing', 'write'],
+          'shop.access': ['menu.shop', 'read'],
+          'orders.access': ['menu.orders', 'read'],
+          'forms.access': ['menu.forms', 'read'],
+          'assets.manage': ['menu.assets', 'write'],
+          'licenses.manage': ['menu.m365.licenses', 'write'],
+          'licenses.order': ['menu.m365.licenses', 'write'],
+          'invoices.manage': ['menu.invoices', 'write'],
+          'staff.manage': ['menu.staff', 'write'],
+          'issues.manage': ['menu.issues', 'write'],
+          'compliance.access': ['menu.compliance', 'read'],
+          'continuity.access': ['menu.continuity', 'read'],
+          'compliance_checks.access': ['menu.compliance_checks', 'read'],
+          'compliance_checks.manage': ['menu.compliance_checks.library', 'write'],
+          'm365_best_practices.access': ['menu.m365.best_practices', 'read'],
+          'm365_user_mailboxes.access': ['menu.m365.user_mailboxes', 'read'],
+          'm365_shared_mailboxes.access': ['menu.m365.shared_mailboxes', 'read'],
+          'company.admin': ['menu.admin.company', 'write'],
+          'company.switch_all': ['menu.admin.technician', 'write'],
+        };
+        return permissions.reduce((acc, permission) => {
+          const mapped = legacyMap[permission];
+          if (mapped) {
+            acc[mapped[0]] = mapped[1];
+          }
+          return acc;
+        }, {});
+      }
+      if (typeof permissions === 'object') {
+        const menuPermissions = permissions.menu && typeof permissions.menu === 'object' ? permissions.menu : permissions;
+        if (menuPermissions['menu.admin.technician'] === 'read') {
+          return { ...menuPermissions, 'menu.admin.technician': 'write' };
+        }
+        return menuPermissions;
+      }
+      return {};
+    }
+
+    function setSelectedPermissions(permissions) {
+      const permissionMap = normalizePermissions(permissions);
+      permissionInputs.forEach((input) => {
+        if (!(input instanceof HTMLInputElement)) {
+          return;
+        }
+        const key = input.getAttribute('data-permission-key');
+        const expectedLevel = key ? permissionMap[key] || 'none' : 'none';
+        input.checked = input.value === expectedLevel;
+      });
+    }
+
+    function updateModalText(mode, roleName) {
+      if (modalTitle) {
+        modalTitle.textContent = mode === 'edit' ? 'Edit role' : mode === 'clone' ? 'Clone role' : 'Create role';
+      }
+      if (modalSubtitle) {
+        if (mode === 'edit') {
+          modalSubtitle.textContent = `Update ${roleName || 'this role'} for every assigned member immediately.`;
+        } else if (mode === 'clone') {
+          modalSubtitle.textContent = `Review the copied permissions from ${roleName || 'the selected role'} before saving a new role.`;
+        } else {
+          modalSubtitle.textContent = 'Create a least-privilege permission set for company members.';
+        }
+      }
+      if (submitButton) {
+        submitButton.textContent = mode === 'edit' ? 'Save role' : mode === 'clone' ? 'Create clone' : 'Create role';
+      }
+    }
+
+    function openRoleModal(trigger, mode, row) {
+      activeRoleTrigger = trigger || null;
+      const roleName = row ? row.dataset.roleName || '' : '';
+      idField.value = mode === 'edit' && row ? row.dataset.roleId || '' : '';
+      nameField.value = mode === 'clone' && roleName ? `Copy of ${roleName}` : row ? row.dataset.roleName || '' : '';
+      descriptionField.value = row ? row.dataset.roleDescription || '' : '';
+      try {
+        const permissions = row ? JSON.parse(row.dataset.rolePermissions || '{}') : {};
+        setSelectedPermissions(permissions);
+      } catch (error) {
+        setSelectedPermissions({});
+      }
+      updateModalText(mode, roleName);
+      if (modal) {
+        modal.hidden = false;
+        modal.setAttribute('aria-hidden', 'false');
+      }
+      nameField.focus();
+      nameField.select();
+    }
+
+    function closeRoleModal() {
+      if (modal) {
+        modal.hidden = true;
+        modal.setAttribute('aria-hidden', 'true');
+      }
+      if (activeRoleTrigger) {
+        activeRoleTrigger.focus();
+        activeRoleTrigger = null;
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const roleId = idField.value;
+      const payload = {
+        name: nameField.value.trim(),
+        description: descriptionField.value.trim() || null,
+        permissions: getSelectedPermissions(),
+      };
+      const method = roleId ? 'PATCH' : 'POST';
+      const url = roleId ? `/roles/${roleId}` : '/roles';
+      try {
+        await requestJson(url, { method, body: JSON.stringify(payload) });
+        window.location.reload();
+      } catch (error) {
+        alert(`Unable to save role: ${error.message}`);
+      }
+    });
+
+    const resetButton = form.querySelector('[data-role-reset]');
+    if (resetButton) {
+      resetButton.addEventListener('click', () => {
+        idField.value = '';
+        nameField.value = '';
+        descriptionField.value = '';
+        setSelectedPermissions({});
+        updateModalText('create');
+        nameField.focus();
+      });
+    }
+
+    document.querySelectorAll('[data-role-create]').forEach((button) => {
+      button.addEventListener('click', () => {
+        openRoleModal(button, 'create', null);
+      });
+    });
+
+    document.querySelectorAll('[data-role-edit]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const row = button.closest('tr');
+        if (!row) {
+          return;
+        }
+        openRoleModal(button, 'edit', row);
+      });
+    });
+
+    document.querySelectorAll('[data-role-clone]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const row = button.closest('tr');
+        if (!row) {
+          return;
+        }
+        openRoleModal(button, 'clone', row);
+      });
+    });
+
+    if (modal) {
+      modal.addEventListener('click', (event) => {
+        if (event.target === modal || event.target.closest('[data-modal-close]')) {
+          event.preventDefault();
+          closeRoleModal();
+        }
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !modal.hidden) {
+          closeRoleModal();
+        }
+      });
+    }
+
+    document.querySelectorAll('[data-role-delete]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const row = button.closest('tr');
+        if (!row) {
+          return;
+        }
+        const roleId = row.dataset.roleId;
+        if (!roleId) {
+          return;
+        }
+        if (!confirm('Delete this role? This action cannot be undone.')) {
+          return;
+        }
+        try {
+          await requestJson(`/roles/${roleId}`, { method: 'DELETE' });
+          window.location.reload();
+        } catch (error) {
+          alert(`Unable to delete role: ${error.message}`);
+        }
+      });
+    });
+  }
+
+  function bindCompanyAssignForm() {
+    const form = document.querySelector('[data-company-assign-form]');
+    if (!form) {
+      return;
+    }
+
+    const companySelect = form.querySelector('[data-company-select]');
+    const userSelect = form.querySelector('[data-user-select]');
+    if (!companySelect || !userSelect) {
+      return;
+    }
+
+    const optionsMap = parseJsonScript('company-assign-user-options', {});
+    if (!optionsMap || typeof optionsMap !== 'object') {
+      return;
+    }
+
+    const placeholderOption = userSelect.querySelector('[data-placeholder]') || null;
+    const initialCompanyId = form.getAttribute('data-initial-company-id') || companySelect.value || '';
+    const initialUserId = form.getAttribute('data-initial-user-id');
+
+    function getOptionsForCompany(companyId) {
+      const key = String(companyId || '').trim();
+      if (!key) {
+        return [];
+      }
+      const value = optionsMap[key];
+      return Array.isArray(value) ? value : [];
+    }
+
+    function populateUsers(companyId, targetSelection) {
+      const options = getOptionsForCompany(companyId);
+      const desiredSelection =
+        targetSelection !== undefined && targetSelection !== null
+          ? String(targetSelection)
+          : userSelect.value;
+
+      Array.from(userSelect.options).forEach((option) => {
+        if (option.hasAttribute('data-placeholder')) {
+          return;
+        }
+        option.remove();
+      });
+
+      let hasSelection = false;
+      options.forEach((entry) => {
+        if (!entry || typeof entry !== 'object') {
+          return;
+        }
+        const value = entry.value ?? entry.id;
+        const label = entry.label ?? entry.email;
+        if (value === undefined || label === undefined) {
+          return;
+        }
+        const option = document.createElement('option');
+        option.value = String(value);
+        option.textContent = String(label);
+        if (entry.user_id !== undefined && entry.user_id !== null) {
+          option.dataset.userId = String(entry.user_id);
+        }
+        if (entry.staff_id !== undefined && entry.staff_id !== null) {
+          option.dataset.staffId = String(entry.staff_id);
+        }
+        if (entry.has_user !== undefined) {
+          option.dataset.hasUser = entry.has_user ? '1' : '0';
+          if (!entry.has_user) {
+            option.dataset.requiresInvite = '1';
+          }
+        }
+        if (desiredSelection && String(value) === String(desiredSelection)) {
+          option.selected = true;
+          hasSelection = true;
+        }
+        userSelect.appendChild(option);
+      });
+
+      if (!hasSelection) {
+        if (placeholderOption) {
+          placeholderOption.selected = true;
+        } else {
+          userSelect.value = '';
+        }
+      }
+    }
+
+    populateUsers(initialCompanyId, initialUserId ?? undefined);
+
+    companySelect.addEventListener('change', () => {
+      const selectedCompanyId = companySelect.value;
+      populateUsers(selectedCompanyId, undefined);
+    });
+
+    userSelect.addEventListener('change', () => {
+      const selectedOption = userSelect.selectedOptions[0];
+      if (!selectedOption) {
+        return;
+      }
+      if (selectedOption.dataset.requiresInvite === '1') {
+        const staffName = selectedOption.textContent || 'This staff member';
+        alert(
+          `${staffName} does not have a portal account yet. Invite them from the staff page before assigning access.`,
+        );
+      }
+    });
+  }
+
+  function bindCompanyAssignmentControls() {
+    document.querySelectorAll('[data-staff-permission]').forEach((select) => {
+      select.addEventListener('change', async () => {
+        const { companyId, userId } = select.dataset;
+        if (!companyId || !userId) {
+          return;
+        }
+        const formData = new FormData();
+        formData.append('permission', select.value);
+        select.disabled = true;
+        try {
+          await requestForm(`/admin/companies/assignment/${companyId}/${userId}/staff-permission`, formData);
+        } catch (error) {
+          alert(`Unable to update staff permission: ${error.message}`);
+        } finally {
+          select.disabled = false;
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-membership-role]').forEach((select) => {
+      select.addEventListener('change', async () => {
+        const { companyId, userId } = select.dataset;
+        if (!companyId || !userId) {
+          return;
+        }
+        const previousValue = select.dataset.currentRole || '';
+        const roleId = select.value;
+        if (!roleId) {
+          select.value = previousValue;
+          return;
+        }
+        const formData = new FormData();
+        formData.append('roleId', roleId);
+        select.disabled = true;
+        try {
+          await requestForm(`/admin/companies/assignment/${companyId}/${userId}/role`, formData);
+          select.dataset.currentRole = roleId;
+        } catch (error) {
+          select.value = previousValue;
+          alert(`Unable to update role: ${error.message}`);
+        } finally {
+          select.disabled = false;
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-remove-pending-assignment]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const { companyId, staffId } = button.dataset;
+        if (!companyId || !staffId) {
+          return;
+        }
+        if (!confirm('Cancel this pending staff access?')) {
+          return;
+        }
+        const row = button.closest('tr');
+        const formData = new FormData();
+        button.disabled = true;
+        try {
+          await requestForm(
+            `/admin/companies/assignment/${companyId}/${staffId}/pending/remove`,
+            formData,
+          );
+          if (row) {
+            row.remove();
+          }
+        } catch (error) {
+          alert(`Unable to cancel pending access: ${error.message}`);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-remove-assignment]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const { companyId, userId } = button.dataset;
+        if (!companyId || !userId) {
+          return;
+        }
+        if (!confirm('Remove this membership? The user will immediately lose access.')) {
+          return;
+        }
+        const row = button.closest('tr');
+        const formData = new FormData();
+        button.disabled = true;
+        try {
+          await requestForm(`/admin/companies/assignment/${companyId}/${userId}/remove`, formData);
+          if (row) {
+            row.remove();
+          }
+        } catch (error) {
+          alert(`Unable to remove membership: ${error.message}`);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+
+  }
+
+  function bindApiKeyEditModal() {
+    const modalId = 'edit-api-key-modal';
+    const modal = document.getElementById(modalId);
+    if (!modal) {
+      return;
+    }
+
+    const descriptionElement = modal.querySelector('[data-api-key-description]');
+    const descriptionTextElement = modal.querySelector('[data-api-key-description-text]');
+    const previewElement = modal.querySelector('[data-api-key-preview]');
+    const createdElement = modal.querySelector('[data-api-key-created]');
+    const expiryElement = modal.querySelector('[data-api-key-expiry]');
+    const lastSeenElement = modal.querySelector('[data-api-key-last-seen]');
+    const usageCountElement = modal.querySelector('[data-api-key-usage-count]');
+    const usageListElement = modal.querySelector('[data-api-key-usage-list]');
+    const usageEmptyElement = modal.querySelector('[data-api-key-usage-empty]');
+    const accessElement = modal.querySelector('[data-api-key-access]');
+    const permissionsListElement = modal.querySelector('[data-api-key-permissions-list]');
+    const permissionsEmptyElement = modal.querySelector('[data-api-key-permissions-empty]');
+    const ipListElement = modal.querySelector('[data-api-key-ips-list]');
+    const ipEmptyElement = modal.querySelector('[data-api-key-ips-empty]');
+    const statusElement = modal.querySelector('[data-api-key-status]');
+    const rotateForm = modal.querySelector('[data-api-key-rotate-form]');
+    const revokeForm = modal.querySelector('[data-api-key-revoke-form]');
+    const rotateIdInput = modal.querySelector('[data-api-key-rotate-id]');
+    const revokeIdInput = modal.querySelector('[data-api-key-revoke-id]');
+    const descriptionInput = rotateForm ? rotateForm.querySelector('#modal-rotate-description') : null;
+    const expiryInput = rotateForm ? rotateForm.querySelector('#modal-rotate-expiry') : null;
+    const retireInput = rotateForm ? rotateForm.querySelector('#modal-rotate-retire') : null;
+    const permissionsInput = rotateForm
+      ? rotateForm.querySelector('[data-api-key-rotate-permissions]')
+      : null;
+    const ipsInput = rotateForm ? rotateForm.querySelector('[data-api-key-rotate-ips]') : null;
+    const enabledInput = rotateForm ? rotateForm.querySelector('[data-api-key-enabled]') : null;
+
+    function formatDateTime(iso, fallbackText = '—') {
+      if (!iso) {
+        return fallbackText;
+      }
+      const date = new Date(iso);
+      if (Number.isNaN(date.getTime())) {
+        return fallbackText;
+      }
+      return date.toLocaleString();
+    }
+
+    function normaliseDescription(payload) {
+      const description = (payload.description || '').trim();
+      if (description) {
+        return `“${description}”`;
+      }
+      const preview = (payload.key_preview || '').trim();
+      if (preview) {
+        return `key ${preview}`;
+      }
+      return 'this credential';
+    }
+
+    function renderUsageList(usage) {
+      if (!usageListElement || !usageEmptyElement) {
+        return;
+      }
+      usageListElement.innerHTML = '';
+      if (Array.isArray(usage) && usage.length > 0) {
+        usageListElement.hidden = false;
+        usageEmptyElement.hidden = true;
+        usage.forEach((entry) => {
+          const item = document.createElement('li');
+          const ip = document.createElement('span');
+          ip.className = 'usage-list__ip';
+          ip.textContent = entry.ip_address || 'Unknown';
+          const count = document.createElement('span');
+          count.className = 'usage-list__count';
+          count.textContent = String(entry.usage_count ?? 0);
+          const time = document.createElement('span');
+          time.className = 'usage-list__time';
+          if (entry.last_used_iso) {
+            time.textContent = formatDateTime(entry.last_used_iso, 'Never');
+          } else {
+            time.textContent = 'Never';
+          }
+          item.appendChild(ip);
+          item.appendChild(count);
+          item.appendChild(time);
+          usageListElement.appendChild(item);
+        });
+        return;
+      }
+      usageListElement.hidden = true;
+      usageEmptyElement.hidden = false;
+    }
+
+    function renderPermissionsList(permissions) {
+      if (!permissionsListElement || !permissionsEmptyElement) {
+        return;
+      }
+      permissionsListElement.innerHTML = '';
+      if (Array.isArray(permissions) && permissions.length > 0) {
+        permissionsListElement.hidden = false;
+        permissionsEmptyElement.hidden = true;
+        permissions.forEach((entry) => {
+          const item = document.createElement('li');
+          const label = document.createElement('span');
+          label.className = 'usage-list__ip';
+          const path = (entry.path || '').trim() || '/';
+          const methods = Array.isArray(entry.methods) && entry.methods.length > 0
+            ? entry.methods.join(', ')
+            : '—';
+          label.textContent = path;
+          const methodsElement = document.createElement('span');
+          methodsElement.className = 'usage-list__count';
+          methodsElement.textContent = methods;
+          item.appendChild(label);
+          item.appendChild(methodsElement);
+          permissionsListElement.appendChild(item);
+        });
+        return;
+      }
+      permissionsListElement.hidden = true;
+      permissionsEmptyElement.hidden = false;
+    }
+
+    function renderIpRestrictionsList(restrictions) {
+      if (!ipListElement || !ipEmptyElement) {
+        return;
+      }
+      ipListElement.innerHTML = '';
+      if (Array.isArray(restrictions) && restrictions.length > 0) {
+        ipListElement.hidden = false;
+        ipEmptyElement.hidden = true;
+        restrictions.forEach((entry) => {
+          const item = document.createElement('li');
+          const label = document.createElement('span');
+          label.className = 'usage-list__ip';
+          const display = (entry && (entry.label || entry.cidr)) || '';
+          label.textContent = display || '—';
+          item.appendChild(label);
+          if (entry && entry.cidr && entry.cidr !== display) {
+            const cidrElement = document.createElement('span');
+            cidrElement.className = 'usage-list__count';
+            cidrElement.textContent = entry.cidr;
+            item.appendChild(cidrElement);
+          }
+          ipListElement.appendChild(item);
+        });
+        return;
+      }
+      ipListElement.hidden = true;
+      ipEmptyElement.hidden = false;
+    }
+
+    function populateModal(trigger) {
+      if (!(trigger instanceof HTMLElement)) {
+        return;
+      }
+      const payloadRaw = trigger.getAttribute('data-api-key');
+      if (!payloadRaw) {
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(payloadRaw);
+      } catch (error) {
+        console.error('Unable to parse API key payload', error);
+        return;
+      }
+
+      if (descriptionElement) {
+        const description = (payload.description || '').trim();
+        descriptionElement.textContent = description || '—';
+      }
+      if (descriptionTextElement) {
+        descriptionTextElement.textContent = normaliseDescription(payload);
+      }
+      if (previewElement) {
+        previewElement.textContent = payload.key_preview || '—';
+      }
+      if (createdElement) {
+        createdElement.textContent = formatDateTime(payload.created_iso);
+      }
+      if (expiryElement) {
+        expiryElement.textContent = '';
+        if (!payload.expiry_iso) {
+          expiryElement.textContent = 'No expiry';
+        } else {
+          expiryElement.textContent = formatDateTime(payload.expiry_iso);
+          if (payload.is_expired) {
+            const badge = document.createElement('span');
+            badge.className = 'badge badge--danger';
+            badge.textContent = 'Expired';
+            expiryElement.appendChild(document.createTextNode(' '));
+            expiryElement.appendChild(badge);
+          }
+        }
+      }
+      if (lastSeenElement) {
+        if (payload.last_seen_iso) {
+          lastSeenElement.textContent = formatDateTime(payload.last_seen_iso);
+        } else {
+          lastSeenElement.textContent = 'Never';
+        }
+      }
+      if (usageCountElement) {
+        const value = typeof payload.usage_count === 'number' ? payload.usage_count : Number(payload.usage_count) || 0;
+        usageCountElement.textContent = String(value);
+      }
+
+      if (statusElement) {
+        const enabled = payload.is_enabled !== false;
+        statusElement.textContent = enabled ? 'Enabled' : 'Disabled';
+      }
+
+      renderUsageList(payload.usage);
+      renderPermissionsList(payload.permissions);
+      renderIpRestrictionsList(payload.ip_restrictions);
+
+      if (accessElement) {
+        const endpointText = (payload.endpoint_summary || payload.access_summary || '').trim();
+        const ipText = (payload.ip_summary || '').trim();
+        if (endpointText || ipText) {
+          const parts = [];
+          if (endpointText) {
+            parts.push(endpointText);
+          }
+          if (ipText) {
+            parts.push(`IPs: ${ipText}`);
+          }
+          accessElement.textContent = parts.join(' • ');
+        } else {
+          accessElement.textContent = 'All endpoints • IPs: Any IP address';
+        }
+      }
+
+      if (rotateIdInput) {
+        rotateIdInput.value = payload.id || '';
+      }
+      if (revokeIdInput) {
+        revokeIdInput.value = payload.id || '';
+      }
+      if (descriptionInput) {
+        descriptionInput.value = (payload.description || '').trim();
+      }
+      if (expiryInput) {
+        expiryInput.value = payload.expiry_date || '';
+      }
+      if (retireInput) {
+        retireInput.checked = true;
+      }
+      if (permissionsInput) {
+        permissionsInput.value = payload.permissions_text || '';
+      }
+      if (ipsInput) {
+        ipsInput.value = payload.ip_restrictions_text || '';
+      }
+      if (enabledInput) {
+        enabledInput.checked = payload.is_enabled !== false;
+      }
+      if (rotateForm) {
+        rotateForm.dataset.apiKeyId = payload.id || '';
+      }
+      if (revokeForm) {
+        revokeForm.dataset.apiKeyId = payload.id || '';
+      }
+    }
+
+    bindModal({
+      modalId,
+      triggerSelector: '[data-edit-api-key-modal-open]',
+      onOpen: populateModal,
+    });
+  }
+
+  function bindApiKeyCopyButtons() {
+    document.querySelectorAll('[data-copy-api-key]').forEach((button) => {
+      const value = button.getAttribute('data-copy-api-key');
+      if (!value) {
+        return;
+      }
+      button.addEventListener('click', async () => {
+        const originalText = button.textContent;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(value);
+          } else {
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = value;
+            input.setAttribute('aria-hidden', 'true');
+            input.style.position = 'absolute';
+            input.style.left = '-1000px';
+            document.body.appendChild(input);
+            input.select();
+            document.execCommand('copy');
+            document.body.removeChild(input);
+          }
+          button.textContent = 'Copied';
+          setTimeout(() => {
+            button.textContent = originalText;
+          }, 2000);
+        } catch (error) {
+          alert('Unable to copy API key. Please copy it manually.');
+        }
+      });
+    });
+  }
+
+  function bindConfirmationButtons() {
+    document.querySelectorAll('[data-confirm]').forEach((element) => {
+      element.addEventListener('click', (event) => {
+        const message = element.getAttribute('data-confirm') || 'Are you sure?';
+        if (!window.confirm(message)) {
+          event.preventDefault();
+        }
+      });
+    });
+  }
+
+  function bindModal({ modalId, triggerSelector, triggerElements, onOpen }) {
+    const modal = document.getElementById(modalId);
+    const triggerButtons = Array.isArray(triggerElements)
+      ? triggerElements.filter((element) => element instanceof HTMLElement)
+      : (triggerSelector ? Array.from(document.querySelectorAll(triggerSelector)) : []);
+
+    if (!modal || triggerButtons.length === 0) {
+      return;
+    }
+
+    const focusableSelector =
+      'a[href], button:not([disabled]), textarea, input:not([type="hidden"]):not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    let activeTrigger = null;
+
+    function getFocusableElements() {
+      return Array.from(modal.querySelectorAll(focusableSelector)).filter((element) => {
+        if (element.hasAttribute('disabled')) {
+          return false;
+        }
+        if (element.getAttribute('aria-hidden') === 'true') {
+          return false;
+        }
+        return element.offsetParent !== null;
+      });
+    }
+
+    function focusFirstElement() {
+      const [firstFocusable] = getFocusableElements();
+      if (firstFocusable && typeof firstFocusable.focus === 'function') {
+        firstFocusable.focus();
+      }
+    }
+
+    function handleKeydown(event) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeModal();
+        return;
+      }
+      if (event.key !== 'Tab') {
+        return;
+      }
+
+      const focusable = getFocusableElements();
+      if (!focusable.length) {
+        event.preventDefault();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const currentActive = document.activeElement;
+
+      if (event.shiftKey) {
+        if (currentActive === first) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (currentActive === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    function openModal(trigger) {
+      activeTrigger = trigger instanceof HTMLElement ? trigger : null;
+      if (typeof onOpen === 'function') {
+        try {
+          onOpen(activeTrigger, modal);
+        } catch (error) {
+          console.error('Error preparing modal', error);
+        }
+      }
+      modal.hidden = false;
+      modal.classList.add('is-visible');
+      modal.setAttribute('aria-hidden', 'false');
+      const modalContent = modal.querySelector('.modal__content, .modal__panel, .modal__dialog, .modal-content');
+      if (modalContent) {
+        modalContent.scrollTop = 0;
+      }
+      if (activeTrigger) {
+        activeTrigger.setAttribute('aria-expanded', 'true');
+      }
+      document.addEventListener('keydown', handleKeydown);
+      focusFirstElement();
+    }
+
+    function closeModal() {
+      modal.classList.remove('is-visible');
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+      document.removeEventListener('keydown', handleKeydown);
+
+      if (activeTrigger) {
+        activeTrigger.setAttribute('aria-expanded', 'false');
+        if (typeof activeTrigger.focus === 'function') {
+          activeTrigger.focus();
+        }
+      }
+      activeTrigger = null;
+    }
+
+    triggerButtons.forEach((button) => {
+      button.setAttribute('aria-expanded', 'false');
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        openModal(button);
+      });
+    });
+
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) {
+        closeModal();
+      }
+    });
+
+    modal.querySelectorAll('[data-modal-close]').forEach((closeButton) => {
+      closeButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        closeModal();
+      });
+    });
+  }
+
+  function bindTicketStatusManager() {
+    const modal = document.getElementById('edit-ticket-statuses-modal');
+    if (!modal) {
+      return;
+    }
+
+    const form = modal.querySelector('[data-ticket-statuses-form]');
+    const list = form ? form.querySelector('[data-statuses-list]') : null;
+    const template = modal.querySelector('#ticket-status-row-template');
+    const errorContainer = modal.querySelector('[data-status-error]');
+
+    if (!form || !list || !template) {
+      return;
+    }
+
+    function clearError() {
+      if (errorContainer) {
+        errorContainer.hidden = true;
+        errorContainer.textContent = '';
+      }
+    }
+
+    function showError(message) {
+      if (errorContainer) {
+        errorContainer.textContent = message;
+        errorContainer.hidden = false;
+      }
+    }
+
+    function updateRowIdentifiers() {
+      const rows = Array.from(list.querySelectorAll('[data-status-row]'));
+      rows.forEach((row, index) => {
+        const labels = Array.from(row.querySelectorAll('label'));
+        const techInput = row.querySelector('input[name="techLabel"]');
+        const publicInput = row.querySelector('input[name="publicLabel"]');
+        if (techInput) {
+          const techId = `status-tech-${index}`;
+          techInput.id = techId;
+          if (labels[0]) {
+            labels[0].setAttribute('for', techId);
+          }
+        }
+        if (publicInput) {
+          const publicId = `status-public-${index}`;
+          publicInput.id = publicId;
+          if (labels[1]) {
+            labels[1].setAttribute('for', publicId);
+          }
+        }
+      });
+    }
+
+    function updateRemoveButtons() {
+      const rows = Array.from(list.querySelectorAll('[data-status-row]'));
+      const disableRemoval = rows.length <= 1;
+      rows.forEach((row) => {
+        const removeButton = row.querySelector('[data-status-remove]');
+        if (removeButton) {
+          removeButton.disabled = disableRemoval;
+        }
+      });
+    }
+
+    function syncHiddenStatusInputs() {
+      const rows = Array.from(list.querySelectorAll('[data-status-row]'));
+      rows.forEach((row) => {
+        const hiddenInput = row.querySelector('[data-status-hidden-input]');
+        const checkbox = row.querySelector('[data-status-hidden-checkbox]');
+        if (hiddenInput && checkbox) {
+          hiddenInput.value = checkbox.checked ? '1' : '0';
+        }
+        const adminHiddenInput = row.querySelector('[data-status-admin-hidden-input]');
+        const adminCheckbox = row.querySelector('[data-status-admin-hidden-checkbox]');
+        if (adminHiddenInput && adminCheckbox) {
+          adminHiddenInput.value = adminCheckbox.checked ? '1' : '0';
+        }
+      });
+    }
+
+    function ensureDefaultRadioChecked() {
+      const defaultRadios = form.querySelectorAll('input[name="defaultStatus"]');
+      const hasChecked = Array.from(defaultRadios).some(radio => radio.checked);
+      if (!hasChecked && defaultRadios.length > 0) {
+        defaultRadios[0].checked = true;
+      }
+    }
+
+    function createRow() {
+      if (template instanceof HTMLTemplateElement) {
+        const fragmentClone = template.content.cloneNode(true);
+        const element = fragmentClone.firstElementChild;
+        if (element) {
+          return element;
+        }
+      }
+      const fallback = template.firstElementChild;
+      if (fallback) {
+        return fallback.cloneNode(true);
+      }
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = template.innerHTML.trim();
+      const derived = wrapper.firstElementChild;
+      if (derived) {
+        return derived.cloneNode(true);
+      }
+      console.error('Ticket status row template is empty.');
+      return document.createElement('tr');
+    }
+
+    function addStatusRow() {
+      const row = createRow();
+      const techInput = row.querySelector('input[name="techLabel"]');
+      const publicInput = row.querySelector('input[name="publicLabel"]');
+      const slugInput = row.querySelector('input[name="existingSlug"]');
+      if (techInput) {
+        techInput.value = '';
+      }
+      if (publicInput) {
+        publicInput.value = '';
+      }
+      if (slugInput) {
+        slugInput.value = '';
+      }
+      const hiddenInput = row.querySelector('[data-status-hidden-input]');
+      const checkbox = row.querySelector('[data-status-hidden-checkbox]');
+      if (hiddenInput) {
+        hiddenInput.value = '0';
+      }
+      if (checkbox) {
+        checkbox.checked = false;
+      }
+      const adminHiddenInput = row.querySelector('[data-status-admin-hidden-input]');
+      const adminCheckbox = row.querySelector('[data-status-admin-hidden-checkbox]');
+      if (adminHiddenInput) {
+        adminHiddenInput.value = '0';
+      }
+      if (adminCheckbox) {
+        adminCheckbox.checked = false;
+      }
+      list.appendChild(row);
+      updateRowIdentifiers();
+      updateRemoveButtons();
+      clearError();
+      if (techInput) {
+        techInput.focus();
+      }
+    }
+
+    function removeStatusRow(button) {
+      const row = button.closest('[data-status-row]');
+      if (!row) {
+        return;
+      }
+      const rows = list.querySelectorAll('[data-status-row]');
+      if (rows.length <= 1) {
+        return;
+      }
+
+      // Check if the row being removed has the default selected
+      const defaultRadio = row.querySelector('input[name="defaultStatus"]');
+      const wasDefault = defaultRadio && defaultRadio.checked;
+
+      row.remove();
+
+      // If the removed row was default, select the first remaining row as default
+      if (wasDefault) {
+        const remainingRows = list.querySelectorAll('[data-status-row]');
+        if (remainingRows.length > 0) {
+          const firstDefaultRadio = remainingRows[0].querySelector('input[name="defaultStatus"]');
+          if (firstDefaultRadio) {
+            firstDefaultRadio.checked = true;
+          }
+        }
+      }
+
+      updateRowIdentifiers();
+      updateRemoveButtons();
+      clearError();
+    }
+
+    form.addEventListener('click', (event) => {
+      const addTrigger = event.target.closest('[data-add-status]');
+      if (addTrigger) {
+        event.preventDefault();
+        addStatusRow();
+        return;
+      }
+      const removeTrigger = event.target.closest('[data-status-remove]');
+      if (removeTrigger) {
+        event.preventDefault();
+        removeStatusRow(removeTrigger);
+      }
+    });
+
+    form.addEventListener('input', () => {
+      clearError();
+      syncHiddenStatusInputs();
+    });
+
+    form.addEventListener('change', () => {
+      clearError();
+      syncHiddenStatusInputs();
+    });
+
+    form.addEventListener('submit', (event) => {
+      clearError();
+      syncHiddenStatusInputs();
+      const rows = Array.from(list.querySelectorAll('[data-status-row]'));
+      const seen = new Set();
+      const selectedDefaultRadio = form.querySelector('input[name="defaultStatus"]:checked');
+      let selectedDefaultSlug = '';
+      for (const row of rows) {
+        const techInput = row.querySelector('input[name="techLabel"]');
+        const publicInput = row.querySelector('input[name="publicLabel"]');
+        if (techInput) {
+          techInput.value = techInput.value.trim();
+        }
+        if (publicInput) {
+          publicInput.value = publicInput.value.trim();
+        }
+        if (!techInput || !techInput.value) {
+          continue;
+        }
+        const slug = techInput.value
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '_')
+          .replace(/^_+|_+$/g, '');
+        if (!slug) {
+          showError('Tech status labels must include letters or numbers.');
+          techInput.focus();
+          event.preventDefault();
+          return;
+        }
+        if (seen.has(slug)) {
+          showError('Tech status values must be unique.');
+          techInput.focus();
+          event.preventDefault();
+          return;
+        }
+        seen.add(slug);
+        if (selectedDefaultRadio && row.contains(selectedDefaultRadio)) {
+          selectedDefaultSlug = slug;
+        }
+      }
+      if (selectedDefaultRadio && selectedDefaultSlug) {
+        selectedDefaultRadio.value = selectedDefaultSlug;
+      }
+    });
+
+    updateRowIdentifiers();
+    updateRemoveButtons();
+    ensureDefaultRadioChecked();
+    syncHiddenStatusInputs();
+
+    // Return the initialization function for use in onOpen callback
+    return {
+      ensureDefaultRadioChecked: ensureDefaultRadioChecked
+    };
+  }
+
+  function bindLabourTypeManager() {
+    const modal = document.getElementById('edit-labour-types-modal');
+    if (!modal) {
+      return;
+    }
+
+    const form = modal.querySelector('[data-labour-types-form]');
+    const list = form ? form.querySelector('[data-labour-list]') : null;
+    const template = modal.querySelector('#labour-type-row-template');
+    const errorContainer = modal.querySelector('[data-labour-error]');
+
+    if (!form || !list || !template) {
+      return;
+    }
+
+    function clearError() {
+      if (errorContainer) {
+        errorContainer.hidden = true;
+        errorContainer.textContent = '';
+      }
+    }
+
+    function showError(message) {
+      if (errorContainer) {
+        errorContainer.textContent = message;
+        errorContainer.hidden = false;
+      }
+    }
+
+    function updateRowIdentifiers() {
+      const rows = Array.from(list.querySelectorAll('[data-labour-row]'));
+      rows.forEach((row, index) => {
+        const defaultInput = row.querySelector('input[name="defaultLabourType"]');
+        const codeInput = row.querySelector('input[name="labourCode"]');
+        const nameInput = row.querySelector('input[name="labourName"]');
+        const idInput = row.querySelector('input[name="labourId"]');
+        const labels = Array.from(row.querySelectorAll('label'));
+        if (defaultInput) {
+          const defaultId = `labour-default-${index}`;
+          defaultInput.id = defaultId;
+          // New labour types do not have a database ID yet. Give their radio
+          // buttons a row-specific value so the server can identify which new
+          // record was selected as the default.
+          defaultInput.value = idInput && idInput.value ? idInput.value : `new-${index}`;
+          if (labels[0]) {
+            labels[0].setAttribute('for', defaultId);
+          }
+        }
+        if (codeInput) {
+          const codeId = `labour-code-${index}`;
+          codeInput.id = codeId;
+          if (labels[1]) {
+            labels[1].setAttribute('for', codeId);
+          }
+        }
+        if (nameInput) {
+          const nameId = `labour-name-${index}`;
+          nameInput.id = nameId;
+          if (labels[2]) {
+            labels[2].setAttribute('for', nameId);
+          }
+        }
+      });
+    }
+
+    function updateRemoveButtons() {
+      const rows = Array.from(list.querySelectorAll('[data-labour-row]'));
+      const disableRemoval = rows.length <= 1;
+      rows.forEach((row) => {
+        const removeButton = row.querySelector('[data-labour-remove]');
+        if (removeButton) {
+          removeButton.disabled = disableRemoval;
+        }
+      });
+    }
+
+    function createRow() {
+      if (template instanceof HTMLTemplateElement) {
+        const fragmentClone = template.content.cloneNode(true);
+        const element = fragmentClone.firstElementChild;
+        if (element) {
+          return element;
+        }
+      }
+      const fallback = template.firstElementChild;
+      if (fallback) {
+        return fallback.cloneNode(true);
+      }
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = template.innerHTML.trim();
+      const derived = wrapper.firstElementChild;
+      if (derived) {
+        return derived.cloneNode(true);
+      }
+      console.error('Labour type row template is empty.');
+      return document.createElement('tr');
+    }
+
+    function addRow() {
+      const row = createRow();
+      const codeInput = row.querySelector('input[name="labourCode"]');
+      const nameInput = row.querySelector('input[name="labourName"]');
+      const idInput = row.querySelector('input[name="labourId"]');
+      if (codeInput) {
+        codeInput.value = '';
+      }
+      if (nameInput) {
+        nameInput.value = '';
+      }
+      if (idInput) {
+        idInput.value = '';
+      }
+      list.appendChild(row);
+      updateRowIdentifiers();
+      updateRemoveButtons();
+      clearError();
+      if (codeInput) {
+        codeInput.focus();
+      }
+    }
+
+    function removeRow(button) {
+      const row = button.closest('[data-labour-row]');
+      if (!row) {
+        return;
+      }
+      const rows = list.querySelectorAll('[data-labour-row]');
+      if (rows.length <= 1) {
+        return;
+      }
+
+      // Check if the row being removed has the default selected
+      const defaultRadio = row.querySelector('input[name="defaultLabourType"]');
+      const wasDefault = defaultRadio && defaultRadio.checked;
+
+      row.remove();
+
+      // If the removed row was default, select the first remaining row as default
+      if (wasDefault) {
+        const remainingRows = list.querySelectorAll('[data-labour-row]');
+        if (remainingRows.length > 0) {
+          const firstDefaultRadio = remainingRows[0].querySelector('input[name="defaultLabourType"]');
+          if (firstDefaultRadio) {
+            firstDefaultRadio.checked = true;
+          }
+        }
+      }
+
+      updateRowIdentifiers();
+      updateRemoveButtons();
+      clearError();
+    }
+
+    form.addEventListener('click', (event) => {
+      const addTrigger = event.target.closest('[data-add-labour]');
+      if (addTrigger) {
+        event.preventDefault();
+        addRow();
+        return;
+      }
+      const removeTrigger = event.target.closest('[data-labour-remove]');
+      if (removeTrigger) {
+        event.preventDefault();
+        removeRow(removeTrigger);
+      }
+    });
+
+    form.addEventListener('input', () => {
+      clearError();
+      syncHiddenStatusInputs();
+    });
+
+    form.addEventListener('change', () => {
+      clearError();
+      syncHiddenStatusInputs();
+    });
+
+    form.addEventListener('submit', (event) => {
+      clearError();
+      syncHiddenStatusInputs();
+      const rows = Array.from(list.querySelectorAll('[data-labour-row]'));
+      const seenCodes = new Set();
+
+      // Check if at least one default is selected
+      const defaultRadios = form.querySelectorAll('input[name="defaultLabourType"]');
+      const hasDefaultSelected = Array.from(defaultRadios).some(radio => radio.checked);
+      if (!hasDefaultSelected) {
+        showError('Please select a default labour type.');
+        event.preventDefault();
+        return;
+      }
+
+      for (const row of rows) {
+        const codeInput = row.querySelector('input[name="labourCode"]');
+        const nameInput = row.querySelector('input[name="labourName"]');
+        if (codeInput) {
+          codeInput.value = codeInput.value.trim();
+        }
+        if (nameInput) {
+          nameInput.value = nameInput.value.trim();
+        }
+        if (!codeInput || !codeInput.value) {
+          showError('Enter a labour code for each row.');
+          if (codeInput) {
+            codeInput.focus();
+          }
+          event.preventDefault();
+          return;
+        }
+        if (!nameInput || !nameInput.value) {
+          showError('Enter a name for each labour type.');
+          if (nameInput) {
+            nameInput.focus();
+          }
+          event.preventDefault();
+          return;
+        }
+        const codeKey = codeInput.value.toLowerCase();
+        if (seenCodes.has(codeKey)) {
+          showError('Labour type codes must be unique.');
+          codeInput.focus();
+          event.preventDefault();
+          return;
+        }
+        seenCodes.add(codeKey);
+      }
+    });
+
+    updateRowIdentifiers();
+    updateRemoveButtons();
+  }
+
+  function bindRecurringInvoiceItems() {
+    const modal = document.getElementById('recurring-item-editor-modal');
+    const form = document.getElementById('recurring-item-form');
+    const companyIdElement = document.querySelector('[data-company-id]');
+
+    if (!modal || !form) {
+      return;
+    }
+
+    const companyId = companyIdElement ? companyIdElement.dataset.companyId : null;
+    if (!companyId || companyId.trim() === '') {
+      console.error('Company ID not found for recurring invoice items');
+      return;
+    }
+
+    const createButtons = document.querySelectorAll('[data-recurring-item-create]');
+    const editButtons = document.querySelectorAll('[data-recurring-item-edit]');
+    const deleteButtons = document.querySelectorAll('[data-recurring-item-delete]');
+    const deleteModalButton = document.querySelector('[data-recurring-item-delete-modal]');
+    const resetButton = document.querySelector('[data-recurring-item-reset]');
+    const frequencyInput = document.getElementById('recurring-item-frequency');
+    const intervalField = document.getElementById('recurring-item-interval-field');
+
+    function syncIntervalVisibility() {
+      if (!frequencyInput || !intervalField) {
+        return;
+      }
+      if (frequencyInput.value === 'times_per_year') {
+        intervalField.removeAttribute('hidden');
+      } else {
+        intervalField.setAttribute('hidden', '');
+      }
+    }
+
+    if (frequencyInput) {
+      frequencyInput.addEventListener('change', syncIntervalVisibility);
+    }
+
+    function openModal() {
+      modal.removeAttribute('hidden');
+      const initialFocus = form.querySelector('[data-initial-focus]');
+      if (initialFocus) {
+        initialFocus.focus();
+      }
+    }
+
+    function closeModal() {
+      modal.setAttribute('hidden', '');
+      resetForm();
+    }
+
+    function resetForm() {
+      form.reset();
+      document.getElementById('recurring-item-id').value = '';
+      document.getElementById('recurring-item-frequency').value = 'every_run';
+      document.getElementById('recurring-item-interval').value = '';
+      document.getElementById('recurring-item-start-date').value = '';
+      document.getElementById('recurring-item-end-date').value = '';
+      syncIntervalVisibility();
+      if (deleteModalButton) {
+        deleteModalButton.setAttribute('hidden', '');
+        deleteModalButton.setAttribute('aria-hidden', 'true');
+      }
+    }
+
+    function populateForm(item) {
+      document.getElementById('recurring-item-id').value = item.id || '';
+      document.getElementById('recurring-item-product-code').value = item.product_code || '';
+      document.getElementById('recurring-item-description').value = item.description_template || '';
+      document.getElementById('recurring-item-qty').value = item.qty_expression || '';
+      document.getElementById('recurring-item-price').value = item.price_override || '';
+      document.getElementById('recurring-item-active').checked = !!item.active;
+      document.getElementById('recurring-item-frequency').value = item.billing_frequency || 'every_run';
+      document.getElementById('recurring-item-interval').value = item.billing_interval || '';
+      document.getElementById('recurring-item-start-date').value = (item.start_date || '').slice(0, 10);
+      document.getElementById('recurring-item-end-date').value = (item.end_date || '').slice(0, 10);
+      syncIntervalVisibility();
+
+      if (item.id && deleteModalButton) {
+        deleteModalButton.removeAttribute('hidden');
+        deleteModalButton.setAttribute('aria-hidden', 'false');
+      }
+    }
+
+    createButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        resetForm();
+        openModal();
+      });
+    });
+
+    editButtons.forEach((button) => {
+      button.addEventListener('click', (event) => {
+        const row = event.target.closest('tr');
+        if (!row) {
+          return;
+        }
+        const itemJson = row.dataset.recurringItem;
+        if (!itemJson) {
+          return;
+        }
+        try {
+          const item = JSON.parse(itemJson);
+          populateForm(item);
+          openModal();
+        } catch (error) {
+          console.error('Failed to parse item data:', error);
+        }
+      });
+    });
+
+    const closeButtons = modal.querySelectorAll('[data-modal-close]');
+    closeButtons.forEach((button) => {
+      button.addEventListener('click', closeModal);
+    });
+
+    if (resetButton) {
+      resetButton.addEventListener('click', resetForm);
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      const itemId = document.getElementById('recurring-item-id').value;
+      const priceValue = document.getElementById('recurring-item-price').value.trim();
+      let priceOverride = null;
+
+      if (priceValue) {
+        const parsed = parseFloat(priceValue);
+        if (!isNaN(parsed) && parsed >= 0) {
+          priceOverride = parsed;
+        }
+      }
+
+      const billingFrequency = document.getElementById('recurring-item-frequency').value;
+      const billingIntervalValue = document.getElementById('recurring-item-interval').value.trim();
+      const formData = {
+        product_code: document.getElementById('recurring-item-product-code').value.trim(),
+        description_template: document.getElementById('recurring-item-description').value.trim(),
+        qty_expression: document.getElementById('recurring-item-qty').value.trim(),
+        price_override: priceOverride,
+        active: document.getElementById('recurring-item-active').checked,
+        billing_frequency: billingFrequency,
+        billing_interval: billingFrequency === 'times_per_year' && billingIntervalValue ? parseInt(billingIntervalValue, 10) : null,
+        start_date: document.getElementById('recurring-item-start-date').value || null,
+        end_date: document.getElementById('recurring-item-end-date').value || null,
+      };
+
+      try {
+        if (itemId) {
+          await requestJson(`/api/companies/${companyId}/recurring-invoice-items/${itemId}`, {
+            method: 'PATCH',
+            body: JSON.stringify(formData),
+          });
+        } else {
+          await requestJson(`/api/companies/${companyId}/recurring-invoice-items`, {
+            method: 'POST',
+            body: JSON.stringify(formData),
+          });
+        }
+        closeModal();
+        window.location.reload();
+      } catch (error) {
+        console.error('Failed to save recurring invoice item:', error);
+        const message = error instanceof Error ? error.message : 'Failed to save item. Please try again.';
+        alert(message);
+      }
+    });
+
+    deleteButtons.forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        const row = event.target.closest('tr');
+        if (!row) {
+          return;
+        }
+        const itemJson = row.dataset.recurringItem;
+        if (!itemJson) {
+          return;
+        }
+
+        try {
+          const item = JSON.parse(itemJson);
+          if (!confirm(`Delete recurring invoice item "${item.product_code}"?`)) {
+            return;
+          }
+
+          await requestJson(`/api/companies/${companyId}/recurring-invoice-items/${item.id}`, {
+            method: 'DELETE',
+          });
+          window.location.reload();
+        } catch (error) {
+          console.error('Failed to delete recurring invoice item:', error);
+          const message = error instanceof Error ? error.message : 'Failed to delete item. Please try again.';
+          alert(message);
+        }
+      });
+    });
+
+    if (deleteModalButton) {
+      deleteModalButton.addEventListener('click', async () => {
+        const itemId = document.getElementById('recurring-item-id').value;
+        if (!itemId) {
+          return;
+        }
+
+        const productCode = document.getElementById('recurring-item-product-code').value;
+        if (!confirm(`Delete recurring invoice item "${productCode}"?`)) {
+          return;
+        }
+
+        try {
+          await requestJson(`/api/companies/${companyId}/recurring-invoice-items/${itemId}`, {
+            method: 'DELETE',
+          });
+          window.location.reload();
+        } catch (error) {
+          console.error('Failed to delete recurring invoice item:', error);
+          const message = error instanceof Error ? error.message : 'Failed to delete item. Please try again.';
+          alert(message);
+        }
+      });
+    }
+  }
+
+  function bindCompanyIdLookupButtons() {
+    const companyEditPage = document.querySelector('[data-company-id]');
+    if (!companyEditPage) {
+      return;
+    }
+
+    const companyId = companyEditPage.dataset.companyId;
+    if (!companyId) {
+      return;
+    }
+
+    const tacticalButton = document.querySelector('[data-lookup-tactical-id]');
+    const xeroButton = document.querySelector('[data-lookup-xero-id]');
+    const huduButton = document.querySelector('[data-lookup-hudu-id]');
+    const onedriveSitesButton = document.querySelector('[data-lookup-onedrive-export-sites]');
+    const createOffboardedStaffSiteButton = document.querySelector('[data-create-offboarded-staff-site]');
+    const huntressButton = document.querySelector('[data-lookup-huntress-id]');
+    const huntressSatButton = document.querySelector('[data-lookup-huntress-sat-id]');
+    const tacticalInput = document.getElementById('edit-company-tactical');
+    const xeroInput = document.getElementById('edit-company-xero');
+    const huduInput = document.getElementById('edit-company-hudu');
+    const onedriveSitesSelect = document.querySelector('[data-onedrive-export-sites-select]');
+    const onedriveSitesError = document.querySelector('[data-onedrive-export-sites-error]');
+    const huntressInput = document.getElementById('edit-company-huntress');
+    const huntressSatInput = document.getElementById('edit-company-huntress-sat');
+
+    const offboardedStaffSiteName = 'Offboarded Staff';
+
+    const addOneDriveSiteOption = (site, { select = false } = {}) => {
+      if (!onedriveSitesSelect || !site) {
+        return;
+      }
+      const siteId = String(site.site_id || '').trim();
+      const driveId = String(site.drive_id || '').trim();
+      if (!siteId || !driveId) {
+        return;
+      }
+      const payload = {
+        site_id: siteId,
+        site_name: String(site.site_name || '').trim(),
+        drive_id: driveId,
+      };
+      const optionValue = JSON.stringify(payload);
+      let option = Array.from(onedriveSitesSelect.options).find((candidate) => candidate.value === optionValue);
+      if (!option) {
+        option = document.createElement('option');
+        option.value = optionValue;
+        option.textContent = site.label || `${payload.site_name || siteId} (${site.drive_name || 'Documents'})`;
+        onedriveSitesSelect.appendChild(option);
+      }
+      if (select) {
+        option.selected = true;
+        onedriveSitesSelect.classList.add('form-input--success');
+        setTimeout(() => onedriveSitesSelect.classList.remove('form-input--success'), 2000);
+      }
+    };
+
+    const refreshCreateOffboardedStaffVisibility = (sites) => {
+      if (!createOffboardedStaffSiteButton) {
+        return;
+      }
+      const hasOffboardedStaffSite = Array.isArray(sites) && sites.some((site) => {
+        return String(site.site_name || site.displayName || site.name || '').trim().toLowerCase() === offboardedStaffSiteName.toLowerCase();
+      });
+      createOffboardedStaffSiteButton.hidden = hasOffboardedStaffSite;
+    };
+
+    const spinnerHtml = '<span class="button__icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false" class="spin-animation"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none" opacity="0.25"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>';
+
+    if (tacticalButton && tacticalInput) {
+      tacticalButton.addEventListener('click', async () => {
+        const originalText = tacticalButton.innerHTML;
+        tacticalButton.disabled = true;
+        tacticalButton.innerHTML = spinnerHtml;
+
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/lookup-tactical-id`, {
+            method: 'POST',
+          });
+
+          if (result.status === 'found' && result.id) {
+            tacticalInput.value = result.id;
+            tacticalInput.classList.add('form-input--success');
+            setTimeout(() => tacticalInput.classList.remove('form-input--success'), 2000);
+          } else {
+            alert('Tactical RMM client ID not found. Please ensure the company name matches exactly in Tactical RMM.');
+          }
+        } catch (error) {
+          console.error('Failed to lookup Tactical RMM client ID:', error);
+          const message = error instanceof Error ? error.message : 'Failed to lookup ID. Please try again.';
+          alert(message);
+        } finally {
+          tacticalButton.disabled = false;
+          tacticalButton.innerHTML = originalText;
+        }
+      });
+    }
+
+    if (xeroButton && xeroInput) {
+      xeroButton.addEventListener('click', async () => {
+        const originalText = xeroButton.innerHTML;
+        xeroButton.disabled = true;
+        xeroButton.innerHTML = spinnerHtml;
+
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/lookup-xero-id`, {
+            method: 'POST',
+          });
+
+          if (result.status === 'found' && result.id) {
+            xeroInput.value = result.id;
+            xeroInput.classList.add('form-input--success');
+            setTimeout(() => xeroInput.classList.remove('form-input--success'), 2000);
+          } else {
+            alert('Xero contact ID not found. Please ensure the company name matches exactly in Xero.');
+          }
+        } catch (error) {
+          console.error('Failed to lookup Xero contact ID:', error);
+          const message = error instanceof Error ? error.message : 'Failed to lookup ID. Please try again.';
+          alert(message);
+        } finally {
+          xeroButton.disabled = false;
+          xeroButton.innerHTML = originalText;
+        }
+      });
+    }
+
+
+    if (onedriveSitesButton && onedriveSitesSelect) {
+      onedriveSitesButton.addEventListener('click', async () => {
+        const originalText = onedriveSitesButton.innerHTML;
+        const selectedValue = onedriveSitesSelect.value;
+        onedriveSitesButton.disabled = true;
+        onedriveSitesButton.innerHTML = spinnerHtml;
+        if (onedriveSitesError) {
+          onedriveSitesError.hidden = true;
+          onedriveSitesError.textContent = '';
+        }
+
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/onedrive-export-sites`, {
+            method: 'GET',
+          });
+          const sites = Array.isArray(result?.sites) ? result.sites : [];
+          const existingOptions = Array.from(onedriveSitesSelect.options).filter((option) => {
+            return option.value === '' || option.selected;
+          });
+          onedriveSitesSelect.replaceChildren(...existingOptions);
+
+          sites.forEach((site) => {
+            addOneDriveSiteOption(site);
+          });
+
+          if (selectedValue) {
+            const previousOption = Array.from(onedriveSitesSelect.options).find((option) => option.value === selectedValue);
+            if (previousOption) {
+              previousOption.selected = true;
+            }
+          }
+
+          refreshCreateOffboardedStaffVisibility(sites);
+
+          if (!sites.length) {
+            alert('No SharePoint sites were found for this Microsoft 365 tenant.');
+          } else {
+            onedriveSitesSelect.classList.add('form-input--success');
+            setTimeout(() => onedriveSitesSelect.classList.remove('form-input--success'), 2000);
+          }
+        } catch (error) {
+          console.error('Failed to lookup SharePoint sites:', error);
+          const message = error instanceof Error ? error.message : 'Failed to lookup SharePoint sites. Please try again.';
+          if (onedriveSitesError) {
+            onedriveSitesError.textContent = `Unable to load SharePoint sites: ${message}`;
+            onedriveSitesError.hidden = false;
+          } else {
+            alert(message);
+          }
+        } finally {
+          onedriveSitesButton.disabled = false;
+          onedriveSitesButton.innerHTML = originalText;
+        }
+      });
+    }
+
+    if (createOffboardedStaffSiteButton && onedriveSitesSelect) {
+      createOffboardedStaffSiteButton.addEventListener('click', async () => {
+        const originalText = createOffboardedStaffSiteButton.innerHTML;
+        createOffboardedStaffSiteButton.disabled = true;
+        createOffboardedStaffSiteButton.innerHTML = spinnerHtml;
+        if (onedriveSitesError) {
+          onedriveSitesError.hidden = true;
+          onedriveSitesError.textContent = '';
+        }
+
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/onedrive-export-sites/offboarded-staff`, {
+            method: 'POST',
+          });
+          if (result?.site) {
+            addOneDriveSiteOption(result.site, { select: true });
+            refreshCreateOffboardedStaffVisibility([result.site]);
+          }
+          alert(result?.status === 'exists' ? 'Offboarded Staff already exists and has been selected.' : 'Offboarded Staff was created and selected.');
+        } catch (error) {
+          console.error('Failed to create Offboarded Staff site:', error);
+          const message = error instanceof Error ? error.message : 'Failed to create Offboarded Staff site. Please try again.';
+          if (onedriveSitesError) {
+            onedriveSitesError.textContent = `Unable to create Offboarded Staff site: ${message}`;
+            onedriveSitesError.hidden = false;
+          } else {
+            alert(message);
+          }
+        } finally {
+          createOffboardedStaffSiteButton.disabled = false;
+          createOffboardedStaffSiteButton.innerHTML = originalText;
+        }
+      });
+    }
+
+
+    if (huduButton && huduInput) {
+      huduButton.addEventListener('click', async () => {
+        const originalText = huduButton.innerHTML;
+        huduButton.disabled = true;
+        huduButton.innerHTML = spinnerHtml;
+
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/lookup-hudu-id`, {
+            method: 'POST',
+          });
+
+          if (result.status === 'found' && result.id) {
+            huduInput.value = result.id;
+            huduInput.classList.add('form-input--success');
+            setTimeout(() => huduInput.classList.remove('form-input--success'), 2000);
+          } else {
+            alert('Hudu company ID not found. Please ensure the company name matches exactly in Hudu.');
+          }
+        } catch (error) {
+          console.error('Failed to lookup Hudu company ID:', error);
+          const message = error instanceof Error ? error.message : 'Failed to lookup ID. Please try again.';
+          alert(message);
+        } finally {
+          huduButton.disabled = false;
+          huduButton.innerHTML = originalText;
+        }
+      });
+    }
+
+    if (huntressButton && huntressInput) {
+      huntressButton.addEventListener('click', async () => {
+        const originalText = huntressButton.innerHTML;
+        huntressButton.disabled = true;
+        huntressButton.innerHTML = spinnerHtml;
+
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/lookup-huntress-id`, {
+            method: 'POST',
+          });
+
+          if (result.status === 'found' && result.id) {
+            huntressInput.value = result.id;
+            huntressInput.classList.add('form-input--success');
+            setTimeout(() => huntressInput.classList.remove('form-input--success'), 2000);
+          } else {
+            alert('Huntress organisation ID not found. Please ensure the company name matches exactly in Huntress.');
+          }
+        } catch (error) {
+          console.error('Failed to lookup Huntress organisation ID:', error);
+          const message = error instanceof Error ? error.message : 'Failed to lookup ID. Please try again.';
+          alert(message);
+        } finally {
+          huntressButton.disabled = false;
+          huntressButton.innerHTML = originalText;
+        }
+      });
+    }
+
+    if (huntressSatButton && huntressSatInput) {
+      huntressSatButton.addEventListener('click', async () => {
+        const originalText = huntressSatButton.innerHTML;
+        huntressSatButton.disabled = true;
+        huntressSatButton.innerHTML = spinnerHtml;
+        try {
+          const result = await requestJson(`/api/companies/${companyId}/lookup-huntress-sat-id`, { method: 'POST' });
+          if (result.status === 'found' && result.id) {
+            huntressSatInput.value = result.id;
+            huntressSatInput.classList.add('form-input--success');
+            setTimeout(() => huntressSatInput.classList.remove('form-input--success'), 2000);
+          } else {
+            alert('Huntress SAT account ID not found. Please ensure the company name matches exactly in Managed SAT.');
+          }
+        } catch (error) {
+          console.error('Failed to lookup Huntress SAT account ID:', error);
+          alert(error instanceof Error ? error.message : 'Failed to lookup ID. Please try again.');
+        } finally {
+          huntressSatButton.disabled = false;
+          huntressSatButton.innerHTML = originalText;
+        }
+      });
+    }
+  }
+
+  function bindTicketRequesterField() {
+    const companySelect = document.querySelector('[data-ticket-company-select]');
+    const requesterSelect = document.querySelector('[data-ticket-requester-select]');
+
+    if (!companySelect || !requesterSelect) {
+      return;
+    }
+
+    async function updateRequesterOptions(companyId) {
+      // Clear existing options except the first "Not specified" option
+      while (requesterSelect.options.length > 1) {
+        requesterSelect.remove(1);
+      }
+
+      if (!companyId) {
+        requesterSelect.disabled = true;
+        return;
+      }
+
+      requesterSelect.disabled = false;
+
+      try {
+        const users = await requestJson(`/api/companies/${encodeURIComponent(companyId)}/staff-users`);
+
+        if (!Array.isArray(users) || users.length === 0) {
+          requesterSelect.disabled = true;
+          // Add a disabled option to show why it's empty
+          const emptyOption = document.createElement('option');
+          emptyOption.value = '';
+          emptyOption.textContent = 'No staff members found for this company';
+          emptyOption.disabled = true;
+          requesterSelect.appendChild(emptyOption);
+          return;
+        }
+
+        users.forEach((user) => {
+          const option = document.createElement('option');
+          option.value = user.requester_value || (user.user_id ? `user:${user.user_id}` : `staff:${user.staff_id || user.id}`);
+          const fullName = `${user.first_name || ''} ${user.last_name || ''}`.trim();
+          option.textContent = fullName ? `${fullName} (${user.email})` : user.email;
+          requesterSelect.appendChild(option);
+        });
+      } catch (error) {
+        console.error('Failed to load staff for company:', error);
+        requesterSelect.disabled = true;
+        // Add a disabled option to show the error
+        const errorOption = document.createElement('option');
+        errorOption.value = '';
+        errorOption.textContent = 'Unable to load staff members';
+        errorOption.disabled = true;
+        requesterSelect.appendChild(errorOption);
+      }
+    }
+
+    companySelect.addEventListener('change', () => {
+      const companyId = companySelect.value;
+      updateRequesterOptions(companyId);
+    });
+
+    // Initialize on load if company is already selected
+    if (companySelect.value) {
+      updateRequesterOptions(companySelect.value);
+    }
+  }
+
+  function bindCompanyDeleteButtons() {
+    document.querySelectorAll('[data-company-delete]').forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        const companyId = button.dataset.companyId;
+        const companyName = button.dataset.companyName || 'this company';
+
+        if (!companyId) {
+          return;
+        }
+
+        if (!confirm(`Delete ${companyName}? This action cannot be undone.`)) {
+          return;
+        }
+
+        try {
+          await requestJson(`/api/companies/${companyId}`, {
+            method: 'DELETE',
+          });
+          window.location.href = `/admin/companies?success=${encodeURIComponent('Company deleted.')}`;
+        } catch (error) {
+          console.error('Failed to delete company:', error);
+          const message = error instanceof Error ? error.message : 'Failed to delete company. Please try again.';
+          alert(message);
+        }
+      });
+    });
+  }
+
+  function bindCompanyArchiveButtons() {
+    document.querySelectorAll('[data-company-archive]').forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        const companyId = button.dataset.companyId;
+        const companyName = button.dataset.companyName || 'this company';
+
+        if (!companyId) {
+          return;
+        }
+
+        if (!confirm(`Archive ${companyName}? Archived companies are hidden throughout the platform.`)) {
+          return;
+        }
+
+        try {
+          await requestJson(`/api/companies/${companyId}/archive`, {
+            method: 'POST',
+          });
+          const currentParams = new URLSearchParams(window.location.search);
+          const showArchived = currentParams.get('show_archived') === 'true';
+          const redirectUrl = showArchived
+            ? `/admin/companies?show_archived=true&success=${encodeURIComponent('Company archived.')}`
+            : `/admin/companies?success=${encodeURIComponent('Company archived.')}`;
+          window.location.href = redirectUrl;
+        } catch (error) {
+          console.error('Failed to archive company:', error);
+          const message = error instanceof Error ? error.message : 'Failed to archive company. Please try again.';
+          alert(message);
+        }
+      });
+    });
+  }
+
+  function bindCompanyUnarchiveButtons() {
+    document.querySelectorAll('[data-company-unarchive]').forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        const companyId = button.dataset.companyId;
+        const companyName = button.dataset.companyName || 'this company';
+
+        if (!companyId) {
+          return;
+        }
+
+        if (!confirm(`Unarchive ${companyName}?`)) {
+          return;
+        }
+
+        try {
+          await requestJson(`/api/companies/${companyId}/unarchive`, {
+            method: 'POST',
+          });
+          const currentParams = new URLSearchParams(window.location.search);
+          const showArchived = currentParams.get('show_archived') === 'true';
+          const redirectUrl = showArchived
+            ? `/admin/companies?show_archived=true&success=${encodeURIComponent('Company unarchived.')}`
+            : `/admin/companies?success=${encodeURIComponent('Company unarchived.')}`;
+          window.location.href = redirectUrl;
+        } catch (error) {
+          console.error('Failed to unarchive company:', error);
+          const message = error instanceof Error ? error.message : 'Failed to unarchive company. Please try again.';
+          alert(message);
+        }
+      });
+    });
+  }
+
+  function bindOrderDeleteButtons() {
+    document.querySelectorAll('[data-order-delete]').forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        const orderNumber = button.dataset.orderNumber;
+        const companyId = button.dataset.companyId;
+
+        if (!orderNumber || !companyId) {
+          return;
+        }
+
+        if (!confirm(`Delete order ${orderNumber}? This action cannot be undone.`)) {
+          return;
+        }
+
+        try {
+          await requestJson(`/api/orders/${orderNumber}?companyId=${companyId}`, {
+            method: 'DELETE',
+          });
+          window.location.reload();
+        } catch (error) {
+          console.error('Failed to delete order:', error);
+          const message = error instanceof Error ? error.message : 'Failed to delete order. Please try again.';
+          alert(message);
+        }
+      });
+    });
+  }
+
+  function bindXeroTenantSelector() {
+    const loadButton = document.getElementById('xero-load-tenants');
+    const selectElement = document.getElementById('xero-tenant-id');
+
+    if (!loadButton || !selectElement) {
+      return;
+    }
+
+    // Load tenants from API
+    loadButton.addEventListener('click', async () => {
+      loadButton.disabled = true;
+      loadButton.setAttribute('aria-busy', 'true');
+
+      try {
+        const data = await requestJson('/api/integration-modules/xero/tenants');
+
+        // Save the current selection
+        const currentSelection = selectElement.value;
+
+        // Clear existing options except the placeholder
+        while (selectElement.options.length > 1) {
+          selectElement.remove(1);
+        }
+
+        // Add tenant options
+        if (data.tenants && data.tenants.length > 0) {
+          data.tenants.forEach((tenant) => {
+            const option = document.createElement('option');
+            option.value = tenant.tenant_id;
+            option.textContent = tenant.tenant_name || tenant.tenant_id;
+            selectElement.appendChild(option);
+          });
+
+          // Select current tenant if available
+          if (data.current_tenant_id) {
+            selectElement.value = data.current_tenant_id;
+          } else if (currentSelection) {
+            selectElement.value = currentSelection;
+          }
+
+          alert(`Loaded ${data.tenants.length} Xero organization(s). Please select one and save.`);
+        } else {
+          alert('No Xero organizations found. Please check your credentials.');
+        }
+      } catch (error) {
+        console.error('Failed to load Xero tenants:', error);
+        const message = error instanceof Error ? error.message : 'Failed to load Xero tenants. Please check your credentials.';
+        alert(message);
+      } finally {
+        loadButton.disabled = false;
+        loadButton.removeAttribute('aria-busy');
+      }
+    });
+  }
+
+  function bindModuleSettingsModals() {
+    const buttons = document.querySelectorAll('[data-edit-module-open]');
+    const buttonGroups = new Map();
+
+    buttons.forEach((button) => {
+      const slug = button.dataset.editModuleOpen;
+      if (!slug) {
+        return;
+      }
+      const group = buttonGroups.get(slug) || [];
+      group.push(button);
+      buttonGroups.set(slug, group);
+    });
+
+    buttonGroups.forEach((group, slug) => {
+      bindModal({
+        modalId: `module-settings-modal-${slug}`,
+        triggerElements: group,
+      });
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    bindSyncroTicketImportForms();
+    bindSyncroStatusMappingRows();
+    bindSyncroCompanyImportForm();
+    bindTicketBulkDelete();
+    bindTicketStatusAutoSubmit();
+    bindIssueStatusAutoSubmit();
+    registerTicketTableRefreshHandler();
+    setupTableRealtimeRefreshControllers();
+    // Auto-load tables marked with data-table-autoload (e.g. tickets dashboard)
+    document.querySelectorAll('[data-table][data-table-autoload]').forEach((autoloadTable) => {
+      if (autoloadTable instanceof HTMLTableElement) {
+        autoloadTable.dispatchEvent(new CustomEvent('table:refresh-request'));
+      }
+    });
+    bindTicketAiReplaceDescription();
+    bindTicketAiRefresh();
+    bindMessageTemplateForm();
+    bindMessageTemplateCloneButtons();
+    bindMessageTemplateDeleteButtons();
+    bindRoleForm();
+    bindCompanyAssignForm();
+    bindCompanyAssignmentControls();
+    bindRecurringInvoiceItems();
+    bindCompanyIdLookupButtons();
+    bindApiKeyEditModal();
+    bindApiKeyCopyButtons();
+    bindConfirmationButtons();
+    const ticketStatusManager = bindTicketStatusManager();
+    bindLabourTypeManager();
+    bindTicketRequesterField();
+    bindCompanyDeleteButtons();
+    bindCompanyArchiveButtons();
+    bindCompanyUnarchiveButtons();
+    bindOrderDeleteButtons();
+    bindXeroTenantSelector();
+    bindModuleSettingsModals();
+    bindModal({ modalId: 'add-company-modal', triggerSelector: '[data-add-company-modal-open]' });
+    bindModal({ modalId: 'create-ticket-modal', triggerSelector: '[data-create-ticket-modal-open]' });
+    bindModal({ modalId: 'canned-response-create-modal', triggerSelector: '[data-canned-response-create-open]' });
+    bindModal({ modalId: 'create-api-key-modal', triggerSelector: '[data-create-api-key-modal-open]' });
+    bindModal({ modalId: 'create-issue-modal', triggerSelector: '[data-create-issue-modal-open]' });
+    bindModal({
+      modalId: 'edit-ticket-statuses-modal',
+      triggerSelector: '[data-edit-ticket-statuses-open]',
+      onOpen: ticketStatusManager ? () => ticketStatusManager.ensureDefaultRadioChecked() : undefined
+    });
+    bindModal({ modalId: 'edit-labour-types-modal', triggerSelector: '[data-edit-labour-types-open]' });
+    bindModal({ modalId: 'import-product-modal', triggerSelector: '[data-import-product-modal-open]' });
+    bindAuditDiffModal();
+  });
+
+  function bindAuditDiffModal() {
+    const modal = document.getElementById('audit-diff-modal');
+    const modalBody = document.getElementById('audit-diff-modal-body');
+    if (!modal || !modalBody) {
+      return;
+    }
+
+    let activeTrigger = null;
+
+    function openModal(trigger) {
+      activeTrigger = trigger;
+      const index = trigger.getAttribute('data-audit-diff-index');
+      const template = document.getElementById(`audit-diff-${index}`);
+      modalBody.innerHTML = '';
+      if (template) {
+        modalBody.appendChild(template.content.cloneNode(true));
+      }
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+      const closeBtn = modal.querySelector('[data-modal-close]');
+      if (closeBtn) {
+        closeBtn.focus();
+      }
+    }
+
+    function closeModal() {
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+      if (activeTrigger) {
+        activeTrigger.focus();
+        activeTrigger = null;
+      }
+    }
+
+    document.addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-audit-diff-btn]');
+      if (btn) {
+        openModal(btn);
+        return;
+      }
+      if (event.target === modal) {
+        closeModal();
+      }
+    });
+
+    modal.addEventListener('click', (event) => {
+      const closeBtn = event.target.closest('[data-modal-close]');
+      if (closeBtn) {
+        event.preventDefault();
+        closeModal();
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !modal.hidden) {
+        closeModal();
+      }
+    });
+  }
+})();

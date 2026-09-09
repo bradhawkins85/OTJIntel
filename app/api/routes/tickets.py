@@ -1,0 +1,2454 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse
+
+from app.api.dependencies.auth import (
+    get_current_session,
+    get_current_user,
+    get_optional_user,
+    require_helpdesk_technician,
+    require_super_admin,
+)
+from app.api.dependencies.api_keys import get_optional_api_key
+from app.core.errors import (
+    build_client_http_error,
+    log_exception_with_error_id,
+    new_error_id,
+)
+from app.core.logging import log_error
+from loguru import logger
+from app.repositories import company_memberships as membership_repo
+from app.repositories import companies as companies_repo
+from app.repositories import assets as assets_repo
+from app.repositories import staff as staff_repo
+from app.repositories import ticket_attachments as attachments_repo
+from app.repositories import ticket_tasks as ticket_tasks_repo
+from app.repositories import ticket_views as ticket_views_repo
+from app.repositories import tickets as tickets_repo
+from app.repositories import users as user_repo
+from app.schemas.tickets import (
+    LabourTypeCreateRequest,
+    LabourTypeListResponse,
+    LabourTypeModel,
+    LabourTypeUpdateRequest,
+    SyncroTicketImportRequest,
+    SyncroTicketImportSummary,
+    TacticalRMMTicketCreate,
+    TacticalRMMTicketResolve,
+    TicketAttachment,
+    TicketAttachmentListResponse,
+    TicketAttachmentUpdate,
+    TicketCreate,
+    TicketDashboardResponse,
+    TicketDashboardRow,
+    TicketDetail,
+    TicketListResponse,
+    TicketReply,
+    TicketReplyCreate,
+    TicketReplyTimeUpdate,
+    TicketReplyResponse,
+    TicketResponse,
+    TicketSearchFilters,
+    TicketStatusDefinitionModel,
+    TicketStatusListResponse,
+    TicketStatusUpdateRequest,
+    TicketTask,
+    TicketTaskCreate,
+    TicketTaskListResponse,
+    TicketTaskUpdate,
+    TicketUpdate,
+    TicketViewCreate,
+    TicketViewListResponse,
+    TicketViewModel,
+    TicketViewUpdate,
+    TicketWatcher,
+    TicketWatcherUpdate,
+    TicketSplitRequest,
+    TicketSplitResponse,
+    TicketMergeRequest,
+    TicketMergeResponse,
+)
+from app.services import ticket_shipment_tracking as shipment_watch_service
+from app.security.session import SessionData
+from app.services import audit as audit_service
+from app.services import labour_types as labour_types_service
+from app.services import ticket_attachments as attachments_service
+from app.services import ticket_importer, tickets as tickets_service
+from app.services.audit_diff import summarise_reply_body
+from app.services.sanitization import sanitize_rich_text
+
+router = APIRouter(prefix="/api/tickets", tags=["Tickets"])
+
+
+# Audit ticket snapshots intentionally exclude the long-form description field
+# - we capture metadata only (status, priority, assignment, etc.) and rely on
+# the ticket record itself for the body. This keeps audit rows compact and
+# avoids duplicating customer-supplied content.
+_TICKET_AUDIT_FIELDS: tuple[str, ...] = (
+    "id",
+    "subject",
+    "status",
+    "priority",
+    "assigned_user_id",
+    "requester_id",
+    "company_id",
+    "category",
+    "module_slug",
+    "external_reference",
+    "merged_into_ticket_id",
+    "xero_invoice_number",
+    "updated_at",
+)
+
+
+def _audit_ticket_view(ticket: dict | None) -> dict | None:
+    if not ticket:
+        return None
+    return {key: ticket.get(key) for key in _TICKET_AUDIT_FIELDS}
+
+
+async def _has_helpdesk_permission(current_user: dict) -> bool:
+    if current_user.get("is_super_admin"):
+        return True
+    user_id = current_user.get("id")
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        return await membership_repo.user_has_permission(
+            user_id_int, tickets_service.HELPDESK_PERMISSION_KEY
+        )
+    except RuntimeError:
+        return False
+
+
+async def _validate_ticket_assignee(assigned_user_id: int | None) -> None:
+    if assigned_user_id is None:
+        return
+    has_permission = await membership_repo.user_has_permission(
+        assigned_user_id, tickets_service.HELPDESK_PERMISSION_KEY
+    )
+    if not has_permission:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected user cannot be assigned to tickets.",
+        )
+
+
+async def _resolve_ticket_actor(
+    optional_user: dict | None = Depends(get_optional_user),
+    api_key_record: dict | None = Depends(get_optional_api_key),
+) -> dict[str, Any]:
+    if api_key_record:
+        return {"user": None, "api_key": api_key_record}
+    if optional_user:
+        return {"user": optional_user, "api_key": None}
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+    )
+
+
+def _encode_ticket_cursor(
+    updated_at: datetime | None, ticket_id: int | None
+) -> str | None:
+    if updated_at is None or ticket_id is None:
+        return None
+    return f"{updated_at.astimezone(timezone.utc).isoformat()}|{int(ticket_id)}"
+
+
+def _decode_ticket_cursor(cursor: str | None) -> tuple[datetime | None, int | None]:
+    if not cursor:
+        return None, None
+    try:
+        updated_raw, id_raw = str(cursor).strip().rsplit("|", 1)
+        updated_at = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        else:
+            updated_at = updated_at.astimezone(timezone.utc)
+        return updated_at, int(id_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor"
+        ) from None
+
+
+async def _build_ticket_detail(ticket_id: int, current_user: dict) -> TicketDetail:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+    requester_id = ticket.get("requester_id")
+    current_user_id = current_user.get("id")
+    try:
+        current_user_id_int = int(current_user_id)
+    except (TypeError, ValueError):
+        current_user_id_int = None
+    if not has_helpdesk_access:
+        if requester_id != current_user_id_int:
+            is_watcher = False
+            if current_user_id_int is not None:
+                is_watcher = await tickets_repo.is_ticket_watcher(
+                    ticket_id, current_user_id_int
+                )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+                )
+
+    replies = await tickets_repo.list_replies(
+        ticket_id, include_internal=has_helpdesk_access
+    )
+    if has_helpdesk_access:
+        replies = [
+            *replies,
+            *await tickets_repo.list_split_replies_for_original(ticket_id),
+        ]
+    ordered_replies = sorted(
+        replies,
+        key=lambda item: item.get("created_at")
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    watcher_records = []
+    if has_helpdesk_access:
+        watcher_records = await tickets_repo.list_watchers(ticket_id)
+    sanitised_replies = []
+    for reply in ordered_replies:
+        sanitised = sanitize_rich_text(str(reply.get("body") or ""))
+        minutes_value = reply.get("minutes_spent")
+        minutes_spent = (
+            minutes_value
+            if isinstance(minutes_value, int) and minutes_value >= 0
+            else None
+        )
+        billable_flag = bool(reply.get("is_billable"))
+        time_summary = tickets_service.format_reply_time_summary(
+            minutes_spent, billable_flag
+        )
+        payload = {
+            **reply,
+            "body": sanitised.html,
+            "minutes_spent": minutes_spent,
+            "is_billable": billable_flag,
+        }
+        if time_summary:
+            payload["time_summary"] = time_summary
+        sanitised_replies.append(payload)
+
+    # Get attachments
+    attachment_records = []
+    if has_helpdesk_access:
+        # Helpdesk technicians can see all attachments
+        attachment_records = await attachments_repo.list_attachments(ticket_id)
+    else:
+        # Non-technicians can only see open and closed attachments (not restricted)
+        attachment_records = await attachments_repo.list_attachments(
+            ticket_id, access_levels=("open", "closed")
+        )
+
+    return TicketDetail(
+        **ticket,
+        replies=[TicketReply(**reply) for reply in sanitised_replies],
+        watchers=[TicketWatcher(**watcher) for watcher in watcher_records],
+        attachments=[
+            TicketAttachment(**attachment) for attachment in attachment_records
+        ],
+    )
+
+
+@router.get("/", response_model=TicketListResponse)
+async def list_tickets(
+    status_filter: str | None = Query(default=None, alias="status"),
+    module_slug: str | None = Query(default=None),
+    company_id: int | None = Query(default=None),
+    assigned_user_id: int | None = Query(default=None),
+    search: str | None = Query(default=None, min_length=1),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None),
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketListResponse:
+    current_user: dict | None = actor.get("user")
+    api_key_record = actor.get("api_key")
+
+    cursor_updated_at, cursor_id = _decode_ticket_cursor(cursor)
+
+    has_helpdesk_access = bool(api_key_record)
+    if current_user:
+        has_helpdesk_access = has_helpdesk_access or await _has_helpdesk_permission(
+            current_user
+        )
+
+    if has_helpdesk_access:
+        tickets = await tickets_repo.list_tickets(
+            status=status_filter,
+            module_slug=module_slug,
+            company_id=company_id,
+            assigned_user_id=assigned_user_id,
+            search=search,
+            limit=limit,
+            offset=offset,
+            requester_id=None,
+            cursor_updated_at=cursor_updated_at,
+            cursor_id=cursor_id,
+        )
+        total = await tickets_repo.count_tickets(
+            status=status_filter,
+            module_slug=module_slug,
+            company_id=company_id,
+            assigned_user_id=assigned_user_id,
+            search=search,
+            requester_id=None,
+        )
+    elif current_user:
+        try:
+            current_user_id = int(current_user["id"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+            ) from None
+        tickets = await tickets_repo.list_tickets_for_user(
+            current_user_id,
+            search=search,
+            status=status_filter,
+            limit=limit,
+            offset=offset,
+            cursor_updated_at=cursor_updated_at,
+            cursor_id=cursor_id,
+        )
+        total = await tickets_repo.count_tickets_for_user(
+            current_user_id,
+            search=search,
+            status=status_filter,
+        )
+    else:  # pragma: no cover - defensive guard
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+        )
+    next_cursor = None
+    if len(tickets) == limit:
+        last = tickets[-1]
+        next_cursor = _encode_ticket_cursor(last.get("updated_at"), last.get("id"))
+    return TicketListResponse(
+        items=[TicketResponse(**ticket) for ticket in tickets],
+        total=total,
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/dashboard", response_model=TicketDashboardResponse)
+async def get_ticket_dashboard(
+    status_filter: list[str] = Query(default=[], alias="status"),
+    module_slug: str | None = Query(default=None, alias="module"),
+    company_id: int | None = Query(default=None, alias="companyId"),
+    assigned_user_id: int | None = Query(default=None, alias="assignedUserId"),
+    search: str | None = Query(default=None, min_length=1),
+    limit: int = Query(default=200, ge=1, le=500),
+    all_tickets: bool = Query(default=False, alias="all"),
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketDashboardResponse:
+    resolved_status: list[str] | None = status_filter if status_filter else None
+    state = await tickets_service.load_dashboard_state(
+        status_filter=resolved_status,
+        module_filter=module_slug,
+        company_id=company_id,
+        assigned_user_id=assigned_user_id,
+        search=search,
+        limit=None if all_tickets else limit,
+        include_reference_data=False,
+    )
+    global_status_counts = await tickets_repo.count_tickets_by_status()
+    rows: list[TicketDashboardRow] = []
+    ticket_ids: list[int] = []
+    for ticket in state.tickets:
+        identifier = ticket.get("id")
+        try:
+            numeric_id = int(identifier)
+        except (TypeError, ValueError):
+            continue
+        ticket_ids.append(numeric_id)
+
+    automation_lookup = (
+        await tickets_repo.get_automation_filter_context_by_ticket_ids(ticket_ids)
+        if ticket_ids
+        else {}
+    )
+    from app.services import slas as sla_service
+    sla_lookup = await sla_service.statuses_for_tickets(ticket_ids) if ticket_ids else {}
+    dashboard_now = datetime.now(timezone.utc)
+
+    def _display_name(record: dict | None) -> str | None:
+        if not isinstance(record, dict):
+            return None
+        name = " ".join(
+            part
+            for part in (
+                str(record.get("first_name") or "").strip(),
+                str(record.get("last_name") or "").strip(),
+            )
+            if part
+        )
+        return name or str(record.get("email") or "").strip() or None
+
+    def _age_hours(value: datetime | None) -> int | None:
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(
+            (dashboard_now - value.astimezone(timezone.utc)).total_seconds() // 3600
+        )
+
+    for ticket in state.tickets:
+        identifier = ticket.get("id")
+        try:
+            numeric_id = int(identifier)
+        except (TypeError, ValueError):
+            continue
+        company_record = state.company_lookup.get(ticket.get("company_id"))
+        assigned_record = state.user_lookup.get(ticket.get("assigned_user_id"))
+        requester_record = state.user_lookup.get(ticket.get("requester_id"))
+        automation_data = automation_lookup.get(numeric_id, {})
+        sla_data = sla_lookup.get(numeric_id, {"state": "not_applicable", "label": "No SLA"})
+        created_at = ticket.get("created_at")
+        updated_at = ticket.get("updated_at")
+        status_changed_at = ticket.get("status_changed_at") or created_at
+        latest_reply_at = automation_data.get("latest_reply_at")
+        requester_label = (
+            ticket.get("requester_label")
+            or _display_name(requester_record)
+            or ticket.get("requester_email")
+        )
+        assigned_display_name = _display_name(assigned_record)
+        ai_tags = (
+            ticket.get("ai_tags") if isinstance(ticket.get("ai_tags"), list) else []
+        )
+        rows.append(
+            TicketDashboardRow(
+                id=numeric_id,
+                subject=str(ticket.get("subject") or ""),
+                status=str(ticket.get("status") or "open"),
+                priority=str(ticket.get("priority") or "normal"),
+                company_id=ticket.get("company_id"),
+                company_name=(
+                    (company_record or {}).get("name")
+                    if isinstance(company_record, dict)
+                    else None
+                ),
+                assigned_user_id=ticket.get("assigned_user_id"),
+                assigned_user_email=(
+                    (assigned_record or {}).get("email")
+                    if isinstance(assigned_record, dict)
+                    else None
+                ),
+                assigned_user_display_name=assigned_display_name,
+                module_slug=ticket.get("module_slug"),
+                requester_id=ticket.get("requester_id"),
+                requester_email=ticket.get("requester_email")
+                or (
+                    (requester_record or {}).get("email")
+                    if isinstance(requester_record, dict)
+                    else None
+                ),
+                requester_label=requester_label,
+                requester_display_name=ticket.get("requester_display_name")
+                or requester_label,
+                category=ticket.get("category"),
+                external_reference=ticket.get("external_reference"),
+                review_date=ticket.get("review_date"),
+                created_at=created_at,
+                updated_at=updated_at,
+                closed_at=ticket.get("closed_at"),
+                status_changed_at=ticket.get("status_changed_at"),
+                ai_resolution_state=ticket.get("ai_resolution_state"),
+                ai_tags=ai_tags,
+                billable_minutes=int(automation_data.get("billable_minutes") or 0),
+                non_billable_minutes=int(
+                    automation_data.get("non_billable_minutes") or 0
+                ),
+                has_attachments=bool(automation_data.get("has_attachments")),
+                attachment_count=int(automation_data.get("attachment_count") or 0),
+                has_tasks=bool(automation_data.get("has_tasks")),
+                task_count=int(automation_data.get("task_count") or 0),
+                has_open_tasks=bool(automation_data.get("has_open_tasks")),
+                open_task_count=int(automation_data.get("open_task_count") or 0),
+                labels=ai_tags,
+                age_days=(
+                    (_age_hours(created_at) // 24)
+                    if _age_hours(created_at) is not None
+                    else None
+                ),
+                updated_age_hours=_age_hours(updated_at),
+                in_status_age_hours=_age_hours(status_changed_at),
+                last_reply_age_hours=_age_hours(latest_reply_at),
+                latest_reply_is_internal=(
+                    automation_data.get("latest_reply_is_internal")
+                    if automation_data.get("latest_reply_id")
+                    else None
+                ),
+                latest_reply_kind=automation_data.get("latest_reply_kind"),
+                latest_public_reply_email_status=automation_data.get(
+                    "latest_public_reply_email_status"
+                ),
+                ticket_update_actor_type=automation_data.get(
+                    "ticket_update_actor_type"
+                ),
+                sla_state=sla_data.get("state"),
+                sla_label=sla_data.get("label"),
+                sla_name=sla_data.get("name"),
+                sla_response_due_at=sla_data.get("response_due_at"),
+                sla_resolution_due_at=sla_data.get("resolution_due_at"),
+            )
+        )
+    filters = TicketSearchFilters(
+        status=resolved_status,
+        module_slug=module_slug,
+        company_id=company_id,
+        assigned_user_id=assigned_user_id,
+        search=search,
+        limit=state.total if all_tickets else limit,
+        offset=0,
+    )
+    return TicketDashboardResponse(
+        items=rows,
+        total=state.total,
+        status_counts=global_status_counts,
+        filters=filters,
+    )
+
+
+@router.get("/statuses", response_model=TicketStatusListResponse)
+async def list_ticket_statuses_endpoint(
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketStatusListResponse:
+    definitions = await tickets_service.list_status_definitions()
+    if current_user.get("is_super_admin"):
+        definitions = [
+            definition for definition in definitions if not definition.hide_from_admins
+        ]
+    else:
+        definitions = [
+            definition
+            for definition in definitions
+            if not definition.hide_from_technicians
+        ]
+    items = [
+        TicketStatusDefinitionModel(
+            tech_status=definition.tech_status,
+            tech_label=definition.tech_label,
+            public_status=definition.public_status,
+            is_default=definition.is_default,
+            hide_from_technicians=definition.hide_from_technicians,
+            hide_from_admins=definition.hide_from_admins,
+        )
+        for definition in definitions
+    ]
+    return TicketStatusListResponse(statuses=items)
+
+
+@router.put("/statuses", response_model=TicketStatusListResponse)
+async def replace_ticket_statuses_endpoint(
+    payload: TicketStatusUpdateRequest,
+    current_user: dict = Depends(require_super_admin),
+) -> TicketStatusListResponse:
+    try:
+        definitions = await tickets_service.replace_ticket_statuses(payload.statuses)
+    except ValueError as exc:
+        error_id = new_error_id()
+        log_exception_with_error_id(
+            "Ticket status configuration validation failed",
+            error_id=error_id,
+            route="tickets.replace_ticket_statuses",
+        )
+        raise build_client_http_error(
+            status.HTTP_400_BAD_REQUEST,
+            "Unable to update ticket status definitions.",
+            error_id=error_id,
+        ) from exc
+    items = [
+        TicketStatusDefinitionModel(
+            tech_status=definition.tech_status,
+            tech_label=definition.tech_label,
+            public_status=definition.public_status,
+            is_default=definition.is_default,
+            hide_from_technicians=definition.hide_from_technicians,
+            hide_from_admins=definition.hide_from_admins,
+        )
+        for definition in definitions
+    ]
+    return TicketStatusListResponse(statuses=items)
+
+
+@router.get("/views", response_model=TicketViewListResponse)
+async def list_ticket_views(
+    session: SessionData = Depends(get_current_session),
+) -> TicketViewListResponse:
+    """List all saved ticket views for the current user"""
+    views = await ticket_views_repo.list_views_for_user(session.user_id)
+    return TicketViewListResponse(items=[TicketViewModel(**view) for view in views])
+
+
+@router.post(
+    "/views", response_model=TicketViewModel, status_code=status.HTTP_201_CREATED
+)
+async def create_ticket_view(
+    payload: TicketViewCreate,
+    session: SessionData = Depends(get_current_session),
+) -> TicketViewModel:
+    """Create a new saved ticket view"""
+    filters_dict = payload.filters.model_dump() if payload.filters else None
+    grouping_fields = payload.grouping_fields or (
+        [payload.grouping_field] if payload.grouping_field else []
+    )
+    view = await ticket_views_repo.create_view(
+        user_id=session.user_id,
+        name=payload.name,
+        description=payload.description,
+        filters=filters_dict,
+        grouping_field=grouping_fields,
+        sort_field=payload.sort_field,
+        sort_direction=payload.sort_direction,
+        is_default=payload.is_default,
+    )
+    return TicketViewModel(**view)
+
+
+@router.get("/views/{view_id}", response_model=TicketViewModel)
+async def get_ticket_view(
+    view_id: int,
+    session: SessionData = Depends(get_current_session),
+) -> TicketViewModel:
+    """Get a specific saved ticket view"""
+    view = await ticket_views_repo.get_view(view_id, session.user_id)
+    if not view:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="View not found"
+        )
+    return TicketViewModel(**view)
+
+
+@router.put("/views/{view_id}", response_model=TicketViewModel)
+async def update_ticket_view(
+    view_id: int,
+    payload: TicketViewUpdate,
+    session: SessionData = Depends(get_current_session),
+) -> TicketViewModel:
+    """Update a saved ticket view"""
+    update_data = payload.model_dump(exclude_unset=True)
+    if "grouping_fields" in update_data:
+        update_data["grouping_field"] = update_data.pop("grouping_fields") or None
+
+    view = await ticket_views_repo.update_view(view_id, session.user_id, **update_data)
+    if not view:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="View not found"
+        )
+    return TicketViewModel(**view)
+
+
+@router.delete("/views/{view_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_ticket_view(
+    view_id: int,
+    session: SessionData = Depends(get_current_session),
+) -> None:
+    """Delete a saved ticket view"""
+    deleted = await ticket_views_repo.delete_view(view_id, session.user_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="View not found"
+        )
+
+
+@router.post("/", response_model=TicketDetail, status_code=status.HTTP_201_CREATED)
+async def create_ticket(
+    payload: TicketCreate,
+    request: Request,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketDetail:
+    current_user: dict | None = actor.get("user")
+    api_key_record: dict | None = actor.get("api_key")
+
+    # API key requests get full helpdesk access; user requests check permissions
+    if api_key_record:
+        has_helpdesk_access = True
+        # API key requests must provide requester_id since there's no session user
+        if payload.requester_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="requester_id is required when using API key authentication.",
+            )
+        requester_id = payload.requester_id
+        author_id: int | None = None  # No author for API key requests
+    elif current_user:
+        has_helpdesk_access = await _has_helpdesk_permission(current_user)
+        requester_id = int(current_user["id"])
+        author_id = int(current_user["id"])
+        # Helpdesk users can specify a different requester
+        if has_helpdesk_access and payload.requester_id is not None:
+            requester_id = payload.requester_id
+    else:  # pragma: no cover - defensive guard
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+        )
+
+    company_id = (
+        payload.company_id
+        if has_helpdesk_access
+        else (current_user.get("company_id") if current_user else None)
+    )
+
+    # Validate requester is an enabled staff member for the company (when company is specified)
+    if (
+        has_helpdesk_access
+        and payload.requester_id is not None
+        and company_id is not None
+    ):
+        allowed_requesters = await staff_repo.list_enabled_staff_users(company_id)
+        allowed_ids = {
+            int(option.get("id"))
+            for option in allowed_requesters
+            if option.get("id") is not None
+        }
+        if payload.requester_id not in allowed_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Requester must be an enabled staff member for the linked company.",
+            )
+
+    assigned_user_id = payload.assigned_user_id if has_helpdesk_access else None
+    await _validate_ticket_assignee(assigned_user_id)
+    priority = payload.priority if has_helpdesk_access else "normal"
+    if has_helpdesk_access:
+        if payload.status:
+            try:
+                status_value = await tickets_service.validate_status_choice(
+                    payload.status,
+                    allow_hidden=bool(
+                        current_user and current_user.get("is_super_admin")
+                    ),
+                )
+            except ValueError as exc:
+                error_id = new_error_id()
+                log_exception_with_error_id(
+                    "Ticket status validation failed",
+                    error_id=error_id,
+                    route="tickets.create_ticket",
+                    requested_status=payload.status,
+                )
+                raise build_client_http_error(
+                    status.HTTP_400_BAD_REQUEST,
+                    "Invalid ticket status.",
+                    error_id=error_id,
+                ) from exc
+        else:
+            status_value = await tickets_service.resolve_status_or_default(None)
+    else:
+        status_value = await tickets_service.resolve_status_or_default(None)
+    category = payload.category if has_helpdesk_access else None
+    module_slug = payload.module_slug if has_helpdesk_access else None
+    external_reference = payload.external_reference if has_helpdesk_access else None
+    ticket = await tickets_service.create_ticket(
+        subject=payload.subject,
+        description=payload.description,
+        requester_id=requester_id,
+        company_id=company_id,
+        assigned_user_id=assigned_user_id,
+        priority=priority,
+        status=status_value,
+        category=category,
+        module_slug=module_slug,
+        external_reference=external_reference,
+        trigger_automations=True,
+        initial_reply_author_id=author_id,
+    )
+    # Add the requester as a watcher (if we have a valid requester_id)
+    if requester_id is not None:
+        await tickets_repo.add_watcher(ticket["id"], requester_id)
+    try:
+        await tickets_service.refresh_ticket_ai_summary(ticket["id"])
+    except RuntimeError as exc:
+        log_error(
+            f"Failed to refresh AI summary for ticket {ticket['id']}: {exc}",
+            exc_info=True,
+        )
+    await tickets_service.refresh_ticket_ai_tags(ticket["id"])
+    # For API key requests, pass a minimal user dict for building ticket detail
+    detail_user = current_user or {"id": requester_id, "is_super_admin": False}
+    await audit_service.record(
+        action="ticket.create",
+        request=request,
+        user_id=int(current_user["id"]) if current_user else None,
+        entity_type="ticket",
+        entity_id=int(ticket["id"]) if ticket.get("id") is not None else None,
+        before=None,
+        after=_audit_ticket_view(ticket),
+        api_key=(
+            str(api_key_record.get("name") or api_key_record.get("id"))
+            if api_key_record
+            else None
+        ),
+    )
+    return await _build_ticket_detail(ticket["id"], detail_user)
+
+
+@router.post(
+    "/tacticalrmm", response_model=TicketDetail, status_code=status.HTTP_201_CREATED
+)
+async def create_tacticalrmm_ticket(
+    payload: TacticalRMMTicketCreate,
+    request: Request,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketDetail:
+    """Create a ticket from TRMM identifiers rather than MyPortal IDs."""
+    alert_id = str(payload.alert_id).strip()
+    if not alert_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tactical RMM alert_id is required.",
+        )
+    external_reference = f"tacticalrmm:alert:{alert_id}"
+    if len(external_reference) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tactical RMM alert_id is too long.",
+        )
+
+    existing_ticket = await tickets_repo.get_ticket_by_external_reference(
+        external_reference
+    )
+    if existing_ticket:
+        current_user = actor.get("user")
+        detail_user = current_user or {"id": None, "is_super_admin": False}
+        return await _build_ticket_detail(existing_ticket["id"], detail_user)
+
+    tactical_client_id = str(payload.company_id).strip()
+    company = await companies_repo.get_company_by_tactical_id(tactical_client_id)
+    if not company:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "No MyPortal company is mapped to Tactical RMM client ID "
+                f"'{tactical_client_id}'."
+            ),
+        )
+
+    asset: dict | None = None
+    tactical_agent_id: str | None = None
+    if payload.agent_id is not None:
+        tactical_agent_id = str(payload.agent_id).strip()
+        asset = await assets_repo.get_asset_by_tactical_id(
+            int(company["id"]), tactical_agent_id
+        )
+        if not asset:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    "No MyPortal asset is mapped to Tactical RMM agent ID "
+                    f"'{tactical_agent_id}' for this company."
+                ),
+            )
+
+    try:
+        status_value = await tickets_service.validate_status_choice(
+            payload.status, allow_hidden=False
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid ticket status.",
+        ) from exc
+
+    ticket = await tickets_service.create_ticket(
+        subject=payload.subject,
+        description=payload.description,
+        requester_id=None,
+        company_id=int(company["id"]),
+        assigned_user_id=None,
+        priority=payload.priority,
+        status=status_value,
+        category=payload.category,
+        module_slug="tacticalrmm",
+        external_reference=external_reference,
+        trigger_automations=True,
+        initial_reply_author_id=None,
+    )
+
+    if asset:
+        await tickets_repo.replace_ticket_assets(ticket["id"], [int(asset["id"])])
+
+    try:
+        await tickets_service.refresh_ticket_ai_summary(ticket["id"])
+    except RuntimeError as exc:
+        log_error(
+            f"Failed to refresh AI summary for ticket {ticket['id']}: {exc}",
+            exc_info=True,
+        )
+    await tickets_service.refresh_ticket_ai_tags(ticket["id"])
+
+    current_user = actor.get("user")
+    api_key_record = actor.get("api_key")
+    await audit_service.record(
+        action="ticket.create",
+        request=request,
+        user_id=int(current_user["id"]) if current_user else None,
+        entity_type="ticket",
+        entity_id=int(ticket["id"]),
+        before=None,
+        after=_audit_ticket_view(ticket),
+        api_key=(
+            str(api_key_record.get("name") or api_key_record.get("id"))
+            if api_key_record
+            else None
+        ),
+    )
+    detail_user = current_user or {"id": None, "is_super_admin": False}
+    return await _build_ticket_detail(ticket["id"], detail_user)
+
+
+@router.post("/tacticalrmm/resolved", response_model=TicketDetail)
+async def resolve_tacticalrmm_ticket(
+    payload: TacticalRMMTicketResolve,
+    request: Request,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketDetail:
+    """Resolve the MyPortal ticket associated with a resolved TRMM alert."""
+    alert_id = str(payload.alert_id).strip()
+    if not alert_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tactical RMM alert_id is required.",
+        )
+    external_reference = f"tacticalrmm:alert:{alert_id}"
+    if len(external_reference) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tactical RMM alert_id is too long.",
+        )
+
+    ticket = await tickets_repo.get_ticket_by_external_reference(external_reference)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No ticket is associated with Tactical RMM alert '{alert_id}'.",
+        )
+
+    if ticket.get("status") != "resolved":
+        previous_ticket = dict(ticket)
+        resolved_status = await tickets_service.validate_status_choice(
+            "resolved", allow_hidden=True
+        )
+        updated = await tickets_repo.set_ticket_status(
+            int(ticket["id"]), resolved_status
+        )
+        if updated:
+            ticket = updated
+        await tickets_service.broadcast_ticket_event(
+            action="updated", ticket_id=int(ticket["id"])
+        )
+        await tickets_service.emit_ticket_updated_event(
+            int(ticket["id"]),
+            actor_type="technician" if actor.get("user") else "api_key",
+            actor=actor.get("user") or actor.get("api_key"),
+        )
+
+        current_user = actor.get("user")
+        api_key_record = actor.get("api_key")
+        await audit_service.record(
+            action="ticket.status_change",
+            request=request,
+            user_id=int(current_user["id"]) if current_user else None,
+            entity_type="ticket",
+            entity_id=int(ticket["id"]),
+            before=_audit_ticket_view(previous_ticket),
+            after=_audit_ticket_view(ticket),
+            api_key=(
+                str(api_key_record.get("name") or api_key_record.get("id"))
+                if api_key_record
+                else None
+            ),
+        )
+
+    current_user = actor.get("user")
+    detail_user = current_user or {"id": None, "is_super_admin": False}
+    return await _build_ticket_detail(int(ticket["id"]), detail_user)
+
+
+@router.get("/{ticket_id}", response_model=TicketDetail)
+async def get_ticket(
+    ticket_id: int,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketDetail:
+    current_user: dict | None = actor.get("user")
+    api_key_record: dict | None = actor.get("api_key")
+    # API key requests get full helpdesk access via a synthetic super-admin user dict
+    effective_user = (
+        current_user if current_user else {"id": None, "is_super_admin": True}
+    )
+    return await _build_ticket_detail(ticket_id, effective_user)
+
+
+@router.put("/{ticket_id}", response_model=TicketDetail)
+async def update_ticket(
+    ticket_id: int,
+    payload: TicketUpdate,
+    request: Request,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketDetail:
+    current_user: dict | None = actor.get("user")
+    api_key_record: dict | None = actor.get("api_key")
+    # For session users, enforce helpdesk technician permission
+    if current_user is not None:
+        if not current_user.get("is_super_admin"):
+            user_id = current_user.get("id")
+            try:
+                user_id_int = int(user_id)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Helpdesk technician privileges required",
+                ) from None
+            has_permission = await membership_repo.user_has_permission(
+                user_id_int, tickets_service.HELPDESK_PERMISSION_KEY
+            )
+            if not has_permission:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Helpdesk technician privileges required",
+                )
+    # API key auth gets full access; build an effective user for downstream helpers
+    effective_user = (
+        current_user if current_user else {"id": None, "is_super_admin": True}
+    )
+    existing = await tickets_repo.get_ticket(ticket_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    fields = payload.model_dump(exclude_unset=True)
+    description_marker = object()
+    description_value = fields.pop("description", description_marker)
+    if "status" in fields and fields["status"] is not None:
+        try:
+            fields["status"] = await tickets_service.validate_status_choice(
+                fields["status"],
+                allow_hidden=bool(effective_user.get("is_super_admin")),
+            )
+        except ValueError as exc:
+            error_id = new_error_id()
+            log_exception_with_error_id(
+                "Ticket status validation failed",
+                error_id=error_id,
+                route="tickets.update_ticket",
+                ticket_id=ticket_id,
+                requested_status=fields["status"],
+            )
+            raise build_client_http_error(
+                status.HTTP_400_BAD_REQUEST,
+                "Invalid ticket status.",
+                error_id=error_id,
+            ) from exc
+    if "subject" in fields and fields["subject"] is not None:
+        fields["subject"] = str(fields["subject"]).strip()
+        if not fields["subject"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ticket subject is required",
+            )
+    if "assigned_user_id" in fields:
+        await _validate_ticket_assignee(fields.get("assigned_user_id"))
+    if fields:
+        await tickets_repo.update_ticket(ticket_id, **fields)
+    if description_value is not description_marker:
+        await tickets_service.update_ticket_description(ticket_id, description_value)
+    try:
+        await tickets_service.refresh_ticket_ai_summary(ticket_id)
+    except RuntimeError:
+        pass
+    await tickets_service.refresh_ticket_ai_tags(ticket_id)
+    await tickets_service.broadcast_ticket_event(action="updated", ticket_id=ticket_id)
+    await tickets_service.emit_ticket_updated_event(
+        ticket_id,
+        actor_type="technician" if current_user else "api_key",
+        actor=effective_user,
+    )
+    updated_ticket = await tickets_repo.get_ticket(ticket_id)
+    # Determine the most descriptive audit action: prefer status_change /
+    # assign over the generic update so the audit log reflects intent.
+    audit_action = "ticket.update"
+    if "status" in fields and existing.get("status") != fields.get("status"):
+        audit_action = "ticket.status_change"
+    elif "assigned_user_id" in fields and existing.get(
+        "assigned_user_id"
+    ) != fields.get("assigned_user_id"):
+        audit_action = "ticket.assign"
+    if effective_user.get("id") is not None:
+        await audit_service.record(
+            action=audit_action,
+            request=request,
+            user_id=int(effective_user["id"]),
+            entity_type="ticket",
+            entity_id=ticket_id,
+            before=_audit_ticket_view(existing),
+            after=_audit_ticket_view(updated_ticket or existing),
+        )
+    return await _build_ticket_detail(ticket_id, effective_user)
+
+
+@router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_ticket(
+    ticket_id: int,
+    request: Request,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> None:
+    current_user: dict | None = actor.get("user")
+    api_key_record: dict | None = actor.get("api_key")
+    # For session users, require super admin
+    if current_user is not None and not current_user.get("is_super_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin privileges required",
+        )
+    effective_user = (
+        current_user if current_user else {"id": None, "is_super_admin": True}
+    )
+    existing = await tickets_repo.get_ticket(ticket_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    await tickets_repo.delete_ticket(ticket_id)
+    await tickets_service.broadcast_ticket_event(action="deleted", ticket_id=ticket_id)
+    if effective_user.get("id") is not None:
+        await audit_service.record(
+            action="ticket.deleted",
+            request=request,
+            user_id=int(effective_user["id"]),
+            entity_type="ticket",
+            entity_id=ticket_id,
+            before=_audit_ticket_view(existing),
+            after=None,
+        )
+
+
+@router.post(
+    "/import/syncro",
+    response_model=SyncroTicketImportSummary,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def import_syncro_tickets_endpoint(
+    payload: SyncroTicketImportRequest,
+    current_user: dict = Depends(require_super_admin),
+) -> SyncroTicketImportSummary:
+    try:
+        summary = await ticket_importer.import_from_request(
+            mode=payload.mode.value,
+            ticket_id=payload.ticket_id,
+            start_id=payload.start_id,
+            end_id=payload.end_id,
+        )
+    except ValueError as exc:
+        error_id = new_error_id()
+        log_exception_with_error_id(
+            "Syncro import request validation failed",
+            error_id=error_id,
+            route="tickets.import_syncro_tickets",
+        )
+        raise build_client_http_error(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid Syncro import request.",
+            error_id=error_id,
+        ) from exc
+    return SyncroTicketImportSummary(**summary.as_dict())
+
+
+@router.post(
+    "/{ticket_id}/replies",
+    response_model=TicketReplyResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_reply(
+    ticket_id: int,
+    payload: TicketReplyCreate,
+    request: Request,
+    actor: dict = Depends(_resolve_ticket_actor),
+) -> TicketReplyResponse:
+    current_user: dict | None = actor.get("user")
+    api_key_record: dict | None = actor.get("api_key")
+    session: SessionData | None = getattr(request.state, "session", None)
+
+    # Check if this ticket has been merged into another
+    merged_target_id = await tickets_repo.get_merged_target_ticket_id(ticket_id)
+    if merged_target_id and merged_target_id != ticket_id:
+        # Redirect to the merged target ticket
+        ticket_id = merged_target_id
+
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    # Prevent adding time to billed tickets
+    if ticket.get("xero_invoice_number"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot add replies to a billed ticket. This ticket has been invoiced and closed.",
+        )
+
+    has_helpdesk_access = bool(api_key_record)
+    if current_user:
+        has_helpdesk_access = has_helpdesk_access or await _has_helpdesk_permission(
+            current_user
+        )
+
+    author_id = session.user_id if session else None
+    if not has_helpdesk_access and ticket.get("requester_id") != author_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    sanitised_body = sanitize_rich_text(payload.body)
+    if not sanitised_body.has_rich_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reply body cannot be empty.",
+        )
+
+    labour_type_id = payload.labour_type_id if has_helpdesk_access else None
+
+    # If time is being logged but no labour type specified, use the default labour type
+    if (
+        has_helpdesk_access
+        and payload.minutes_spent
+        and payload.minutes_spent > 0
+        and labour_type_id is None
+    ):
+        default_labour = await labour_types_service.get_default_labour_type()
+        if default_labour:
+            labour_type_id = default_labour.get("id")
+
+    if labour_type_id is not None:
+        labour_record = await labour_types_service.get_labour_type(labour_type_id)
+        if not labour_record:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Labour type not found"
+            )
+
+    reply = await tickets_repo.create_reply(
+        ticket_id=ticket_id,
+        author_id=author_id,
+        body=sanitised_body.html,
+        is_internal=payload.is_internal if has_helpdesk_access else False,
+        minutes_spent=payload.minutes_spent if has_helpdesk_access else None,
+        is_billable=payload.is_billable if has_helpdesk_access else False,
+        labour_type_id=labour_type_id,
+    )
+    try:
+        await tickets_service.refresh_ticket_ai_summary(ticket_id)
+    except RuntimeError:
+        pass
+    await tickets_service.refresh_ticket_ai_tags(ticket_id)
+    await tickets_service.emit_ticket_updated_event(
+        ticket_id,
+        actor_type="technician" if has_helpdesk_access else "requester",
+        actor=current_user or api_key_record,
+        reply=reply,
+    )
+    await tickets_service.emit_ticket_replied_event(
+        ticket_id,
+        actor_type="technician" if has_helpdesk_access else "requester",
+        actor=current_user or api_key_record,
+        reply=reply,
+    )
+    updated_ticket = await tickets_repo.get_ticket(ticket_id)
+    ticket_payload = updated_ticket or ticket
+    ticket_response = TicketResponse(**ticket_payload)
+    sanitised_reply_payload = sanitize_rich_text(str(reply.get("body") or ""))
+    reply_payload = {**reply, "body": sanitised_reply_payload.html}
+    minutes_value = reply_payload.get("minutes_spent")
+    minutes_spent = (
+        minutes_value if isinstance(minutes_value, int) and minutes_value >= 0 else None
+    )
+    billable_flag = bool(reply_payload.get("is_billable"))
+    labour_type_name = reply_payload.get("labour_type_name")
+    time_summary = tickets_service.format_reply_time_summary(
+        minutes_spent, billable_flag, labour_type_name
+    )
+    if time_summary:
+        reply_payload["time_summary"] = time_summary
+    await tickets_service.broadcast_ticket_event(action="reply", ticket_id=ticket_id)
+
+    # Push the reply's time entry to Solidtime if the module is enabled and
+    # the reply has tracked minutes. Runs as a background task so the API
+    # response is not blocked on the upstream call.
+    reply_id_int = reply.get("id")
+    if isinstance(reply_id_int, int) and reply_id_int > 0:
+        try:
+            from app.services import solidtime as solidtime_service
+
+            solidtime_service.schedule_reply_sync(reply_id_int)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Solidtime reply sync scheduling failed for reply {}: {}",
+                reply_id_int,
+                exc,
+            )
+
+    # Push public replies on Trello-linked tickets back to the Trello card as comments
+    if not reply.get("is_internal") and ticket_payload.get("module_slug") == "trello":
+        try:
+            from app.repositories import companies as company_repo
+            from app.services import trello as trello_service
+
+            card_id = trello_service.card_id_from_external_reference(
+                ticket_payload.get("external_reference")
+            )
+            if card_id:
+                trello_company: dict[str, Any] | None = None
+                trello_company_id = ticket_payload.get("company_id")
+                if trello_company_id is not None:
+                    try:
+                        trello_company = await company_repo.get_company_by_id(
+                            int(trello_company_id)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                actor_record = current_user or {}
+                first_name = str(actor_record.get("first_name") or "").strip()
+                last_name = str(actor_record.get("last_name") or "").strip()
+                author_parts = [p for p in (first_name, last_name) if p]
+                author_display = (
+                    " ".join(author_parts)
+                    if author_parts
+                    else str(
+                        actor_record.get("email")
+                        or (
+                            api_key_record.get("description")
+                            if api_key_record
+                            else "API"
+                        )
+                    )
+                )
+                await trello_service.post_reply_comment(
+                    card_id,
+                    author_display,
+                    sanitised_reply_payload.html,
+                    company=trello_company,
+                )
+        except Exception as exc:
+            logger.debug("Trello reply sync failed for ticket {}: {}", ticket_id, exc)
+
+    # IMPORTANT: never store the reply body in the audit log. We capture only
+    # metadata (id, author, visibility, length) so admins can confirm a reply
+    # was made without the audit_logs table mirroring potentially sensitive
+    # customer correspondence. The "body" key is included in
+    # sensitive_extra_keys so the redaction helper masks it even if a future
+    # change accidentally adds it to the snapshot.
+    reply_metadata: dict[str, object] = {
+        "reply_id": reply.get("id"),
+        "author_id": author_id,
+        "is_internal": bool(reply.get("is_internal")),
+        "channel": "internal" if reply.get("is_internal") else "public",
+        "minutes_spent": reply.get("minutes_spent"),
+        "is_billable": bool(reply.get("is_billable")),
+    }
+    if api_key_record:
+        reply_metadata["api_key_id"] = api_key_record.get("id")
+        reply_metadata["api_key_prefix"] = api_key_record.get("key_prefix")
+    reply_metadata.update(summarise_reply_body(sanitised_body.html))
+    await audit_service.record(
+        action="ticket.replied",
+        request=request,
+        user_id=int(author_id) if author_id is not None else None,
+        entity_type="ticket",
+        entity_id=ticket_id,
+        before=None,
+        after=None,
+        metadata=reply_metadata,
+        api_key=str(api_key_record.get("key_prefix")) if api_key_record else None,
+        sensitive_extra_keys=("body", "html", "text", "content"),
+    )
+    return TicketReplyResponse(
+        ticket=ticket_response, reply=TicketReply(**reply_payload)
+    )
+
+
+@router.patch("/{ticket_id}/replies/{reply_id}", response_model=TicketReplyResponse)
+async def update_reply_time_entry(
+    ticket_id: int,
+    reply_id: int,
+    payload: TicketReplyTimeUpdate,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketReplyResponse:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    # Prevent updating time on billed tickets
+    if ticket.get("xero_invoice_number"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot update time entries on a billed ticket. This ticket has been invoiced and closed.",
+        )
+
+    reply = await tickets_repo.get_reply_by_id(reply_id)
+    if not reply or reply.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Reply not found"
+        )
+
+    fields_set = payload.model_fields_set
+    update_kwargs: dict[str, Any] = {}
+    if "minutes_spent" in fields_set:
+        update_kwargs["minutes_spent"] = payload.minutes_spent
+    if "is_billable" in fields_set and payload.is_billable is not None:
+        update_kwargs["is_billable"] = payload.is_billable
+    if "labour_type_id" in fields_set:
+        if payload.labour_type_id is None:
+            update_kwargs["labour_type_id"] = None
+        else:
+            labour_record = await labour_types_service.get_labour_type(
+                payload.labour_type_id
+            )
+            if not labour_record:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Labour type not found",
+                )
+            update_kwargs["labour_type_id"] = payload.labour_type_id
+    if not update_kwargs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide minutes_spent or is_billable to update the reply.",
+        )
+
+    updated = await tickets_repo.update_reply(reply_id, **update_kwargs)
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Reply not found"
+        )
+
+    minutes_value = updated.get("minutes_spent")
+    minutes_spent = (
+        minutes_value if isinstance(minutes_value, int) and minutes_value >= 0 else None
+    )
+    billable_flag = bool(updated.get("is_billable"))
+    labour_type_name = updated.get("labour_type_name")
+    time_summary = tickets_service.format_reply_time_summary(
+        minutes_spent, billable_flag, labour_type_name
+    )
+    reply_payload = {
+        **updated,
+        "minutes_spent": minutes_spent,
+        "is_billable": billable_flag,
+    }
+    if time_summary:
+        reply_payload["time_summary"] = time_summary
+
+    await tickets_service.emit_ticket_updated_event(
+        ticket_id,
+        actor_type="technician",
+        actor=current_user,
+    )
+
+    # Push the updated time entry to Solidtime if the module is enabled.
+    try:
+        from app.services import solidtime as solidtime_service
+
+        solidtime_service.schedule_reply_sync(int(reply_id))
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.debug(
+            "Solidtime reply update sync scheduling failed for reply {}: {}",
+            reply_id,
+            exc,
+        )
+
+    ticket_payload = TicketResponse(**ticket)
+    return TicketReplyResponse(
+        ticket=ticket_payload, reply=TicketReply(**reply_payload)
+    )
+
+
+@router.put("/{ticket_id}/watchers", response_model=TicketDetail)
+async def update_watchers(
+    ticket_id: int,
+    payload: TicketWatcherUpdate,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketDetail:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    await tickets_repo.replace_watchers(ticket_id, payload.user_ids, payload.emails)
+    return await _build_ticket_detail(ticket_id, current_user)
+
+
+@router.post(
+    "/{ticket_id}/watchers/email",
+    response_model=TicketDetail,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_watcher_by_email(
+    ticket_id: int,
+    request: Request,
+    email: str = Query(..., description="Email address of the watcher"),
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketDetail:
+    """Add a watcher to a ticket by email address."""
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    email_normalized = email.strip().lower()
+    if not email_normalized or "@" not in email_normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid email address"
+        )
+
+    await tickets_repo.add_watcher(ticket_id, email=email_normalized)
+    await audit_service.record(
+        action="ticket.watcher.add",
+        request=request,
+        user_id=int(current_user["id"]),
+        entity_type="ticket",
+        entity_id=ticket_id,
+        before=None,
+        after=None,
+        metadata={"watcher_email": email_normalized},
+    )
+    return await _build_ticket_detail(ticket_id, current_user)
+
+
+@router.post(
+    "/{ticket_id}/watchers/{user_id}",
+    response_model=TicketDetail,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_watcher(
+    ticket_id: int,
+    user_id: int,
+    request: Request,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketDetail:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    watcher_user = await user_repo.get_user_by_id(user_id)
+    if not watcher_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Watcher user not found"
+        )
+
+    await tickets_repo.add_watcher(ticket_id, user_id=user_id)
+    await audit_service.record(
+        action="ticket.watcher.add",
+        request=request,
+        user_id=int(current_user["id"]),
+        entity_type="ticket",
+        entity_id=ticket_id,
+        before=None,
+        after=None,
+        metadata={"watcher_user_id": user_id},
+    )
+    return await _build_ticket_detail(ticket_id, current_user)
+
+
+@router.delete(
+    "/{ticket_id}/watchers/{user_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def remove_watcher(
+    ticket_id: int,
+    user_id: int,
+    request: Request,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> None:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+    await tickets_repo.remove_watcher(ticket_id, user_id=user_id)
+    await audit_service.record(
+        action="ticket.watcher.remove",
+        request=request,
+        user_id=int(current_user["id"]),
+        entity_type="ticket",
+        entity_id=ticket_id,
+        before=None,
+        after=None,
+        metadata={"watcher_user_id": user_id},
+    )
+
+
+@router.delete(
+    "/{ticket_id}/watchers/email/{email:path}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def remove_watcher_by_email(
+    ticket_id: int,
+    email: str,
+    request: Request,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> None:
+    """Remove a watcher from a ticket by email address."""
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    email_normalized = email.strip().lower()
+    await tickets_repo.remove_watcher(ticket_id, email=email_normalized)
+    await audit_service.record(
+        action="ticket.watcher.remove",
+        request=request,
+        user_id=int(current_user["id"]),
+        entity_type="ticket",
+        entity_id=ticket_id,
+        before=None,
+        after=None,
+        metadata={"watcher_email": email_normalized},
+    )
+
+
+@router.get("/shipment-watch/detect")
+async def detect_shipment_provider(
+    url: str = Query(..., min_length=1, max_length=500),
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> dict[str, Any]:
+    try:
+        shipment_watch_service.validate_tracking_url(url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from None
+    provider = await shipment_watch_service.detect_provider_slug(url)
+    return {"provider": provider, "supported": bool(provider)}
+
+
+@router.get("/{ticket_id}/shipment-watch")
+async def get_shipment_watch(
+    ticket_id: int,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> dict[str, Any]:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+    watch = await shipment_watch_service.get_watch_for_ticket(ticket_id)
+    if not watch:
+        return {"watch": None}
+    return {
+        "watch": shipment_watch_service.TicketShipmentWatchResponse.model_validate(
+            watch
+        ).model_dump()
+    }
+
+
+@router.put("/{ticket_id}/shipment-watch")
+async def upsert_shipment_watch(
+    ticket_id: int,
+    payload: shipment_watch_service.TicketShipmentWatchPayload,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> dict[str, Any]:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+    try:
+        watch = await shipment_watch_service.upsert_watch(
+            ticket_id=ticket_id,
+            tracking_url=payload.tracking_url,
+            poll_interval_seconds=payload.poll_interval_seconds,
+            active=payload.active,
+            public_comments_enabled=payload.public_comments_enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from None
+    return {
+        "watch": shipment_watch_service.TicketShipmentWatchResponse.model_validate(
+            watch
+        ).model_dump()
+    }
+
+
+@router.get("/labour-types", response_model=LabourTypeListResponse)
+async def list_labour_types_endpoint(
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> LabourTypeListResponse:
+    labour_types = await labour_types_service.list_labour_types()
+    items = [
+        LabourTypeModel(
+            id=int(item.get("id")),
+            code=str(item.get("code") or ""),
+            name=str(item.get("name") or ""),
+            rate=item.get("rate"),
+            is_default=bool(item.get("is_default", False)),
+            created_at=item.get("created_at"),
+            updated_at=item.get("updated_at"),
+        )
+        for item in labour_types
+        if item.get("id") is not None
+    ]
+    return LabourTypeListResponse(labour_types=items)
+
+
+@router.post(
+    "/labour-types", response_model=LabourTypeModel, status_code=status.HTTP_201_CREATED
+)
+async def create_labour_type_endpoint(
+    payload: LabourTypeCreateRequest,
+    current_user: dict = Depends(require_super_admin),
+) -> LabourTypeModel:
+    try:
+        record = await labour_types_service.create_labour_type(
+            code=payload.code, name=payload.name, rate=payload.rate
+        )
+    except ValueError as exc:
+        error_id = new_error_id()
+        log_exception_with_error_id(
+            "Labour type validation failed",
+            error_id=error_id,
+            route="tickets.create_labour_type",
+        )
+        raise build_client_http_error(
+            status.HTTP_400_BAD_REQUEST,
+            "Unable to create labour type.",
+            error_id=error_id,
+        ) from exc
+    return LabourTypeModel(**record)
+
+
+@router.put("/labour-types/{labour_type_id}", response_model=LabourTypeModel)
+async def update_labour_type_endpoint(
+    labour_type_id: int,
+    payload: LabourTypeUpdateRequest,
+    current_user: dict = Depends(require_super_admin),
+) -> LabourTypeModel:
+    try:
+        record = await labour_types_service.update_labour_type(
+            labour_type_id,
+            code=payload.code,
+            name=payload.name,
+            rate=payload.rate,
+        )
+    except ValueError as exc:
+        error_id = new_error_id()
+        log_exception_with_error_id(
+            "Labour type validation failed",
+            error_id=error_id,
+            route="tickets.update_labour_type",
+            labour_type_id=labour_type_id,
+        )
+        raise build_client_http_error(
+            status.HTTP_400_BAD_REQUEST,
+            "Unable to update labour type.",
+            error_id=error_id,
+        ) from exc
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Labour type not found"
+        )
+    return LabourTypeModel(**record)
+
+
+@router.delete("/labour-types/{labour_type_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_labour_type_endpoint(
+    labour_type_id: int,
+    current_user: dict = Depends(require_super_admin),
+) -> None:
+    existing = await labour_types_service.get_labour_type(labour_type_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Labour type not found"
+        )
+    await labour_types_service.delete_labour_type(labour_type_id)
+
+
+@router.get("/{ticket_id}/tasks", response_model=TicketTaskListResponse)
+async def list_ticket_tasks(
+    ticket_id: int,
+    current_user: dict = Depends(get_current_user),
+) -> TicketTaskListResponse:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+    requester_id = ticket.get("requester_id")
+    current_user_id = current_user.get("id")
+    try:
+        current_user_id_int = int(current_user_id)
+    except (TypeError, ValueError):
+        current_user_id_int = None
+
+    if not has_helpdesk_access:
+        if requester_id != current_user_id_int:
+            is_watcher = False
+            if current_user_id_int is not None:
+                is_watcher = await tickets_repo.is_ticket_watcher(
+                    ticket_id, current_user_id_int
+                )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+                )
+
+    tasks = await ticket_tasks_repo.list_tasks(ticket_id)
+    return TicketTaskListResponse(items=[TicketTask(**task) for task in tasks])
+
+
+@router.post(
+    "/{ticket_id}/tasks", response_model=TicketTask, status_code=status.HTTP_201_CREATED
+)
+async def create_ticket_task(
+    ticket_id: int,
+    payload: TicketTaskCreate,
+    current_user: dict = Depends(get_current_user),
+) -> TicketTask:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+    requester_id = ticket.get("requester_id")
+    current_user_id = current_user.get("id")
+    try:
+        current_user_id_int = int(current_user_id)
+    except (TypeError, ValueError):
+        current_user_id_int = None
+
+    if not has_helpdesk_access:
+        if requester_id != current_user_id_int:
+            is_watcher = False
+            if current_user_id_int is not None:
+                is_watcher = await tickets_repo.is_ticket_watcher(
+                    ticket_id, current_user_id_int
+                )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+                )
+
+    task = await ticket_tasks_repo.create_task(
+        ticket_id=ticket_id,
+        task_name=payload.task_name,
+        sort_order=payload.sort_order,
+    )
+    return TicketTask(**task)
+
+
+@router.put("/{ticket_id}/tasks/{task_id}", response_model=TicketTask)
+async def update_ticket_task(
+    ticket_id: int,
+    task_id: int,
+    payload: TicketTaskUpdate,
+    session: SessionData = Depends(get_current_session),
+    current_user: dict = Depends(get_current_user),
+) -> TicketTask:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    task = await ticket_tasks_repo.get_task(task_id)
+    if not task or task.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+    requester_id = ticket.get("requester_id")
+    current_user_id = current_user.get("id")
+    try:
+        current_user_id_int = int(current_user_id)
+    except (TypeError, ValueError):
+        current_user_id_int = None
+
+    if not has_helpdesk_access:
+        if requester_id != current_user_id_int:
+            is_watcher = False
+            if current_user_id_int is not None:
+                is_watcher = await tickets_repo.is_ticket_watcher(
+                    ticket_id, current_user_id_int
+                )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+                )
+
+    update_kwargs = {}
+    if payload.task_name is not None:
+        update_kwargs["task_name"] = payload.task_name
+    if payload.is_completed is not None:
+        update_kwargs["is_completed"] = payload.is_completed
+        if payload.is_completed:
+            update_kwargs["completed_by"] = session.user_id
+    if payload.sort_order is not None:
+        update_kwargs["sort_order"] = payload.sort_order
+
+    updated_task = await ticket_tasks_repo.update_task(task_id, **update_kwargs)
+    if not updated_task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    return TicketTask(**updated_task)
+
+
+@router.delete("/{ticket_id}/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_ticket_task(
+    ticket_id: int,
+    task_id: int,
+    current_user: dict = Depends(get_current_user),
+) -> None:
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    task = await ticket_tasks_repo.get_task(task_id)
+    if not task or task.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+    requester_id = ticket.get("requester_id")
+    current_user_id = current_user.get("id")
+    try:
+        current_user_id_int = int(current_user_id)
+    except (TypeError, ValueError):
+        current_user_id_int = None
+
+    if not has_helpdesk_access:
+        if requester_id != current_user_id_int:
+            is_watcher = False
+            if current_user_id_int is not None:
+                is_watcher = await tickets_repo.is_ticket_watcher(
+                    ticket_id, current_user_id_int
+                )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+                )
+
+    await ticket_tasks_repo.delete_task(task_id)
+
+
+# ==================== Ticket Attachments ====================
+
+
+@router.get("/{ticket_id}/attachments", response_model=TicketAttachmentListResponse)
+async def list_ticket_attachments(
+    ticket_id: int,
+    current_user: dict = Depends(get_current_user),
+) -> TicketAttachmentListResponse:
+    """List all attachments for a ticket"""
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+
+    # Check access permissions
+    if not has_helpdesk_access:
+        requester_id = ticket.get("requester_id")
+        current_user_id = current_user.get("id")
+        try:
+            current_user_id_int = int(current_user_id)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+            )
+
+        if requester_id != current_user_id_int:
+            is_watcher = await tickets_repo.is_ticket_watcher(
+                ticket_id, current_user_id_int
+            )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+                )
+
+    # Get attachments
+    if has_helpdesk_access:
+        attachments = await attachments_repo.list_attachments(ticket_id)
+    else:
+        # Non-technicians cannot see restricted attachments
+        attachments = await attachments_repo.list_attachments(
+            ticket_id, access_levels=("open", "closed")
+        )
+
+    return TicketAttachmentListResponse(
+        items=[TicketAttachment(**attachment) for attachment in attachments]
+    )
+
+
+@router.post(
+    "/{ticket_id}/attachments",
+    response_model=TicketAttachment,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_ticket_attachment(
+    ticket_id: int,
+    file: UploadFile = File(...),
+    access_level: str = Query(default="closed"),
+    session: SessionData = Depends(get_current_session),
+    current_user: dict = Depends(get_current_user),
+) -> TicketAttachment:
+    """Upload a file attachment to a ticket"""
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+
+    # Check if user can add attachments
+    if not has_helpdesk_access:
+        requester_id = ticket.get("requester_id")
+        if requester_id != session.user_id:
+            is_watcher = await tickets_repo.is_ticket_watcher(
+                ticket_id, session.user_id
+            )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+                )
+
+    # Validate access level
+    valid_levels = {"open", "closed", "restricted"}
+    if access_level not in valid_levels:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid access level. Must be one of: {', '.join(valid_levels)}",
+        )
+
+    # Only helpdesk technicians can set restricted or open access
+    if not has_helpdesk_access and access_level in ("restricted", "open"):
+        access_level = "closed"
+
+    # Save the file
+    try:
+        attachment = await attachments_service.save_uploaded_file(
+            ticket_id=ticket_id,
+            file=file,
+            access_level=access_level,
+            uploaded_by_user_id=session.user_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except IOError as e:
+        log_error(f"Failed to upload attachment: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save file",
+        )
+
+    return TicketAttachment(**attachment)
+
+
+@router.get("/{ticket_id}/attachments/{attachment_id}/download")
+async def download_ticket_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    current_user: dict = Depends(get_current_user),
+    preview: bool = Query(default=False),
+):
+    """Download a ticket attachment (requires authentication)"""
+    attachment = await attachments_repo.get_attachment(attachment_id)
+    if not attachment or attachment.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    has_helpdesk_access = await _has_helpdesk_permission(current_user)
+    access_level = attachment.get("access_level")
+
+    # Check access permissions
+    if access_level == "restricted" and not has_helpdesk_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+        )
+
+    if access_level == "closed" and not has_helpdesk_access:
+        requester_id = ticket.get("requester_id")
+        current_user_id = current_user.get("id")
+        try:
+            current_user_id_int = int(current_user_id)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+            )
+
+        if requester_id != current_user_id_int:
+            is_watcher = await tickets_repo.is_ticket_watcher(
+                ticket_id, current_user_id_int
+            )
+            if not is_watcher:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+                )
+
+    # Get file path. Email ingestion previously wrote files to the legacy
+    # static uploads directory while records pointed at ticket attachments.
+    # Prefer private storage, but fall back so existing requester-reply
+    # attachments remain downloadable after the storage move.
+    filename = attachment.get("filename")
+    file_path = attachments_service.get_attachment_file_path(filename)
+    if not file_path.exists():
+        legacy_file_path = attachments_service.get_legacy_attachment_file_path(filename)
+        if legacy_file_path.exists():
+            file_path = legacy_file_path
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            )
+
+    original_filename = attachment.get("original_filename") or "download"
+    disposition = "inline" if preview else "attachment"
+    return FileResponse(
+        path=file_path,
+        filename=original_filename,
+        media_type=attachment.get("mime_type") or "application/octet-stream",
+        content_disposition_type=disposition,
+    )
+
+
+@router.get("/attachments/open/{token}")
+async def download_open_attachment(token: str):
+    """Download an attachment with an open access token (no authentication required)"""
+    # Verify token
+    attachment_id = attachments_service.verify_open_access_token(token)
+    if not attachment_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or expired token"
+        )
+
+    attachment = await attachments_repo.get_attachment(attachment_id)
+    if not attachment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+
+    # Verify this is an open access attachment
+    if attachment.get("access_level") != "open":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+        )
+
+    # Get file path. Email ingestion previously wrote files to the legacy
+    # static uploads directory while records pointed at ticket attachments.
+    # Prefer private storage, but fall back so existing requester-reply
+    # attachments remain downloadable after the storage move.
+    filename = attachment.get("filename")
+    file_path = attachments_service.get_attachment_file_path(filename)
+    if not file_path.exists():
+        legacy_file_path = attachments_service.get_legacy_attachment_file_path(filename)
+        if legacy_file_path.exists():
+            file_path = legacy_file_path
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            )
+
+    return FileResponse(
+        path=file_path,
+        filename=attachment.get("original_filename"),
+        media_type=attachment.get("mime_type") or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{attachment.get("original_filename", "download")}"'
+        },
+    )
+
+
+@router.patch(
+    "/{ticket_id}/attachments/{attachment_id}", response_model=TicketAttachment
+)
+async def update_ticket_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    payload: TicketAttachmentUpdate,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketAttachment:
+    """Update attachment metadata (e.g., access level) - technicians only"""
+    attachment = await attachments_repo.get_attachment(attachment_id)
+    if not attachment or attachment.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+
+    fields = payload.model_dump(exclude_unset=True)
+    if fields:
+        await attachments_repo.update_attachment(attachment_id, **fields)
+
+    updated_attachment = await attachments_repo.get_attachment(attachment_id)
+    if not updated_attachment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+
+    return TicketAttachment(**updated_attachment)
+
+
+@router.delete(
+    "/{ticket_id}/attachments/{attachment_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_ticket_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> None:
+    """Delete a ticket attachment - technicians only"""
+    attachment = await attachments_repo.get_attachment(attachment_id)
+    if not attachment or attachment.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+
+    try:
+        await attachments_service.delete_attachment_file(attachment)
+    except Exception as e:
+        log_error(f"Failed to delete attachment: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete attachment",
+        )
+
+
+@router.post("/{ticket_id}/attachments/{attachment_id}/blocklist")
+async def blocklist_ticket_attachment(
+    ticket_id: int,
+    attachment_id: int,
+    request: Request,
+    remove_existing: bool = Query(default=False),
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> dict[str, Any]:
+    """Block matching attachment bytes and discard this attachment."""
+    attachment = await attachments_repo.get_attachment(attachment_id)
+    if not attachment or attachment.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+    if remove_existing and not current_user.get("is_super_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only super admins can remove matching historical attachments",
+        )
+    try:
+        entry, removed = await attachments_service.block_attachment(
+            attachment,
+            created_by_user_id=current_user.get("id"),
+            remove_existing=remove_existing,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    await audit_service.record(
+        action="ticket.attachment_blocked",
+        request=request,
+        user_id=int(current_user["id"]),
+        entity_type="ticket_attachment_blocklist",
+        entity_id=int(entry["id"]),
+        after={"sha256_hash": entry["sha256_hash"]},
+        metadata={
+            "ticket_id": ticket_id,
+            "attachment_id": attachment_id,
+            "removed": removed,
+        },
+    )
+    return {"blocklist_id": entry["id"], "removed": removed}
+
+
+@router.get("/{ticket_id}/attachments/{attachment_id}/token")
+async def get_open_access_token(
+    ticket_id: int,
+    attachment_id: int,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> dict[str, str]:
+    """Generate an open access token for an attachment - technicians only"""
+    attachment = await attachments_repo.get_attachment(attachment_id)
+    if not attachment or attachment.get("ticket_id") != ticket_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found"
+        )
+
+    if attachment.get("access_level") != "open":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Can only generate tokens for open access attachments",
+        )
+
+    token = attachments_service.generate_open_access_token(attachment_id)
+    return {"token": token, "url": f"/api/tickets/attachments/open/{token}"}
+
+
+@router.post(
+    "/{ticket_id}/split",
+    response_model=TicketSplitResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def split_ticket(
+    ticket_id: int,
+    payload: TicketSplitRequest,
+    request: Request,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketSplitResponse:
+    """
+    Split a ticket by moving selected replies to a new ticket.
+    The new ticket will have the same company and requester as the original.
+    Requires helpdesk technician permission.
+    """
+    # Validate original ticket exists
+    original_ticket = await tickets_repo.get_ticket(ticket_id)
+    if not original_ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    # Perform the split (validation happens in service layer)
+    try:
+        original, new_ticket, moved_count = await tickets_service.split_ticket(
+            original_ticket_id=ticket_id,
+            reply_ids=payload.reply_ids,
+            new_subject=payload.new_subject,
+        )
+    except ValueError as exc:
+        error_id = new_error_id()
+        log_exception_with_error_id(
+            "Ticket split validation failed",
+            error_id=error_id,
+            route="tickets.split_ticket",
+            ticket_id=ticket_id,
+        )
+        raise build_client_http_error(
+            status.HTTP_400_BAD_REQUEST,
+            "Unable to split ticket with the requested replies.",
+            error_id=error_id,
+        ) from exc
+
+    if not original or not new_ticket:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to split ticket",
+        )
+
+    await audit_service.record(
+        action="ticket.split",
+        request=request,
+        user_id=int(current_user["id"]),
+        entity_type="ticket",
+        entity_id=ticket_id,
+        before=_audit_ticket_view(original_ticket),
+        after=_audit_ticket_view(original),
+        metadata={
+            "new_ticket_id": new_ticket.get("id"),
+            "reply_ids": payload.reply_ids,
+            "moved_reply_count": moved_count,
+        },
+    )
+
+    return TicketSplitResponse(
+        original_ticket=TicketResponse(**original),
+        new_ticket=TicketResponse(**new_ticket),
+        moved_reply_count=moved_count,
+    )
+
+
+@router.post("/merge", response_model=TicketMergeResponse)
+async def merge_tickets(
+    payload: TicketMergeRequest,
+    current_user: dict = Depends(require_helpdesk_technician),
+) -> TicketMergeResponse:
+    """
+    Merge multiple tickets into one target ticket.
+    All replies and time entries are moved to the target ticket.
+    Source tickets are marked as closed and merged.
+    Requires helpdesk technician permission.
+    """
+    moved_time_entry_count = 0
+    for source_ticket_id in payload.ticket_ids:
+        if source_ticket_id != payload.target_ticket_id:
+            moved_time_entry_count += await tickets_repo.count_time_entries(
+                source_ticket_id
+            )
+
+    # Perform the merge (validation happens in service layer)
+    try:
+        merged_ticket, merged_ids, moved_count = await tickets_service.merge_tickets(
+            ticket_ids=payload.ticket_ids,
+            target_ticket_id=payload.target_ticket_id,
+        )
+    except ValueError as exc:
+        error_id = new_error_id()
+        log_exception_with_error_id(
+            "Ticket merge validation failed",
+            error_id=error_id,
+            route="tickets.merge_tickets",
+            target_ticket_id=payload.target_ticket_id,
+        )
+        raise build_client_http_error(
+            status.HTTP_400_BAD_REQUEST,
+            "Unable to merge tickets with the requested inputs.",
+            error_id=error_id,
+        ) from exc
+
+    if not merged_ticket:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to merge tickets",
+        )
+
+    return TicketMergeResponse(
+        merged_ticket=TicketResponse(**merged_ticket),
+        merged_ticket_ids=merged_ids,
+        moved_reply_count=moved_count,
+        moved_time_entry_count=moved_time_entry_count,
+    )

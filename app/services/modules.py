@@ -1,0 +1,7472 @@
+from __future__ import annotations
+
+import array
+import base64
+import hashlib
+import re
+import json
+import os
+import string
+import wave
+from defusedxml import ElementTree as DefusedET
+from defusedxml.common import DefusedXmlException
+from html import unescape
+from html.parser import HTMLParser
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import asyncio
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Mapping
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from dotenv import load_dotenv
+from loguru import logger
+
+# Load .env file before accessing environment variables
+# This ensures XERO_ and other env vars are available when DEFAULT_MODULES is initialized
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_env_path = _PROJECT_ROOT / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
+
+from app.core.database import db
+from app.repositories import companies as company_repo
+from app.repositories import integration_modules as module_repo
+from app.repositories import scheduled_tasks as scheduled_tasks_repo
+from app.repositories import tickets as tickets_repo
+from app.repositories import webhook_events as webhook_repo
+from app.security.encryption import decrypt_secret, encrypt_secret
+from app.services import call_recordings as call_recordings_service
+from app.services import email as email_service, webhook_monitor
+from app.services import unifi_talk as unifi_talk_service
+from app.services.realtime import RefreshNotifier, refresh_notifier
+from app.services import tickets as tickets_service
+from app.core.module_capabilities import COMMANDS_BY_MODULE, MODULE_CAPABILITIES
+
+REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+
+_SMART_ATTACHMENT_POLL_ATTEMPTS = 5
+_SMART_ATTACHMENT_POLL_DELAY_SECONDS = 0.5
+
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+_TACTICALRMM_RATE_LIMIT_LOCK = asyncio.Lock()
+_TACTICALRMM_LAST_REQUEST_AT: float | None = None
+_TACTICALRMM_DEFAULT_CALLS_PER_SECOND = 1.0
+
+_XERO_TOKEN_REFRESH_LOCK = asyncio.Lock()
+_XERO_TOKEN_EXPIRY_BUFFER = timedelta(minutes=5)
+_XERO_TOKEN_KEEPALIVE_TASK: asyncio.Task[Any] | None = None
+_XERO_TOKEN_KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60
+_XERO_TOKEN_KEEPALIVE_MIN_INTERVAL_SECONDS = 60 * 60
+
+
+# Module slug constants
+XERO_MODULE_SLUG = "xero"
+
+# Truncation limits for webhook payload logging
+WEBHOOK_PAYLOAD_DESCRIPTION_MAX_LENGTH = 200
+
+CALL_RECORDINGS_PHONE_SYSTEM_TYPES: tuple[str, ...] = (
+    "generic",
+    "grandstream-ucm",
+    "3cx",
+)
+"""Supported phone system types for call recording processing.
+
+The dropdown shown in the call-recordings module configuration uses these
+values. ``generic`` is the default and uses the existing audio-file/title
+based discovery. ``grandstream-ucm`` parses the
+``.rd_files_netdisk_YYYY-MM.csv`` index files produced by Grandstream UCM
+appliances. ``3cx`` is reserved for 3CX-specific processing and currently
+falls back to the generic discovery flow.
+"""
+
+DEFAULT_CHATGPT_TOOLS = [
+    "listTickets",
+    "getTicket",
+    "createTicketReply",
+    "updateTicket",
+]
+
+
+def _default_whisperx_settings() -> dict[str, Any]:
+    """Return WhisperX module defaults sourced from the environment.
+
+    These values are evaluated after the project ``.env`` file is loaded at
+    module import time, allowing operators to configure both ticket attachment
+    and call recording transcription from the same environment keys.
+    """
+
+    return {
+        "base_url": str(os.getenv("WHISPERX_BASE_URL", "")).strip().rstrip("/"),
+        "api_key": str(os.getenv("WHISPERX_API_KEY", "")).strip(),
+        "language": str(os.getenv("WHISPERX_LANGUAGE", "")).strip() or "en",
+        "stereo_split": _ensure_bool(os.getenv("WHISPERX_STEREO_SPLIT"), False),
+    }
+
+
+def _get_tacticalrmm_calls_per_second() -> float:
+    """Return the configured TacticalRMM request rate limit.
+
+    The value is intentionally loaded from the environment at call time so
+    operators can tune ``TACTICALRMM_CALLS_PER_SECOND`` via the ``.env`` file
+    without storing throttling configuration in the encrypted module settings.
+    Invalid, blank, or non-positive values safely fall back to one request per
+    second.
+    """
+    raw_value = os.getenv("TACTICALRMM_CALLS_PER_SECOND", "").strip()
+    if not raw_value:
+        return _TACTICALRMM_DEFAULT_CALLS_PER_SECOND
+    try:
+        calls_per_second = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid TACTICALRMM_CALLS_PER_SECOND value; using default",
+            value=raw_value,
+            default=_TACTICALRMM_DEFAULT_CALLS_PER_SECOND,
+        )
+        return _TACTICALRMM_DEFAULT_CALLS_PER_SECOND
+    if calls_per_second <= 0:
+        logger.warning(
+            "Non-positive TACTICALRMM_CALLS_PER_SECOND value; using default",
+            value=raw_value,
+            default=_TACTICALRMM_DEFAULT_CALLS_PER_SECOND,
+        )
+        return _TACTICALRMM_DEFAULT_CALLS_PER_SECOND
+    return calls_per_second
+
+
+async def _throttle_tacticalrmm_request() -> None:
+    """Serialize TacticalRMM API calls so they respect the configured rate."""
+    global _TACTICALRMM_LAST_REQUEST_AT
+    calls_per_second = _get_tacticalrmm_calls_per_second()
+    min_interval = 1.0 / calls_per_second
+    loop = asyncio.get_running_loop()
+    async with _TACTICALRMM_RATE_LIMIT_LOCK:
+        now = loop.time()
+        if _TACTICALRMM_LAST_REQUEST_AT is not None:
+            wait_seconds = (_TACTICALRMM_LAST_REQUEST_AT + min_interval) - now
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+                now = loop.time()
+        _TACTICALRMM_LAST_REQUEST_AT = now
+
+
+def _hash_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+async def update_xero_tokens(
+    *,
+    refresh_token: str | None = None,
+    access_token: str | None = None,
+    token_expires_at: datetime | None = None,
+    tenant_id: str | None = None,
+) -> None:
+    """Update Xero OAuth tokens in the module settings.
+
+    Args:
+        refresh_token: The refresh token to store (will be encrypted)
+        access_token: The access token to store (will be encrypted)
+        token_expires_at: When the access token expires
+        tenant_id: The Xero tenant ID (string)
+    """
+    module = await module_repo.get_module(XERO_MODULE_SLUG)
+    if not module:
+        logger.error("Xero module not found when attempting to update tokens")
+        return
+
+    settings = dict(module.get("settings") or {})
+
+    # Encrypt and store tokens
+    if refresh_token is not None:
+        settings["refresh_token"] = (
+            encrypt_secret(refresh_token) if refresh_token else ""
+        )
+    if access_token is not None:
+        settings["access_token"] = encrypt_secret(access_token) if access_token else ""
+    if token_expires_at is not None:
+        # Store as ISO format string
+        settings["token_expires_at"] = (
+            token_expires_at.isoformat() if token_expires_at else None
+        )
+    if tenant_id is not None:
+        # Store tenant_id as a string (empty string allowed)
+        settings["tenant_id"] = str(tenant_id)
+
+    await module_repo.update_module(XERO_MODULE_SLUG, settings=settings)
+    logger.info("Updated Xero OAuth tokens")
+
+
+async def get_xero_credentials() -> dict[str, Any] | None:
+    """Get Xero credentials with decrypted tokens.
+
+    Returns:
+        Dictionary with decrypted credentials or None if module not found
+    """
+    module = await get_module(XERO_MODULE_SLUG, redact=False)
+    if not module:
+        return None
+
+    settings = dict(module.get("settings") or {})
+    credentials = {
+        "client_id": settings.get("client_id", ""),
+        "client_secret": settings.get("client_secret", ""),
+        "tenant_id": settings.get("tenant_id", ""),
+        "company_name": settings.get("company_name", ""),
+    }
+
+    company_name_env = str(os.getenv("XERO_COMPANY_NAME", "")).strip()
+    if company_name_env and not credentials["company_name"]:
+        credentials["company_name"] = company_name_env
+
+    # Decrypt tokens if present
+    encrypted_refresh = settings.get("refresh_token", "")
+    encrypted_access = settings.get("access_token", "")
+
+    if encrypted_refresh:
+        try:
+            credentials["refresh_token"] = decrypt_secret(encrypted_refresh)
+        except Exception as exc:
+            logger.error("Failed to decrypt Xero refresh token", error=str(exc))
+            credentials["refresh_token"] = ""
+    else:
+        credentials["refresh_token"] = ""
+
+    if encrypted_access:
+        try:
+            credentials["access_token"] = decrypt_secret(encrypted_access)
+        except Exception as exc:
+            logger.error("Failed to decrypt Xero access token", error=str(exc))
+            credentials["access_token"] = ""
+    else:
+        credentials["access_token"] = ""
+
+    # Parse token expiry
+    token_expires_at_str = settings.get("token_expires_at")
+    if token_expires_at_str:
+        try:
+            credentials["token_expires_at"] = datetime.fromisoformat(
+                token_expires_at_str
+            )
+        except (ValueError, TypeError):
+            credentials["token_expires_at"] = None
+    else:
+        credentials["token_expires_at"] = None
+
+    return credentials
+
+
+async def refresh_xero_access_token() -> str:
+    """Refresh the Xero access token using the stored refresh token.
+
+    Returns:
+        The new access token
+
+    Raises:
+        RuntimeError: If credentials are missing or token refresh fails
+    """
+    credentials = await get_xero_credentials()
+    if not credentials:
+        raise RuntimeError("Xero credentials not configured")
+
+    client_id = credentials.get("client_id", "").strip()
+    client_secret = credentials.get("client_secret", "").strip()
+    refresh_token = credentials.get("refresh_token", "").strip()
+
+    if not (client_id and client_secret and refresh_token):
+        raise RuntimeError("Xero OAuth credentials incomplete")
+
+    # Exchange refresh token for new access token
+    token_url = "https://identity.xero.com/connect/token"
+    token_data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(
+                token_url,
+                data=token_data,
+                auth=(client_id, client_secret),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response.raise_for_status()
+            token_response = response.json()
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Failed to refresh Xero access token",
+            status_code=exc.response.status_code if exc.response else None,
+            error=exc.response.text if exc.response else str(exc),
+        )
+        raise RuntimeError("Failed to refresh Xero access token") from exc
+    except Exception as exc:
+        logger.error("Error refreshing Xero access token", error=str(exc))
+        raise RuntimeError("Failed to refresh Xero access token") from exc
+
+    access_token = token_response.get("access_token")
+    new_refresh_token = token_response.get("refresh_token")
+    expires_in = token_response.get("expires_in")
+
+    if not access_token:
+        raise RuntimeError("No access token in Xero response")
+
+    # Calculate expiry time
+    expires_at = None
+    if isinstance(expires_in, (int, float)):
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
+
+    # Store the new tokens
+    await update_xero_tokens(
+        access_token=access_token,
+        refresh_token=new_refresh_token if new_refresh_token else refresh_token,
+        token_expires_at=expires_at,
+    )
+
+    logger.info("Successfully refreshed Xero access token")
+    return access_token
+
+
+def _xero_cached_access_token(credentials: Mapping[str, Any] | None) -> str | None:
+    """Return the cached Xero access token when it is safely reusable."""
+    if not credentials:
+        return None
+
+    access_token = str(credentials.get("access_token", "")).strip()
+    token_expires_at = credentials.get("token_expires_at")
+    if not (access_token and isinstance(token_expires_at, datetime)):
+        return None
+
+    if token_expires_at.tzinfo is None:
+        token_expires_at = token_expires_at.replace(tzinfo=timezone.utc)
+
+    if datetime.now(timezone.utc) + _XERO_TOKEN_EXPIRY_BUFFER < token_expires_at:
+        return access_token
+    return None
+
+
+async def acquire_xero_access_token() -> str:
+    """Get a valid Xero access token, refreshing if necessary.
+
+    Returns:
+        A valid access token
+
+    Raises:
+        RuntimeError: If unable to acquire a valid token
+    """
+    credentials = await get_xero_credentials()
+    if not credentials:
+        raise RuntimeError("Xero credentials not configured")
+
+    cached_token = _xero_cached_access_token(credentials)
+    if cached_token:
+        return cached_token
+
+    # Xero rotates refresh tokens. Serialise refreshes and re-read the token
+    # after waiting so a concurrent request does not reuse an already-rotated
+    # refresh token and poison the integration with intermittent invalid_grant
+    # failures.
+    async with _XERO_TOKEN_REFRESH_LOCK:
+        refreshed_credentials = await get_xero_credentials()
+        if not refreshed_credentials:
+            raise RuntimeError("Xero credentials not configured")
+
+        cached_token = _xero_cached_access_token(refreshed_credentials)
+        if cached_token:
+            return cached_token
+
+        return await refresh_xero_access_token()
+
+
+def _get_xero_token_keepalive_interval_seconds() -> int:
+    """Return how often the background Xero OAuth keepalive should run."""
+    raw_value = str(os.getenv("XERO_TOKEN_KEEPALIVE_INTERVAL_SECONDS", "")).strip()
+    if not raw_value:
+        return _XERO_TOKEN_KEEPALIVE_DEFAULT_INTERVAL_SECONDS
+    try:
+        interval = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid XERO_TOKEN_KEEPALIVE_INTERVAL_SECONDS value; using default",
+            value=raw_value,
+            default=_XERO_TOKEN_KEEPALIVE_DEFAULT_INTERVAL_SECONDS,
+        )
+        return _XERO_TOKEN_KEEPALIVE_DEFAULT_INTERVAL_SECONDS
+    if interval < _XERO_TOKEN_KEEPALIVE_MIN_INTERVAL_SECONDS:
+        logger.warning(
+            "XERO_TOKEN_KEEPALIVE_INTERVAL_SECONDS below minimum; using minimum",
+            value=raw_value,
+            minimum=_XERO_TOKEN_KEEPALIVE_MIN_INTERVAL_SECONDS,
+        )
+        return _XERO_TOKEN_KEEPALIVE_MIN_INTERVAL_SECONDS
+    return interval
+
+
+async def _xero_token_keepalive_once() -> bool:
+    """Refresh/revalidate Xero OAuth when the module has enough credentials.
+
+    Xero access tokens are short lived and refresh tokens are rotated on use. If
+    the integration is idle for an extended period, an unused refresh token can
+    expire before the next scheduled sync. Running this keepalive periodically
+    keeps the stored refresh token current without requiring admins to revisit
+    the OAuth connect flow.
+    """
+    module = await get_module(XERO_MODULE_SLUG, redact=False)
+    if not module or not module.get("enabled", True):
+        return False
+
+    credentials = await get_xero_credentials()
+    if not credentials:
+        return False
+
+    required_fields = ("client_id", "client_secret", "refresh_token")
+    if not all(str(credentials.get(field) or "").strip() for field in required_fields):
+        return False
+
+    await acquire_xero_access_token()
+    return True
+
+
+async def _xero_token_keepalive_loop() -> None:
+    interval_seconds = _get_xero_token_keepalive_interval_seconds()
+    logger.info(
+        "Started Xero OAuth token keepalive task",
+        interval_seconds=interval_seconds,
+    )
+    try:
+        while True:
+            try:
+                refreshed = await _xero_token_keepalive_once()
+                if refreshed:
+                    logger.info("Xero OAuth token keepalive completed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Xero OAuth token keepalive failed", error=str(exc))
+            await asyncio.sleep(interval_seconds)
+    finally:
+        logger.info("Stopped Xero OAuth token keepalive task")
+
+
+def start_xero_token_keepalive() -> None:
+    """Start the background Xero OAuth keepalive task if not already running."""
+    global _XERO_TOKEN_KEEPALIVE_TASK
+    if _XERO_TOKEN_KEEPALIVE_TASK and not _XERO_TOKEN_KEEPALIVE_TASK.done():
+        return
+    _XERO_TOKEN_KEEPALIVE_TASK = asyncio.create_task(_xero_token_keepalive_loop())
+
+
+async def stop_xero_token_keepalive() -> None:
+    """Stop the background Xero OAuth keepalive task."""
+    global _XERO_TOKEN_KEEPALIVE_TASK
+    task = _XERO_TOKEN_KEEPALIVE_TASK
+    if not task:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    _XERO_TOKEN_KEEPALIVE_TASK = None
+
+
+def _merge_settings(
+    defaults: Mapping[str, Any], overrides: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    merged = dict(defaults)
+    if not overrides:
+        return merged
+    for key, value in overrides.items():
+        merged[key] = value
+    return merged
+
+
+def _ensure_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, list):
+        if not value:
+            return default
+        return _ensure_bool(value[-1], default)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return default
+
+
+def _ensure_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        values = value
+    elif isinstance(value, str):
+        values = [value]
+    else:
+        return []
+
+    result: list[str] = []
+    for item in values:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part:
+                result.append(part)
+    return result
+
+
+def _extract_ticket_id_from_email_payload(payload: Mapping[str, Any]) -> int | None:
+    context = payload.get("context")
+    candidates: list[Any] = [payload.get("ticket_id")]
+    if isinstance(context, Mapping):
+        metadata = context.get("metadata")
+        ticket = context.get("ticket")
+        if isinstance(metadata, Mapping):
+            candidates.append(metadata.get("ticket_id"))
+        if isinstance(ticket, Mapping):
+            candidates.extend([ticket.get("id"), ticket.get("ticket_id")])
+    for candidate in candidates:
+        try:
+            ticket_id = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if ticket_id > 0:
+            return ticket_id
+    return None
+
+
+async def _load_ticket_email_attachments(
+    payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Load ticket attachments for automation email modules when possible.
+
+    Explicit payload attachments are respected by callers; this helper only supplies
+    attachments automatically for ticket reply events that include the files uploaded
+    with that reply. Other ticket automations, such as reminders, must not attach
+    every file already stored on the ticket.
+    """
+    ticket_id = _extract_ticket_id_from_email_payload(payload)
+    context = payload.get("context")
+
+    from app.services import ticket_attachments as attachments_service
+
+    attachments: list[Mapping[str, Any]] = []
+    if isinstance(context, Mapping):
+        reply = context.get("reply")
+        if isinstance(reply, Mapping) and isinstance(reply.get("attachments"), list):
+            attachments = [
+                item for item in reply["attachments"] if isinstance(item, Mapping)
+            ]
+
+    if not attachments:
+        return []
+
+    email_attachments: list[dict[str, Any]] = []
+    for attachment in attachments:
+        filename = str(attachment.get("filename") or "").strip()
+        if not filename:
+            continue
+        file_path = attachments_service.get_attachment_file_path(filename)
+        try:
+            content = file_path.read_bytes()
+        except OSError as exc:
+            logger.warning(
+                "Ticket attachment unavailable for automation email",
+                ticket_id=ticket_id,
+                attachment_id=attachment.get("id"),
+                filename=filename,
+                error=str(exc),
+            )
+            continue
+        email_attachments.append(
+            {
+                "filename": str(attachment.get("original_filename") or filename),
+                "content": content,
+                "mime_type": attachment.get("mime_type") or "application/octet-stream",
+            }
+        )
+    return email_attachments
+
+
+def _attachments_for_smtp2go(attachments: list[dict[str, Any]]) -> list[dict[str, str]]:
+    formatted: list[dict[str, str]] = []
+    for attachment in attachments:
+        content = attachment.get("content")
+        if isinstance(content, str):
+            encoded = content
+        elif isinstance(content, bytes):
+            encoded = base64.b64encode(content).decode("ascii")
+        elif isinstance(content, bytearray):
+            encoded = base64.b64encode(bytes(content)).decode("ascii")
+        else:
+            continue
+        formatted.append(
+            {
+                "filename": str(attachment.get("filename") or "attachment"),
+                "fileblob": encoded,
+            }
+        )
+    return formatted
+
+
+def _coerce_int(
+    value: Any, *, minimum: int | None = None, maximum: int | None = None
+) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        integer = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minimum is not None:
+        integer = max(minimum, integer)
+    if maximum is not None:
+        integer = min(maximum, integer)
+    return integer
+
+
+def _parse_nullable_int(value: Any) -> int | None:
+    """Parse an optional integer value from automation payload.
+
+    Handles None, empty string, and the literal string "null" as null values.
+    Returns the parsed integer or None if the value is null or cannot be parsed.
+    """
+    if value is None or value == "" or value == "null":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_boolean(value: Any) -> bool:
+    """Coerce automation JSON/form-style values to a predictable boolean."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().casefold() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _normalise_tool_names(value: Any) -> list[str]:
+    requested = _ensure_list(value)
+    if not requested:
+        return list(DEFAULT_CHATGPT_TOOLS)
+    normalised: list[str] = []
+    for name in requested:
+        candidate = name.strip()
+        if not candidate:
+            continue
+        if candidate not in DEFAULT_CHATGPT_TOOLS:
+            continue
+        if candidate not in normalised:
+            normalised.append(candidate)
+    return normalised or list(DEFAULT_CHATGPT_TOOLS)
+
+
+def _normalise_statuses(value: Any) -> list[str]:
+    statuses = _ensure_list(value)
+    cleaned: list[str] = []
+    for status in statuses:
+        lowered = status.strip().lower()
+        if not lowered:
+            continue
+        if lowered not in cleaned:
+            cleaned.append(lowered)
+    if cleaned:
+        return cleaned
+    return ["open", "pending", "in_progress", "resolved", "closed"]
+
+
+def _default_chatgpt_settings() -> dict[str, Any]:
+    shared_secret = str(os.getenv("CHATGPT_MCP_SHARED_SECRET", "")).strip()
+    shared_secret_hash = _hash_secret(shared_secret) if shared_secret else ""
+    allowed_actions = _normalise_tool_names(os.getenv("CHATGPT_MCP_ALLOWED_ACTIONS"))
+    max_results = (
+        _coerce_int(os.getenv("CHATGPT_MCP_MAX_RESULTS"), minimum=1, maximum=200) or 50
+    )
+    allow_updates = _ensure_bool(os.getenv("CHATGPT_MCP_ALLOW_UPDATES"), False)
+    allowed_statuses = _normalise_statuses(os.getenv("CHATGPT_MCP_ALLOWED_STATUSES"))
+    system_user_id = _coerce_int(os.getenv("CHATGPT_MCP_SYSTEM_USER_ID"))
+    return {
+        "shared_secret_hash": shared_secret_hash,
+        "allowed_actions": allowed_actions,
+        "max_results": max_results,
+        "allow_ticket_updates": allow_updates,
+        "allowed_statuses": allowed_statuses,
+        "system_user_id": system_user_id,
+    }
+
+
+def _default_uptimekuma_settings() -> dict[str, Any]:
+    shared_secret = str(os.getenv("UPTIMEKUMA_SHARED_SECRET", "")).strip()
+    shared_secret_hash = _hash_secret(shared_secret) if shared_secret else ""
+    return {
+        "shared_secret_hash": shared_secret_hash,
+        "sync_service_status": True,
+    }
+
+
+# Tools available to the Ollama MCP server. Read-only by default; write tools
+# (``create_ticket_reply``, ``update_ticket``) must be enabled explicitly via
+# the ``allow_ticket_replies`` / ``allow_ticket_updates`` toggles.
+DEFAULT_OLLAMA_MCP_TOOLS = [
+    "search_tickets",
+    "list_tickets",
+    "get_ticket",
+    "list_ticket_statuses",
+]
+OPTIONAL_OLLAMA_MCP_TOOLS = [
+    "create_ticket_reply",
+    "update_ticket",
+]
+ALL_OLLAMA_MCP_TOOLS = DEFAULT_OLLAMA_MCP_TOOLS + OPTIONAL_OLLAMA_MCP_TOOLS
+
+
+def _normalise_ollama_tool_names(value: Any) -> list[str]:
+    requested = _ensure_list(value)
+    if not requested:
+        return list(DEFAULT_OLLAMA_MCP_TOOLS)
+    normalised: list[str] = []
+    for name in requested:
+        candidate = name.strip()
+        if not candidate or candidate not in ALL_OLLAMA_MCP_TOOLS:
+            continue
+        if candidate not in normalised:
+            normalised.append(candidate)
+    return normalised or list(DEFAULT_OLLAMA_MCP_TOOLS)
+
+
+def _default_ollama_mcp_settings() -> dict[str, Any]:
+    shared_secret = str(os.getenv("OLLAMA_MCP_SHARED_SECRET", "")).strip()
+    shared_secret_hash = _hash_secret(shared_secret) if shared_secret else ""
+    allowed_actions = _normalise_ollama_tool_names(
+        os.getenv("OLLAMA_MCP_ALLOWED_ACTIONS")
+    )
+    max_results = (
+        _coerce_int(os.getenv("OLLAMA_MCP_MAX_RESULTS"), minimum=1, maximum=200) or 25
+    )
+    allow_replies = _ensure_bool(os.getenv("OLLAMA_MCP_ALLOW_REPLIES"), False)
+    allow_updates = _ensure_bool(os.getenv("OLLAMA_MCP_ALLOW_UPDATES"), False)
+    allowed_statuses = _normalise_statuses(os.getenv("OLLAMA_MCP_ALLOWED_STATUSES"))
+    system_user_id = _coerce_int(os.getenv("OLLAMA_MCP_SYSTEM_USER_ID"))
+    include_internal = _ensure_bool(
+        os.getenv("OLLAMA_MCP_INCLUDE_INTERNAL_REPLIES"), False
+    )
+    return {
+        "shared_secret_hash": shared_secret_hash,
+        "allowed_actions": allowed_actions,
+        "max_results": max_results,
+        "allow_ticket_replies": allow_replies,
+        "allow_ticket_updates": allow_updates,
+        "allowed_statuses": allowed_statuses,
+        "system_user_id": system_user_id,
+        "include_internal_replies": include_internal,
+        "server_name": str(os.getenv("OLLAMA_MCP_SERVER_NAME", "")).strip()
+        or "MyPortal Ollama MCP",
+        "server_version": str(os.getenv("OLLAMA_MCP_SERVER_VERSION", "")).strip()
+        or "1.0.0",
+    }
+
+
+def _default_xero_settings() -> dict[str, Any]:
+    def _clean_env(key: str) -> str:
+        return str(os.getenv(key, "")).strip()
+
+    def _format_rate(value: str) -> str:
+        if not value:
+            return ""
+        try:
+            decimal_value = Decimal(value)
+        except (InvalidOperation, ValueError):
+            return ""
+        quantised = decimal_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{quantised:f}"
+
+    return {
+        "client_id": _clean_env("XERO_CLIENT_ID"),
+        "client_secret": _clean_env("XERO_CLIENT_SECRET"),
+        "webhook_key": _clean_env("XERO_WEBHOOK_KEY"),
+        "tenant_id": _clean_env("XERO_TENANT_ID"),
+        # Note: refresh_token is obtained via OAuth2 code flow only (/xero/connect)
+        # and should not be set manually via environment variables
+        "company_name": _clean_env("XERO_COMPANY_NAME"),
+        "default_hourly_rate": _format_rate(_clean_env("XERO_DEFAULT_HOURLY_RATE")),
+        "account_code": _clean_env("XERO_ACCOUNT_CODE") or "400",
+        "tax_type": _clean_env("XERO_TAX_TYPE"),
+        "line_amount_type": _clean_env("XERO_LINE_AMOUNT_TYPE") or "Exclusive",
+        "reference_prefix": _clean_env("XERO_REFERENCE_PREFIX") or "Support",
+        "billable_statuses": _normalise_statuses(_clean_env("XERO_BILLABLE_STATUSES")),
+        "line_item_description_template": _clean_env("XERO_LINE_ITEM_TEMPLATE")
+        or "Ticket {ticket_id}: {ticket_subject} {labour_suffix} ({labour_duration})",
+        "auto_create_products": _ensure_bool(
+            os.getenv("XERO_AUTO_CREATE_PRODUCTS"), True
+        ),
+    }
+
+
+DEFAULT_MODULES: list[dict[str, Any]] = [
+    {
+        "slug": "plausible",
+        "name": "Plausible Analytics",
+        "description": "Privacy-first analytics integration for email tracking and authenticated user pageviews.",
+        "icon": "📊",
+        "settings": {
+            "base_url": "",
+            "site_domain": "",
+            "api_key": "",
+            "track_opens": True,
+            "track_clicks": True,
+            "send_to_plausible": False,
+            "track_pageviews": False,
+            "pepper": "",
+            "send_pii": False,
+        },
+    },
+    {
+        "slug": "syncro",
+        "name": "Syncro",
+        "description": "Synchronise tickets and contacts from SyncroMSP.",
+        "icon": "🧾",
+        "settings": {
+            "base_url": "",
+            "api_key": "",
+            "rate_limit_per_minute": 180,
+            "ticket_status_mappings": [],
+        },
+    },
+    {
+        "slug": "ollama",
+        "name": "Ollama",
+        "description": "Generate AI summaries with Ollama, OpenAI, or OpenAI-compatible llama.cpp servers.",
+        "icon": "🧠",
+        "settings": {
+            "provider": "ollama",
+            "base_url": "http://127.0.0.1:11434",
+            "model": "llama3",
+            "prompt": "",
+            "api_key": "",
+        },
+    },
+    {
+        "slug": "smtp",
+        "name": "Send Email",
+        "description": "Trigger outbound email notifications using the platform SMTP server.",
+        "icon": "✉️",
+        "settings": {
+            "from_address": "",
+            "default_recipients": [],
+            "subject_prefix": "",
+        },
+    },
+    {
+        "slug": "smtp2go",
+        "name": "SMTP2Go",
+        "description": "Send email via SMTP2Go API with delivery, open, click, and bounce tracking.",
+        "icon": "📧",
+        "settings": {
+            "api_key": str(os.getenv("SMTP2GO_API_KEY", "")),
+            "enable_tracking": True,
+            "track_opens": True,
+            "track_clicks": True,
+            "webhook_secret": str(os.getenv("SMTP2GO_WEBHOOK_SECRET", "")),
+            "disable_webhook_signature_verification": False,
+        },
+    },
+    {
+        "slug": "m365-direct-delivery",
+        "name": "M365 Direct Delivery",
+        "description": "Deposit notifications directly into Microsoft 365 inboxes without SMTP transport.",
+        "icon": "📨",
+        "settings": {
+            "company_id": 0,
+            "recipient_domains": [],
+            "fallback_to_smtp": True,
+            "track_read_status": True,
+        },
+    },
+    {
+        "slug": "imap",
+        "name": "IMAP Mailboxes",
+        "description": "Import support emails from mailboxes into the ticketing queue.",
+        "icon": "📥",
+        "settings": {
+            "manage_url": "/admin/modules/imap",
+        },
+    },
+    {
+        "slug": "receive-sms",
+        "name": "Receive SMS",
+        "description": "Create and update tickets from inbound SMS webhooks.",
+        "icon": "📱",
+        "settings": {},
+    },
+    {
+        "slug": "calls",
+        "name": "Calls",
+        "description": "Receive and review phone call webhook events.",
+        "icon": "☎️",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "voice-monitor",
+        "name": "Voice Monitor",
+        "description": "Place bounded health-check calls to subscribed telephone numbers.",
+        "icon": "📞",
+        "settings": {
+            "provider_type": "disabled", "endpoint": "", "credentials_encrypted": "",
+            "caller_identity": "", "per_user_hourly_limit": 3, "per_company_hourly_limit": 10,
+            "recording_retention_days": 30, "worker_concurrency": 5,
+            "worker_lease_seconds": 300, "test_calls_enabled": False,
+        },
+    },
+    {
+        "slug": "m365-mail",
+        "name": "Office 365 Mailbox Import",
+        "description": "Import support emails from Microsoft 365 mailboxes into the ticketing queue.",
+        "icon": "📬",
+        "settings": {
+            "manage_url": "/admin/modules/m365-mail",
+        },
+    },
+    {
+        "slug": "tacticalrmm",
+        "name": "Tactical RMM",
+        "description": "Call Tactical RMM webhook endpoints for automation actions.",
+        "icon": "🛡️",
+        "settings": {
+            "base_url": "",
+            "base_rmm_url": "",
+            "api_key": "",
+            "verify_ssl": True,
+        },
+    },
+    {
+        "slug": "ntfy",
+        "name": "ntfy",
+        "description": "Broadcast automation alerts to ntfy topics.",
+        "icon": "📣",
+        "settings": {
+            "base_url": "https://ntfy.sh",
+            "topic": "",
+            "auth_token": "",
+        },
+    },
+    {
+        "slug": "apprise",
+        "name": "Apprise",
+        "description": "Send notifications to 80+ services via Apprise notification URLs.",
+        "icon": "🔔",
+        "settings": {
+            "urls": [],
+            "title": "",
+        },
+    },
+    {
+        "slug": "uptimekuma",
+        "name": "Uptime Kuma",
+        "description": "Ingest uptime alerts from Uptime Kuma webhooks.",
+        "icon": "📈",
+        "settings": _default_uptimekuma_settings(),
+    },
+    {
+        "slug": "chatgpt-mcp",
+        "name": "ChatGPT MCP",
+        "description": "Expose ticketing tools to ChatGPT via the Model Context Protocol.",
+        "icon": "🤖",
+        "settings": _default_chatgpt_settings(),
+    },
+    {
+        "slug": "ollama-mcp",
+        "name": "Ollama MCP",
+        "description": "Expose ticket search and lookup tools to Ollama via the Model Context Protocol.",
+        "icon": "🦙",
+        "settings": _default_ollama_mcp_settings(),
+    },
+    {
+        "slug": "xero",
+        "name": "Xero",
+        "description": "Synchronise invoice data with Xero.",
+        "icon": "💼",
+        "settings": _default_xero_settings(),
+    },
+    {
+        "slug": "sms-gateway",
+        "name": "Send SMS",
+        "description": "Send SMS messages via HTTP POST to a custom gateway endpoint.",
+        "icon": "📱",
+        "settings": {
+            "gateway_url": "",
+            "authorization": "",
+        },
+    },
+    {
+        "slug": "m365-admin",
+        "name": "Microsoft 365 Admin",
+        "description": "Configure Microsoft 365 admin app credentials for enterprise app management.",
+        "icon": "☁️",
+        "settings": {
+            "client_id": str(os.getenv("M365_ADMIN_CLIENT_ID", "")),
+            "client_secret": str(os.getenv("M365_ADMIN_CLIENT_SECRET", "")),
+            "tenant_id": "",
+            "app_object_id": "",
+            "client_secret_key_id": "",
+            "client_secret_expires_at": "",
+        },
+    },
+    {
+        "slug": "call-recordings",
+        "name": "Call Recordings",
+        "description": "Configure the storage location for call recording files. Set the base directory path where recording files should be stored or retrieved, and pick the phone system that produced the recordings so the files can be processed correctly.",
+        "icon": "📞",
+        "settings": {
+            "recordings_path": "/var/lib/myportal/call_recordings",
+            "phone_system_type": "generic",
+        },
+        "enabled": True,
+    },
+    {
+        "slug": "whisperx",
+        "name": "WhisperX",
+        "description": "Transcribe ticket audio attachments and call recordings with a WhisperX-compatible ASR service.",
+        "icon": "🎙️",
+        "settings": _default_whisperx_settings(),
+    },
+    {
+        "slug": "unifi-talk",
+        "name": "Unifi Talk",
+        "description": "Import call recordings from Unifi Talk server via SFTP. Downloads MP3 recordings to local storage for transcription processing.",
+        "icon": "📞",
+        "settings": {
+            "remote_host": "",
+            "remote_path": "/volume1/.srv/unifi-talk/recordings",
+            "username": "",
+            "password": "",
+            "local_path": "/var/lib/myportal/call_recordings",
+            "port": 22,
+        },
+    },
+    {
+        "slug": "reprocess-ai",
+        "name": "Reprocess AI",
+        "description": "Re-trigger AI processing to regenerate ticket summary and tags using the Ollama model.",
+        "icon": "🔄",
+        "settings": {},
+        "enabled": True,  # Internal action module - no external configuration required
+    },
+    {
+        "slug": "password-pusher",
+        "name": "Password Pusher",
+        "description": "Securely share passwords and secrets via Password Pusher (pwpush). Generates a time-limited, view-limited share link for use in onboarding and offboarding workflows.",
+        "icon": "🔐",
+        "settings": {
+            "base_url": "https://pwpush.com",
+            "api_key": "",
+            "user_email": "",
+            "expire_after_days": 7,
+            "expire_after_views": 5,
+            "deletable_by_viewer": True,
+            "retrieval_step": False,
+        },
+    },
+    {
+        "slug": "hudu",
+        "name": "Hudu",
+        "description": "Hudu documentation and password management integration. Link companies to Hudu records and push onboarding/offboarding data.",
+        "icon": "📚",
+        "settings": {
+            "base_url": "",
+            "api_key": "",
+        },
+    },
+    {
+        "slug": "huntress",
+        "name": "Huntress",
+        "description": (
+            "Huntress EDR / ITDR / SAT / SIEM / SOC statistics for company reports. "
+            "Credentials are read from environment variables (HUNTRESS_API_KEY, "
+            "HUNTRESS_API_SECRET, and CURRICULA_API_KEY/CURRICULA_API_SECRET "
+            "for Managed SAT OAuth2)."
+        ),
+        "icon": "🛡️",
+        "settings": {},
+    },
+    {
+        "slug": "trello",
+        "name": "Trello",
+        "description": "Link companies to Trello boards. Cards created in Trello become tickets; ticket replies sync back as card comments.",
+        "icon": "📋",
+        "settings": {},
+        "enabled": True,  # Enabled by default so it appears as a trigger action when the module is configured
+    },
+    {
+        "slug": "solidtime",
+        "name": "Solidtime",
+        "description": "Sync tickets to Solidtime as projects and ticket time entries (replies with billable minutes) as Solidtime time entries.",
+        "icon": "⏱️",
+        "settings": {
+            "base_url": "",
+            "api_token": "",
+            "organization_id": "",
+            "default_client_id": "",
+            "sync_tickets_to_projects": True,
+            "sync_projects_to_tickets": False,
+            "sync_time_entries_to_solidtime": True,
+            "sync_time_entries_from_solidtime": True,
+            "only_billable_to_solidtime": False,
+            "labour_type_to_task": False,
+            "webhook_secret": "",
+            "rate_limit_per_minute": 120,
+            "reconcile_interval_minutes": 15,
+            "monitor_successful_api_requests": False,
+            "manage_url": "/admin/modules/solidtime",
+        },
+    },
+    {
+        "slug": "matrix-chat-assign",
+        "name": "Matrix Chat Auto-Assign",
+        "description": "Automatically assign new Matrix chat rooms to technicians based on configurable rules (customer name, contact name, subject, time of day, day of week). Includes a default fallback rule.",
+        "icon": "💬",
+        "settings": {
+            "manage_url": "/chat/auto-assign",
+        },
+    },
+]
+
+
+_ALWAYS_ON_TICKET_ACTION_MODULES: tuple[dict[str, Any], ...] = (
+    {
+        "slug": "suggest-assets",
+        "name": "Suggest Assets",
+        "description": "Suggest Tactical RMM devices used by the ticket requester.",
+        "icon": "🖥️",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "create-ticket",
+        "name": "Create Ticket",
+        "description": "Create a new support ticket with customizable details.",
+        "icon": "🎫",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "create-task",
+        "name": "Create Task",
+        "description": "Create a new task for a ticket.",
+        "icon": "✓",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "update-ticket",
+        "name": "Update Ticket",
+        "description": "Update ticket fields such as status, priority, assigned user, category, and requester.",
+        "icon": "✏️",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "update-ticket-description",
+        "name": "Update Ticket Description",
+        "description": "Change the description field of an existing ticket.",
+        "icon": "📝",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "ai-rename-ticket",
+        "name": "AI Rename Ticket",
+        "description": "Use the current subject and initial problem description to create a more descriptive 3 to 12 word ticket subject.",
+        "icon": "✨",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "add-ticket-reply",
+        "name": "Add Ticket Reply",
+        "description": "Add a reply to an existing ticket. Supports public replies, internal notes, and optional time tracking with billable/non-billable hours.",
+        "icon": "💬",
+        "settings": {},
+        "enabled": True,
+    },
+    {
+        "slug": "smart-attachment-removal",
+        "name": "Smart Attachment Removal",
+        "description": "Remove duplicate ticket attachments by comparing file hashes and deleting redundant copies from storage.",
+        "icon": "🧹",
+        "settings": {},
+        "enabled": True,
+    },
+)
+_ALWAYS_ON_TICKET_ACTION_MODULE_SLUGS = {
+    module["slug"] for module in _ALWAYS_ON_TICKET_ACTION_MODULES
+}
+_ALWAYS_ON_TICKET_ACTION_MODULES_BY_SLUG = {
+    module["slug"]: module for module in _ALWAYS_ON_TICKET_ACTION_MODULES
+}
+
+
+def _normalise_slug(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def _is_always_on_ticket_action_module(slug: str) -> bool:
+    return _normalise_slug(slug) in _ALWAYS_ON_TICKET_ACTION_MODULE_SLUGS
+
+
+def _get_always_on_ticket_action_module(slug: str) -> dict[str, Any] | None:
+    key = _normalise_slug(slug)
+    module = _ALWAYS_ON_TICKET_ACTION_MODULES_BY_SLUG.get(key)
+    return dict(module) if module else None
+
+
+def _default_module_setting(slug: str, key: str, fallback: str) -> str:
+    for module in DEFAULT_MODULES:
+        if module.get("slug") == slug:
+            settings = module.get("settings") or {}
+            value = settings.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return fallback
+
+
+_DEFAULT_OLLAMA_MODEL = _default_module_setting("ollama", "model", "llama3")
+_DEFAULT_OLLAMA_BASE_URL = _default_module_setting(
+    "ollama", "base_url", "http://127.0.0.1:11434"
+)
+
+# Map module slugs to the setting fields that can be sourced from environment
+# variables. When FORCE_ENV_MODULE_SETTINGS=true, these fields are resolved from
+# env/default values instead of the database while non-env-backed fields remain.
+_ENV_BACKED_MODULE_FIELDS: dict[str, tuple[str, ...]] = {
+    "apprise": ("urls", "title"),
+    "call-recordings": ("recordings_path", "phone_system_type"),
+    "chatgpt-mcp": (
+        "shared_secret_hash",
+        "allowed_actions",
+        "max_results",
+        "allow_ticket_updates",
+        "allowed_statuses",
+        "system_user_id",
+    ),
+    "hudu": ("base_url", "api_key"),
+    "m365-admin": ("client_id", "client_secret"),
+    "ntfy": ("base_url", "topic", "auth_token"),
+    "ollama": ("provider", "base_url", "model", "prompt", "api_key"),
+    "ollama-mcp": (
+        "shared_secret_hash",
+        "allowed_actions",
+        "max_results",
+        "allow_ticket_replies",
+        "allow_ticket_updates",
+        "allowed_statuses",
+        "system_user_id",
+        "include_internal_replies",
+        "server_name",
+        "server_version",
+    ),
+    "password-pusher": (
+        "base_url",
+        "api_key",
+        "user_email",
+        "expire_after_days",
+        "expire_after_views",
+        "deletable_by_viewer",
+        "retrieval_step",
+    ),
+    "sms-gateway": ("gateway_url", "authorization"),
+    "smtp": ("from_address", "default_recipients", "subject_prefix"),
+    "smtp2go": (
+        "api_key",
+        "enable_tracking",
+        "track_opens",
+        "track_clicks",
+        "webhook_secret",
+        "disable_webhook_signature_verification",
+    ),
+    "m365-direct-delivery": (
+        "company_id", "recipient_domains", "fallback_to_smtp", "track_read_status"
+    ),
+    "solidtime": (
+        "base_url",
+        "api_token",
+        "organization_id",
+        "default_client_id",
+        "sync_tickets_to_projects",
+        "sync_projects_to_tickets",
+        "sync_time_entries_to_solidtime",
+        "sync_time_entries_from_solidtime",
+        "only_billable_to_solidtime",
+        "labour_type_to_task",
+        "webhook_secret",
+        "rate_limit_per_minute",
+    ),
+    "syncro": ("base_url", "api_key", "rate_limit_per_minute"),
+    "tacticalrmm": ("base_url", "base_rmm_url", "api_key", "verify_ssl"),
+    "unifi-talk": (
+        "remote_host",
+        "remote_path",
+        "username",
+        "password",
+        "local_path",
+        "port",
+    ),
+    "uptimekuma": ("shared_secret_hash", "sync_service_status"),
+    "whisperx": ("base_url", "api_key", "language", "stereo_split"),
+    "xero": (
+        "client_id",
+        "client_secret",
+        "tenant_id",
+        "company_name",
+        "default_hourly_rate",
+        "account_code",
+        "tax_type",
+        "line_amount_type",
+        "reference_prefix",
+        "billable_statuses",
+        "line_item_description_template",
+        "auto_create_products",
+        "webhook_key",
+    ),
+}
+
+
+def _force_env_module_settings() -> bool:
+    """Return whether env-backed module fields should ignore database values."""
+
+    return _ensure_bool(os.getenv("FORCE_ENV_MODULE_SETTINGS"), False)
+
+
+def _parse_module_settings(value: Any) -> Mapping[str, Any] | None:
+    """Return module settings as a mapping when the stored value is parseable."""
+
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, Mapping) else None
+    return None
+
+
+def _resolve_module_settings_for_runtime(
+    slug: str,
+    module: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve effective runtime settings for a module.
+
+    This merges stored settings with the usual defaults/env overrides. When
+    FORCE_ENV_MODULE_SETTINGS=true, env-backed fields are replaced with their
+    env/default values while DB-only fields are preserved.
+    """
+
+    raw_settings = _parse_module_settings((module or {}).get("settings"))
+    resolved = _coerce_settings(slug, raw_settings, module)
+    if slug == "xero":
+        env_tenant_id = str(os.getenv("XERO_TENANT_ID", "")).strip()
+        if env_tenant_id and not str(resolved.get("tenant_id") or "").strip():
+            resolved["tenant_id"] = env_tenant_id
+        env_line_item_template = str(os.getenv("XERO_LINE_ITEM_TEMPLATE", "")).strip()
+        if env_line_item_template:
+            resolved["line_item_description_template"] = env_line_item_template
+    if not _force_env_module_settings():
+        return resolved
+    env_only = _coerce_settings(slug, {}, None)
+    for field in _ENV_BACKED_MODULE_FIELDS.get(slug, ()):
+        if field in env_only:
+            resolved[field] = env_only[field]
+        else:
+            resolved.pop(field, None)
+    return resolved
+
+
+def _resolve_module_for_runtime(module: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a module record with runtime-resolved settings applied."""
+
+    resolved = dict(module)
+    resolved["settings"] = _resolve_module_settings_for_runtime(
+        str(module.get("slug") or ""),
+        module,
+    )
+    return resolved
+
+
+def _coerce_settings(
+    slug: str,
+    payload: Mapping[str, Any] | None,
+    existing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    defaults = next(
+        (module["settings"] for module in DEFAULT_MODULES if module["slug"] == slug), {}
+    )
+    existing_settings: Mapping[str, Any] | None = None
+    if existing and isinstance(existing.get("settings"), Mapping):
+        existing_settings = existing["settings"]
+    base = _merge_settings(defaults, existing_settings)
+    merged = _merge_settings(base, payload)
+    if slug == "ollama":
+        provider = str(merged.get("provider", "")).strip().lower() or "ollama"
+        if provider not in {"ollama", "openai", "llamacpp"}:
+            provider = "ollama"
+        base_url = str(merged.get("base_url", "")).strip() or defaults.get("base_url")
+        model = str(merged.get("model", "")).strip() or defaults.get("model")
+        prompt = str(merged.get("prompt", "")).strip()
+        api_key_override = (payload or {}).get("api_key")
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            candidate = str(api_key_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+            else:
+                api_key = candidate
+        merged.update(
+            {
+                "provider": provider,
+                "base_url": base_url,
+                "model": model,
+                "prompt": prompt,
+                "api_key": api_key,
+            }
+        )
+        _env = os.getenv("OLLAMA_PROVIDER", "").strip().lower()
+        if _env in {"ollama", "openai", "llamacpp"}:
+            merged["provider"] = _env
+        _env = os.getenv("OLLAMA_BASE_URL", "").strip()
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("OLLAMA_MODEL", "").strip()
+        if _env:
+            merged["model"] = _env
+        _env = os.getenv("OLLAMA_PROMPT", "").strip()
+        if _env:
+            merged["prompt"] = _env
+        _env = os.getenv("OPENAI_API_KEY", "").strip()
+        if _env:
+            merged["api_key"] = _env
+    elif slug == "smtp":
+        merged.update(
+            {
+                "from_address": str(merged.get("from_address", "")).strip(),
+                "default_recipients": _ensure_list(merged.get("default_recipients")),
+                "subject_prefix": str(merged.get("subject_prefix", "")).strip(),
+            }
+        )
+        _env = os.getenv("SMTP_FROM_ADDRESS", "").strip()
+        if _env:
+            merged["from_address"] = _env
+        _env = os.getenv("SMTP_DEFAULT_RECIPIENTS", "").strip()
+        if _env:
+            merged["default_recipients"] = [
+                e.strip() for e in _env.split(",") if e.strip()
+            ]
+        _env = os.getenv("SMTP_SUBJECT_PREFIX", "").strip()
+        if _env:
+            merged["subject_prefix"] = _env
+    elif slug == "smtp2go":
+        overrides = payload or {}
+        api_key_override = overrides.get("api_key")
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            candidate = str(api_key_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+            else:
+                api_key = candidate
+
+        merged.update(
+            {
+                "api_key": api_key,
+                "enable_tracking": _ensure_bool(merged.get("enable_tracking"), True),
+                "track_opens": _ensure_bool(merged.get("track_opens"), True),
+                "track_clicks": _ensure_bool(merged.get("track_clicks"), True),
+                "webhook_secret": str(merged.get("webhook_secret", "")).strip(),
+                "disable_webhook_signature_verification": _ensure_bool(
+                    merged.get("disable_webhook_signature_verification"), False
+                ),
+            }
+        )
+        _env = os.getenv("SMTP2GO_API_KEY", "").strip()
+        if _env:
+            merged["api_key"] = _env
+        _env = os.getenv("SMTP2GO_ENABLE_TRACKING", "").strip()
+        if _env:
+            merged["enable_tracking"] = _env.lower() not in ("false", "0", "no", "off")
+        _env = os.getenv("SMTP2GO_TRACK_OPENS", "").strip()
+        if _env:
+            merged["track_opens"] = _env.lower() not in ("false", "0", "no", "off")
+        _env = os.getenv("SMTP2GO_TRACK_CLICKS", "").strip()
+        if _env:
+            merged["track_clicks"] = _env.lower() not in ("false", "0", "no", "off")
+        _env = os.getenv("SMTP2GO_DISABLE_WEBHOOK_SIGNATURE_VERIFICATION", "").strip()
+        if _env:
+            merged["disable_webhook_signature_verification"] = _env.lower() not in (
+                "false", "0", "no", "off"
+            )
+    elif slug == "m365-direct-delivery":
+        try:
+            company_id = int(merged.get("company_id") or 0)
+        except (TypeError, ValueError):
+            company_id = 0
+        merged.update({
+            "company_id": max(0, company_id),
+            "recipient_domains": [str(value).strip().lower().lstrip("@") for value in _ensure_list(merged.get("recipient_domains")) if str(value).strip()],
+            "fallback_to_smtp": _ensure_bool(merged.get("fallback_to_smtp"), True),
+            "track_read_status": _ensure_bool(merged.get("track_read_status"), True),
+        })
+    elif slug == "syncro":
+        base_url = str(merged.get("base_url") or "").strip().rstrip("/")
+        api_key_override = payload.get("api_key") if payload else None
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            api_key = str(api_key_override or "").strip()
+            if not api_key and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+        rate_limit = (
+            _coerce_int(merged.get("rate_limit_per_minute"), minimum=1, maximum=600)
+            or 180
+        )
+        raw_mappings = merged.get("ticket_status_mappings") or []
+        status_mappings: list[dict[str, str]] = []
+        seen_syncro_statuses: set[str] = set()
+        if isinstance(raw_mappings, list):
+            for item in raw_mappings:
+                if not isinstance(item, Mapping):
+                    continue
+                syncro_status = str(
+                    item.get("syncro_status") or item.get("syncroStatus") or ""
+                ).strip()
+                myportal_status = (
+                    str(item.get("myportal_status") or item.get("myportalStatus") or "")
+                    .strip()
+                    .lower()
+                )
+                if not syncro_status or not myportal_status:
+                    continue
+                lookup_key = syncro_status.casefold()
+                if lookup_key in seen_syncro_statuses:
+                    continue
+                seen_syncro_statuses.add(lookup_key)
+                status_mappings.append(
+                    {
+                        "syncro_status": syncro_status[:128],
+                        "myportal_status": myportal_status[:128],
+                    }
+                )
+        merged.update(
+            {
+                "base_url": base_url,
+                "api_key": api_key,
+                "rate_limit_per_minute": rate_limit,
+                "ticket_status_mappings": status_mappings,
+            }
+        )
+        _env = os.getenv("SYNCRO_BASE_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("SYNCRO_API_KEY", "").strip()
+        if _env:
+            merged["api_key"] = _env
+        _env = os.getenv("SYNCRO_RATE_LIMIT_PER_MINUTE", "").strip()
+        if _env and _env.isdigit():
+            merged["rate_limit_per_minute"] = max(1, min(600, int(_env)))
+    elif slug == "tacticalrmm":
+        overrides = payload or {}
+        api_key_override = overrides.get("api_key")
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            candidate = str(api_key_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+            else:
+                api_key = candidate
+        merged.update(
+            {
+                "base_url": str(merged.get("base_url", "")).strip().rstrip("/"),
+                "base_rmm_url": str(merged.get("base_rmm_url", "")).strip().rstrip("/"),
+                "api_key": api_key,
+                "verify_ssl": _ensure_bool(merged.get("verify_ssl"), True),
+            }
+        )
+        _env = os.getenv("TACTICALRMM_BASE_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("TACTICALRMM_BASE_RMM_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_rmm_url"] = _env
+        _env = os.getenv("TACTICALRMM_API_KEY", "").strip()
+        if _env:
+            merged["api_key"] = _env
+        _env = os.getenv("TACTICALRMM_VERIFY_SSL", "").strip()
+        if _env:
+            merged["verify_ssl"] = _env.lower() not in ("false", "0", "no", "off")
+    elif slug == "ntfy":
+        overrides = payload or {}
+        auth_token_override = overrides.get("auth_token")
+        if auth_token_override is None:
+            auth_token = str(merged.get("auth_token") or "").strip()
+        else:
+            candidate = str(auth_token_override or "").strip()
+            if (
+                not candidate
+                and existing_settings
+                and existing_settings.get("auth_token")
+            ):
+                auth_token = str(existing_settings.get("auth_token") or "").strip()
+            else:
+                auth_token = candidate
+        base_url_value = str(merged.get("base_url", "")).strip()
+        base_url = base_url_value.rstrip("/") if base_url_value else ""
+        merged.update(
+            {
+                "base_url": base_url or "https://ntfy.sh",
+                "topic": str(merged.get("topic", "")).strip(),
+                "auth_token": auth_token,
+            }
+        )
+        _env = os.getenv("NTFY_BASE_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("NTFY_TOPIC", "").strip()
+        if _env:
+            merged["topic"] = _env
+        _env = os.getenv("NTFY_AUTH_TOKEN", "").strip()
+        if _env:
+            merged["auth_token"] = _env
+    elif slug == "apprise":
+        raw_urls = merged.get("urls")
+        if isinstance(raw_urls, str):
+            urls = [u.strip() for u in raw_urls.splitlines() if u.strip()]
+        elif isinstance(raw_urls, list):
+            urls = [str(u).strip() for u in raw_urls if u and str(u).strip()]
+        else:
+            urls = []
+        merged.update(
+            {
+                "urls": urls,
+                "title": str(merged.get("title", "")).strip(),
+            }
+        )
+        _env = os.getenv("APPRISE_URLS", "").strip()
+        if _env:
+            merged["urls"] = [u.strip() for u in _env.splitlines() if u.strip()]
+        _env = os.getenv("APPRISE_TITLE", "").strip()
+        if _env:
+            merged["title"] = _env
+    elif slug == "plausible":
+        overrides = payload or {}
+        api_key_override = overrides.get("api_key")
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            candidate = str(api_key_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+            else:
+                api_key = candidate
+
+        # Handle pepper field similarly to api_key (preserve existing if not provided)
+        pepper_override = overrides.get("pepper")
+        if pepper_override is None:
+            pepper = str(merged.get("pepper") or "").strip()
+        else:
+            candidate = str(pepper_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("pepper"):
+                pepper = str(existing_settings.get("pepper") or "").strip()
+            else:
+                pepper = candidate
+
+        base_url_value = str(merged.get("base_url", "")).strip()
+        base_url = base_url_value.rstrip("/") if base_url_value else ""
+        merged.update(
+            {
+                "base_url": base_url,
+                "site_domain": str(merged.get("site_domain", "")).strip(),
+                "api_key": api_key,
+                "track_opens": _ensure_bool(merged.get("track_opens"), True),
+                "track_clicks": _ensure_bool(merged.get("track_clicks"), True),
+                "send_to_plausible": _ensure_bool(
+                    merged.get("send_to_plausible"), False
+                ),
+                "track_pageviews": _ensure_bool(merged.get("track_pageviews"), False),
+                "pepper": pepper,
+                "send_pii": _ensure_bool(merged.get("send_pii"), False),
+            }
+        )
+    elif slug == "imap":
+        manage_url = (
+            str(merged.get("manage_url") or "").strip() or "/admin/modules/imap"
+        )
+        merged.update({"manage_url": manage_url})
+    elif slug == "m365-mail":
+        manage_url = (
+            str(merged.get("manage_url") or "").strip() or "/admin/modules/m365-mail"
+        )
+        merged.update({"manage_url": manage_url})
+    elif slug == "chatgpt-mcp":
+        overrides = payload or {}
+        shared_secret_override = overrides.get("shared_secret")
+        shared_secret_hash_override = overrides.get("shared_secret_hash")
+        if (
+            shared_secret_override is not None
+            or shared_secret_hash_override is not None
+        ):
+            candidate = shared_secret_override
+            if candidate in (None, ""):
+                candidate = shared_secret_hash_override
+            candidate_str = str(candidate or "").strip()
+            if candidate_str:
+                if (
+                    len(candidate_str) == 64
+                    and all(char in string.hexdigits for char in candidate_str)
+                    and shared_secret_override in (None, "")
+                ):
+                    merged["shared_secret_hash"] = candidate_str.lower()
+                else:
+                    merged["shared_secret_hash"] = _hash_secret(candidate_str)
+            # else: blank submission — preserve existing merged["shared_secret_hash"]
+        # ensure a hash is always present even if override absent
+        merged["shared_secret_hash"] = str(merged.get("shared_secret_hash", "")).strip()
+        merged["allowed_actions"] = _normalise_tool_names(merged.get("allowed_actions"))
+        merged["max_results"] = (
+            _coerce_int(merged.get("max_results"), minimum=1, maximum=200) or 50
+        )
+        merged["allow_ticket_updates"] = _ensure_bool(
+            merged.get("allow_ticket_updates"), False
+        )
+        merged["allowed_statuses"] = _normalise_statuses(merged.get("allowed_statuses"))
+        merged["system_user_id"] = _coerce_int(merged.get("system_user_id"))
+        merged.pop("shared_secret", None)
+    elif slug == "ollama-mcp":
+        overrides = payload or {}
+        shared_secret_override = overrides.get("shared_secret")
+        shared_secret_hash_override = overrides.get("shared_secret_hash")
+        if (
+            shared_secret_override is not None
+            or shared_secret_hash_override is not None
+        ):
+            candidate = shared_secret_override
+            if candidate in (None, ""):
+                candidate = shared_secret_hash_override
+            candidate_str = str(candidate or "").strip()
+            if candidate_str:
+                if (
+                    len(candidate_str) == 64
+                    and all(char in string.hexdigits for char in candidate_str)
+                    and shared_secret_override in (None, "")
+                ):
+                    merged["shared_secret_hash"] = candidate_str.lower()
+                else:
+                    merged["shared_secret_hash"] = _hash_secret(candidate_str)
+            # else: blank submission — preserve existing merged["shared_secret_hash"]
+        merged["shared_secret_hash"] = str(merged.get("shared_secret_hash", "")).strip()
+        merged["allowed_actions"] = _normalise_ollama_tool_names(
+            merged.get("allowed_actions")
+        )
+        merged["max_results"] = (
+            _coerce_int(merged.get("max_results"), minimum=1, maximum=200) or 25
+        )
+        merged["allow_ticket_replies"] = _ensure_bool(
+            merged.get("allow_ticket_replies"), False
+        )
+        merged["allow_ticket_updates"] = _ensure_bool(
+            merged.get("allow_ticket_updates"), False
+        )
+        merged["allowed_statuses"] = _normalise_statuses(merged.get("allowed_statuses"))
+        merged["system_user_id"] = _coerce_int(merged.get("system_user_id"))
+        merged["include_internal_replies"] = _ensure_bool(
+            merged.get("include_internal_replies"), False
+        )
+        merged["server_name"] = (
+            str(merged.get("server_name") or "").strip() or "MyPortal Ollama MCP"
+        )
+        merged["server_version"] = (
+            str(merged.get("server_version") or "").strip() or "1.0.0"
+        )
+        merged.pop("shared_secret", None)
+    elif slug == "uptimekuma":
+        overrides = payload or {}
+        shared_secret_override = overrides.get("shared_secret")
+        shared_secret_hash_override = overrides.get("shared_secret_hash")
+        if (
+            shared_secret_override is not None
+            or shared_secret_hash_override is not None
+        ):
+            candidate = shared_secret_override
+            if candidate in (None, ""):
+                candidate = shared_secret_hash_override
+            candidate_str = str(candidate or "").strip()
+            if candidate_str:
+                if (
+                    len(candidate_str) == 64
+                    and all(char in string.hexdigits for char in candidate_str)
+                    and shared_secret_override in (None, "")
+                ):
+                    merged["shared_secret_hash"] = candidate_str.lower()
+                else:
+                    merged["shared_secret_hash"] = _hash_secret(candidate_str)
+            # else: blank submission — preserve existing merged["shared_secret_hash"]
+        merged["shared_secret_hash"] = str(merged.get("shared_secret_hash", "")).strip()
+        merged.pop("shared_secret", None)
+        merged["sync_service_status"] = _ensure_bool(
+            merged.get("sync_service_status"), True
+        )
+        _env = os.getenv("UPTIMEKUMA_SYNC_SERVICE_STATUS", "").strip()
+        if _env:
+            merged["sync_service_status"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("UPTIMEKUMA_SHARED_SECRET", "").strip()
+        if _env and not merged.get("shared_secret_hash"):
+            merged["shared_secret_hash"] = _hash_secret(_env)
+    elif slug == "xero":
+        overrides = payload or {}
+
+        def _preserve_secret(field: str) -> str:
+            override = overrides.get(field)
+            if override is None:
+                return str(merged.get(field, "") or "").strip()
+            candidate = str(override or "").strip()
+            if candidate and candidate != "********":
+                return candidate
+            if existing_settings and existing_settings.get(field):
+                return str(existing_settings.get(field) or "").strip()
+            return ""
+
+        def _normalise_rate(value: Any) -> str:
+            if value in (None, ""):
+                return ""
+            try:
+                decimal_value = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                return ""
+            quantised = decimal_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return f"{quantised:f}"
+
+        # Preserve encrypted tokens if not overriding
+        access_token = _preserve_secret("access_token")
+        refresh_token = _preserve_secret("refresh_token")
+        token_expires_at = merged.get("token_expires_at")
+
+        # Preserve existing token expiry if not provided in overrides
+        if token_expires_at is None and existing_settings:
+            token_expires_at = existing_settings.get("token_expires_at")
+
+        merged.update(
+            {
+                "client_id": str(merged.get("client_id", "")).strip(),
+                "client_secret": _preserve_secret("client_secret"),
+                "webhook_key": _preserve_secret("webhook_key"),
+                "refresh_token": refresh_token,
+                "access_token": access_token,
+                "token_expires_at": token_expires_at,
+                "tenant_id": str(merged.get("tenant_id", "")).strip(),
+                "company_name": str(merged.get("company_name", "")).strip(),
+                "default_hourly_rate": _normalise_rate(
+                    merged.get("default_hourly_rate")
+                ),
+                "account_code": str(merged.get("account_code", "")).strip(),
+                "tax_type": str(merged.get("tax_type", "")).strip(),
+                "line_amount_type": str(merged.get("line_amount_type", "")).strip()
+                or "Exclusive",
+                "reference_prefix": str(merged.get("reference_prefix", "")).strip()
+                or "Support",
+                "billable_statuses": _normalise_statuses(
+                    merged.get("billable_statuses")
+                ),
+                "line_item_description_template": str(
+                    merged.get("line_item_description_template", "")
+                ).strip()
+                or "Ticket {ticket_id}: {ticket_subject} {labour_suffix} ({labour_duration})",
+                "auto_create_products": _ensure_bool(
+                    merged.get("auto_create_products"), True
+                ),
+            }
+        )
+    elif slug == "sms-gateway":
+        overrides = payload or {}
+        authorization_override = overrides.get("authorization")
+        if authorization_override is None:
+            authorization = str(merged.get("authorization") or "").strip()
+        else:
+            candidate = str(authorization_override or "").strip()
+            if (
+                not candidate
+                and existing_settings
+                and existing_settings.get("authorization")
+            ):
+                authorization = str(
+                    existing_settings.get("authorization") or ""
+                ).strip()
+            else:
+                authorization = candidate
+        merged.update(
+            {
+                "gateway_url": str(merged.get("gateway_url", "")).strip(),
+                "authorization": authorization,
+            }
+        )
+        _env = os.getenv("SMS_GATEWAY_URL", "").strip()
+        if _env:
+            merged["gateway_url"] = _env
+        _env = os.getenv("SMS_GATEWAY_AUTH", "").strip()
+        if _env:
+            merged["authorization"] = _env
+    elif slug == "m365-admin":
+        overrides = payload or {}
+        client_secret_override = overrides.get("client_secret")
+        if client_secret_override is None:
+            client_secret = str(merged.get("client_secret") or "").strip()
+        else:
+            candidate = str(client_secret_override or "").strip()
+            if (
+                not candidate
+                and existing_settings
+                and existing_settings.get("client_secret")
+            ):
+                client_secret = str(
+                    existing_settings.get("client_secret") or ""
+                ).strip()
+            else:
+                client_secret = candidate
+
+        # Preserve app_object_id, client_secret_key_id, client_secret_expires_at
+        # and tenant_id when not explicitly overridden so auto-provisioned values
+        # are not wiped by an unrelated settings save.
+        def _preserve_field(name: str) -> str:
+            override_val = overrides.get(name)
+            if override_val is not None:
+                return str(override_val).strip()
+            return str(merged.get(name) or "").strip()
+
+        merged.update(
+            {
+                "client_id": str(merged.get("client_id", "")).strip(),
+                "client_secret": client_secret,
+                "tenant_id": _preserve_field("tenant_id"),
+                "app_object_id": _preserve_field("app_object_id"),
+                "client_secret_key_id": _preserve_field("client_secret_key_id"),
+                "client_secret_expires_at": _preserve_field("client_secret_expires_at"),
+            }
+        )
+    elif slug == "call-recordings":
+        phone_system_type = str(merged.get("phone_system_type") or "").strip().lower()
+        if phone_system_type not in CALL_RECORDINGS_PHONE_SYSTEM_TYPES:
+            phone_system_type = "generic"
+        merged.update(
+            {
+                "recordings_path": str(merged.get("recordings_path", "")).strip()
+                or "/var/lib/myportal/call_recordings",
+                "phone_system_type": phone_system_type,
+            }
+        )
+        _env = os.getenv("CALL_RECORDINGS_PATH", "").strip()
+        if _env:
+            merged["recordings_path"] = _env
+        _env = os.getenv("CALL_RECORDINGS_PHONE_SYSTEM", "").strip().lower()
+        if _env and _env in CALL_RECORDINGS_PHONE_SYSTEM_TYPES:
+            merged["phone_system_type"] = _env
+    elif slug == "whisperx":
+        env_settings = _default_whisperx_settings()
+        merged.update(
+            {
+                "base_url": str(merged.get("base_url") or "").strip().rstrip("/"),
+                "api_key": str(merged.get("api_key") or "").strip(),
+                "language": str(merged.get("language") or "").strip() or "en",
+                "stereo_split": _ensure_bool(merged.get("stereo_split"), False),
+            }
+        )
+        for key in ("base_url", "api_key", "language"):
+            if env_settings[key]:
+                merged[key] = env_settings[key]
+        if os.getenv("WHISPERX_STEREO_SPLIT") is not None:
+            merged["stereo_split"] = env_settings["stereo_split"]
+    elif slug == "unifi-talk":
+        overrides = payload or {}
+        password_override = overrides.get("password")
+        if password_override is None:
+            password = str(merged.get("password") or "").strip()
+        else:
+            candidate = str(password_override or "").strip()
+            if (
+                not candidate
+                and existing_settings
+                and existing_settings.get("password")
+            ):
+                password = str(existing_settings.get("password") or "").strip()
+            else:
+                password = candidate
+        merged.update(
+            {
+                "remote_host": str(merged.get("remote_host", "")).strip(),
+                "remote_path": str(merged.get("remote_path", "")).strip()
+                or "/volume1/.srv/unifi-talk/recordings",
+                "username": str(merged.get("username", "")).strip(),
+                "password": password,
+                "local_path": str(merged.get("local_path", "")).strip()
+                or "/var/lib/myportal/call_recordings",
+                "port": _coerce_int(merged.get("port"), minimum=1, maximum=65535) or 22,
+            }
+        )
+        _env = os.getenv("UNIFI_TALK_REMOTE_HOST", "").strip()
+        if _env:
+            merged["remote_host"] = _env
+        _env = os.getenv("UNIFI_TALK_PORT", "").strip()
+        if _env and _env.isdigit():
+            merged["port"] = max(1, min(65535, int(_env)))
+        _env = os.getenv("UNIFI_TALK_USERNAME", "").strip()
+        if _env:
+            merged["username"] = _env
+        _env = os.getenv("UNIFI_TALK_PASSWORD", "").strip()
+        if _env:
+            merged["password"] = _env
+        _env = os.getenv("UNIFI_TALK_REMOTE_PATH", "").strip()
+        if _env:
+            merged["remote_path"] = _env
+        _env = os.getenv("UNIFI_TALK_LOCAL_PATH", "").strip()
+        if _env:
+            merged["local_path"] = _env
+    elif slug == "password-pusher":
+        overrides = payload or {}
+        api_key_override = overrides.get("api_key")
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            candidate = str(api_key_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+            else:
+                api_key = candidate
+        merged.update(
+            {
+                "base_url": str(merged.get("base_url", "")).strip().rstrip("/")
+                or "https://pwpush.com",
+                "api_key": api_key,
+                "user_email": str(merged.get("user_email", "")).strip(),
+                "expire_after_days": _coerce_int(
+                    merged.get("expire_after_days"), minimum=1, maximum=90
+                )
+                or 7,
+                "expire_after_views": _coerce_int(
+                    merged.get("expire_after_views"), minimum=1, maximum=100
+                )
+                or 5,
+                "deletable_by_viewer": _ensure_bool(
+                    merged.get("deletable_by_viewer"), True
+                ),
+                "retrieval_step": _ensure_bool(merged.get("retrieval_step"), False),
+            }
+        )
+        _env = os.getenv("PASSWORD_PUSHER_BASE_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("PASSWORD_PUSHER_API_KEY", "").strip()
+        if _env:
+            merged["api_key"] = _env
+        _env = os.getenv("PASSWORD_PUSHER_USER_EMAIL", "").strip()
+        if _env:
+            merged["user_email"] = _env
+        _env = os.getenv("PASSWORD_PUSHER_EXPIRE_AFTER_DAYS", "").strip()
+        if _env and _env.isdigit():
+            merged["expire_after_days"] = max(1, min(90, int(_env)))
+        _env = os.getenv("PASSWORD_PUSHER_EXPIRE_AFTER_VIEWS", "").strip()
+        if _env and _env.isdigit():
+            merged["expire_after_views"] = max(1, min(100, int(_env)))
+        _env = os.getenv("PASSWORD_PUSHER_DELETABLE_BY_VIEWER", "").strip()
+        if _env:
+            merged["deletable_by_viewer"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("PASSWORD_PUSHER_RETRIEVAL_STEP", "").strip()
+        if _env:
+            merged["retrieval_step"] = _env.lower() not in ("false", "0", "no", "off")
+    elif slug == "hudu":
+        overrides = payload or {}
+        api_key_override = overrides.get("api_key")
+        if api_key_override is None:
+            api_key = str(merged.get("api_key") or "").strip()
+        else:
+            candidate = str(api_key_override or "").strip()
+            if not candidate and existing_settings and existing_settings.get("api_key"):
+                api_key = str(existing_settings.get("api_key") or "").strip()
+            else:
+                api_key = candidate
+        merged.update(
+            {
+                "base_url": str(merged.get("base_url", "")).strip().rstrip("/"),
+                "api_key": api_key,
+            }
+        )
+        _env = os.getenv("HUDU_BASE_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("HUDU_API_KEY", "").strip()
+        if _env:
+            merged["api_key"] = _env
+    elif slug == "solidtime":
+        overrides = payload or {}
+
+        def _preserve_secret(field: str) -> str:
+            override = overrides.get(field)
+            if override is None:
+                return str(merged.get(field) or "").strip()
+            candidate = str(override or "").strip()
+            if not candidate and existing_settings and existing_settings.get(field):
+                return str(existing_settings.get(field) or "").strip()
+            return candidate
+
+        api_token = _preserve_secret("api_token")
+        webhook_secret = _preserve_secret("webhook_secret")
+        rate_limit = (
+            _coerce_int(merged.get("rate_limit_per_minute"), minimum=1, maximum=600)
+            or 120
+        )
+        reconcile_interval = (
+            _coerce_int(
+                merged.get("reconcile_interval_minutes"), minimum=5, maximum=1440
+            )
+            or 15
+        )
+        merged.update(
+            {
+                "base_url": str(merged.get("base_url", "")).strip().rstrip("/"),
+                "api_token": api_token,
+                "organization_id": str(merged.get("organization_id", "")).strip(),
+                "default_client_id": str(merged.get("default_client_id", "")).strip(),
+                "sync_tickets_to_projects": _ensure_bool(
+                    merged.get("sync_tickets_to_projects"), True
+                ),
+                "sync_projects_to_tickets": _ensure_bool(
+                    merged.get("sync_projects_to_tickets"), False
+                ),
+                "sync_time_entries_to_solidtime": _ensure_bool(
+                    merged.get("sync_time_entries_to_solidtime"), True
+                ),
+                "sync_time_entries_from_solidtime": _ensure_bool(
+                    merged.get("sync_time_entries_from_solidtime"), True
+                ),
+                "only_billable_to_solidtime": _ensure_bool(
+                    merged.get("only_billable_to_solidtime"), False
+                ),
+                "labour_type_to_task": _ensure_bool(
+                    merged.get("labour_type_to_task"), False
+                ),
+                "webhook_secret": webhook_secret,
+                "rate_limit_per_minute": rate_limit,
+                "reconcile_interval_minutes": reconcile_interval,
+                "monitor_successful_api_requests": _ensure_bool(
+                    merged.get("monitor_successful_api_requests"), False
+                ),
+                "manage_url": str(merged.get("manage_url") or "").strip()
+                or "/admin/modules/solidtime",
+            }
+        )
+        _env = os.getenv("SOLIDTIME_BASE_URL", "").strip().rstrip("/")
+        if _env:
+            merged["base_url"] = _env
+        _env = os.getenv("SOLIDTIME_API_TOKEN", "").strip()
+        if _env:
+            merged["api_token"] = _env
+        _env = os.getenv("SOLIDTIME_ORGANIZATION_ID", "").strip()
+        if _env:
+            merged["organization_id"] = _env
+        _env = os.getenv("SOLIDTIME_DEFAULT_CLIENT_ID", "").strip()
+        if _env:
+            merged["default_client_id"] = _env
+        _env = os.getenv("SOLIDTIME_SYNC_TICKETS_TO_PROJECTS", "").strip()
+        if _env:
+            merged["sync_tickets_to_projects"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("SOLIDTIME_SYNC_PROJECTS_TO_TICKETS", "").strip()
+        if _env:
+            merged["sync_projects_to_tickets"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("SOLIDTIME_SYNC_TIME_ENTRIES_TO_SOLIDTIME", "").strip()
+        if _env:
+            merged["sync_time_entries_to_solidtime"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("SOLIDTIME_SYNC_TIME_ENTRIES_FROM_SOLIDTIME", "").strip()
+        if _env:
+            merged["sync_time_entries_from_solidtime"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("SOLIDTIME_ONLY_BILLABLE_TO_SOLIDTIME", "").strip()
+        if _env:
+            merged["only_billable_to_solidtime"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("SOLIDTIME_LABOUR_TYPE_TO_TASK", "").strip()
+        if _env:
+            merged["labour_type_to_task"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+        _env = os.getenv("SOLIDTIME_RATE_LIMIT_PER_MINUTE", "").strip()
+        if _env and _env.isdigit():
+            merged["rate_limit_per_minute"] = max(1, min(600, int(_env)))
+        _env = os.getenv("SOLIDTIME_RECONCILE_INTERVAL_MINUTES", "").strip()
+        if _env and _env.isdigit():
+            merged["reconcile_interval_minutes"] = max(5, min(1440, int(_env)))
+        _env = os.getenv("SOLIDTIME_MONITOR_SUCCESSFUL_API_REQUESTS", "").strip()
+        if _env:
+            merged["monitor_successful_api_requests"] = _env.lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
+    return merged
+
+
+def _redact_module_settings(module: dict[str, Any]) -> dict[str, Any]:
+    slug = module.get("slug")
+    fields_to_redact: dict[str, tuple[str, ...]] = {
+        "chatgpt-mcp": ("shared_secret_hash",),
+        "ollama": ("api_key",),
+        "ollama-mcp": ("shared_secret_hash",),
+        "syncro": ("api_key",),
+        "uptimekuma": ("shared_secret_hash",),
+        "tacticalrmm": ("api_key",),
+        "ntfy": ("auth_token",),
+        "xero": ("client_secret", "refresh_token", "access_token", "webhook_key"),
+        "sms-gateway": ("authorization",),
+        "unifi-talk": ("password",),
+        "plausible": ("api_key", "pepper"),
+        "smtp2go": ("api_key", "webhook_secret"),
+        "m365-admin": ("client_secret",),
+        "password-pusher": ("api_key",),
+        "hudu": ("api_key",),
+        "solidtime": ("api_token", "webhook_secret"),
+    }
+    targets = fields_to_redact.get(slug)
+    if not targets:
+        return module
+    redacted = dict(module)
+    settings = dict(redacted.get("settings") or {})
+    for field in targets:
+        if settings.get(field):
+            settings[field] = "********"
+    redacted["settings"] = settings
+    return redacted
+
+
+async def ensure_default_modules() -> None:
+    if not db.is_connected():
+        logger.info(
+            "Skipping default module synchronisation because the database is not connected."
+        )
+        return
+
+    try:
+        existing = await module_repo.list_modules()
+    except RuntimeError as exc:
+        logger.warning(
+            "Unable to synchronise default modules due to database error",
+            error=str(exc),
+        )
+        return
+    existing_by_slug = {module["slug"]: module for module in existing}
+    for default in DEFAULT_MODULES:
+        current = existing_by_slug.get(default["slug"])
+        # Use the enabled value from DEFAULT_MODULES if specified, otherwise default to False
+        default_enabled = default.get("enabled", False)
+        if not current:
+            await module_repo.upsert_module(
+                slug=default["slug"],
+                name=default["name"],
+                description=default["description"],
+                icon=default["icon"],
+                enabled=default_enabled,
+                settings=default["settings"],
+            )
+            continue
+        updates: dict[str, Any] = {}
+        if current.get("name") != default["name"]:
+            updates["name"] = default["name"]
+        if current.get("description") != default["description"]:
+            updates["description"] = default["description"]
+        if current.get("icon") != default["icon"]:
+            updates["icon"] = default["icon"]
+        # Never overwrite an existing enabled flag.  Migration-created rows and
+        # operator toggles are authoritative; defaults apply only to new rows.
+        if updates:
+            await module_repo.update_module(default["slug"], **updates)
+
+
+async def list_modules() -> list[dict[str, Any]]:
+    modules = await module_repo.list_modules()
+    return [
+        _redact_module_settings(_resolve_module_for_runtime(module))
+        for module in modules
+        if not _is_always_on_ticket_action_module(str(module.get("slug") or ""))
+    ]
+
+
+async def get_module_settings(slug: str) -> dict[str, Any] | None:
+    module = await module_repo.get_module(slug)
+    if not module:
+        return None
+    return _resolve_module_settings_for_runtime(slug, module)
+
+
+# Modules that are only ingesters or interfaces and cannot trigger actions
+_NON_TRIGGERABLE_MODULE_SLUGS = {
+    "imap",  # IMAP Mailboxes - only ingests emails
+    "ollama",  # Ollama - AI interface, doesn't output actions
+    "xero",  # Xero - removed from trigger actions
+    "uptimekuma",  # Uptime Kuma - removed from trigger actions
+    "syncro",  # Syncro - removed from trigger actions
+    "chatgpt-mcp",  # ChatGPT MCP - removed from trigger actions
+    "ollama-mcp",  # Ollama MCP - inbound query surface, not an action module
+    "call-recordings",  # Call Recordings - configuration only, not an action module
+    "unifi-talk",  # Unifi Talk - SFTP import module, not an action module
+    "plausible",  # Plausible - email tracking config only
+    "m365-admin",  # M365 Admin - configuration only, not an action module
+    "hudu",  # Hudu - documentation/password management, not a trigger action module
+    "huntress",  # Huntress - report data ingester, not a trigger action module
+    "solidtime",  # Solidtime - dedicated ticket/reply sync, not a generic trigger action module
+}
+
+_ACTION_PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
+    "smtp": {
+        "fields": [
+            {
+                "name": "recipients",
+                "label": "Recipients",
+                "type": "json",
+                "required": True,
+                "placeholder": '["support@example.com"]',
+            },
+            {"name": "subject", "label": "Subject", "type": "string", "required": True},
+            {"name": "html", "label": "HTML body", "type": "string"},
+            {"name": "text", "label": "Text body", "type": "string"},
+            {"name": "sender", "label": "Sender", "type": "string"},
+        ],
+    },
+    "ntfy": {
+        "fields": [
+            {"name": "topic", "label": "Topic", "type": "string"},
+            {"name": "title", "label": "Title", "type": "string"},
+            {"name": "message", "label": "Message", "type": "string", "required": True},
+            {
+                "name": "priority",
+                "label": "Priority",
+                "type": "string",
+                "enum": ["min", "low", "default", "high", "urgent", "max"],
+            },
+        ],
+    },
+    "create-ticket": {
+        "fields": [
+            {"name": "subject", "label": "Subject", "type": "string", "required": True},
+            {
+                "name": "description",
+                "label": "Description",
+                "type": "string",
+                "required": True,
+            },
+            {"name": "status", "label": "Status", "type": "string"},
+            {"name": "priority", "label": "Priority", "type": "string"},
+            {"name": "company_id", "label": "Company ID", "type": "string"},
+            {"name": "requester_id", "label": "Requester ID", "type": "string"},
+            {"name": "assigned_user_id", "label": "Assigned user ID", "type": "string"},
+            {"name": "module_slug", "label": "Module slug", "type": "string"},
+        ],
+    },
+    "create-task": {
+        "fields": [
+            {"name": "task_name", "label": "Task name", "type": "string"},
+            {"name": "sort_order", "label": "Sort order", "type": "integer"},
+            {"name": "context", "label": "Context (JSON)", "type": "json"},
+            {"name": "tasks", "label": "Tasks (JSON array)", "type": "json"},
+        ],
+    },
+    "update-ticket": {
+        "fields": [
+            {"name": "ticket_id", "label": "Ticket ID", "type": "string"},
+            {"name": "subject", "label": "Subject", "type": "string"},
+            {"name": "description", "label": "Description", "type": "string"},
+            {"name": "status", "label": "Status", "type": "string"},
+            {"name": "priority", "label": "Priority", "type": "string"},
+            {"name": "assigned_user_id", "label": "Assigned user ID", "type": "string"},
+            {"name": "requester_id", "label": "Requester ID", "type": "string"},
+            {"name": "requester_staff_id", "label": "Requester staff ID", "type": "string"},
+            {"name": "company_id", "label": "Company ID", "type": "string"},
+            {"name": "category", "label": "Category", "type": "string"},
+            {"name": "external_reference", "label": "External reference", "type": "string"},
+            {"name": "review_date", "label": "Review date (YYYY-MM-DD)", "type": "string"},
+            {"name": "module_slug", "label": "Module slug", "type": "string"},
+            {"name": "ticket_number", "label": "Ticket number", "type": "string"},
+            {"name": "xero_invoice_number", "label": "Xero invoice number", "type": "string"},
+            {"name": "shipment_tracking_url", "label": "Shipping tracking URL", "type": "string"},
+            {"name": "shipment_poll_interval_seconds", "label": "Shipment poll interval (seconds)", "type": "integer"},
+            {"name": "shipment_monitoring_enabled", "label": "Shipment monitoring enabled", "type": "boolean"},
+            {"name": "shipment_public_comments_enabled", "label": "Shipment public comments enabled", "type": "boolean"},
+        ],
+    },
+    "update-ticket-description": {
+        "fields": [
+            {
+                "name": "ticket_id",
+                "label": "Ticket ID",
+                "type": "string",
+                "required": True,
+            },
+            {
+                "name": "description",
+                "label": "Description",
+                "type": "string",
+                "required": True,
+            },
+        ],
+    },
+    "ai-rename-ticket": {
+        "fields": [
+            {
+                "name": "ticket_id",
+                "label": "Ticket ID",
+                "type": "string",
+                "placeholder": "{{ticket.id}}",
+            },
+        ],
+    },
+    "reprocess-ai": {
+        "fields": [
+            {
+                "name": "ticket_id",
+                "label": "Ticket ID",
+                "type": "string",
+                "required": True,
+            },
+            {"name": "refresh_summary", "label": "Refresh summary", "type": "boolean"},
+            {"name": "refresh_tags", "label": "Refresh tags", "type": "boolean"},
+        ],
+    },
+    "add-ticket-reply": {
+        "fields": [
+            {
+                "name": "ticket_id",
+                "label": "Ticket ID",
+                "type": "string",
+                "required": True,
+            },
+            {"name": "body", "label": "Body", "type": "string", "required": True},
+            {"name": "is_internal", "label": "Internal note", "type": "boolean"},
+            {"name": "minutes_spent", "label": "Minutes spent", "type": "integer"},
+            {"name": "is_billable", "label": "Billable", "type": "boolean"},
+            {"name": "author_id", "label": "Author ID", "type": "string"},
+        ],
+    },
+    "smart-attachment-removal": {
+        "fields": [
+            {
+                "name": "ticket_id",
+                "label": "Ticket ID",
+                "type": "string",
+                "placeholder": "{{ticket.id}}",
+            },
+            {
+                "name": "hash_algorithm",
+                "label": "Hash algorithm",
+                "type": "string",
+                "enum": ["sha256", "md5"],
+            },
+            {
+                "name": "dry_run",
+                "label": "Dry run",
+                "type": "boolean",
+            },
+        ],
+    },
+    "whisperx": {
+        "fields": [
+            {"name": "ticket_id", "label": "Ticket ID", "type": "string"},
+            {"name": "add_note", "label": "Add note", "type": "boolean"},
+            {"name": "language", "label": "Language", "type": "string"},
+        ],
+    },
+    "password-pusher": {
+        "fields": [
+            {
+                "name": "payload",
+                "label": "Secret text",
+                "type": "string",
+                "required": True,
+            },
+            {
+                "name": "expire_after_days",
+                "label": "Expire after days",
+                "type": "integer",
+            },
+            {
+                "name": "expire_after_views",
+                "label": "Expire after views",
+                "type": "integer",
+            },
+            {
+                "name": "deletable_by_viewer",
+                "label": "Deletable by viewer",
+                "type": "boolean",
+            },
+            {
+                "name": "retrieval_step",
+                "label": "Add retrieval step",
+                "type": "boolean",
+            },
+            {"name": "note", "label": "Note", "type": "string"},
+        ],
+    },
+    "trello": {
+        "fields": [
+            {
+                "name": "card_id",
+                "label": "Card ID",
+                "type": "string",
+                "required": True,
+                "placeholder": "{{ticket.external_reference}}",
+            },
+            {
+                "name": "text",
+                "label": "Comment text",
+                "type": "string",
+                "required": True,
+            },
+        ],
+    },
+}
+
+
+def get_action_payload_schema(slug: str) -> dict[str, Any] | None:
+    return _ACTION_PAYLOAD_SCHEMAS.get(str(slug or "").strip())
+
+
+def validate_action_payload(
+    module_slug: str, payload: Mapping[str, Any] | None
+) -> None:
+    schema = get_action_payload_schema(module_slug)
+    if not schema:
+        return
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        raise ValueError("Action payload must be an object.")
+
+    fields = schema.get("fields")
+    if not isinstance(fields, list):
+        return
+    for field in fields:
+        if not isinstance(field, Mapping):
+            continue
+        name = str(field.get("name") or "").strip()
+        if not name:
+            continue
+        required = bool(field.get("required"))
+        value = payload.get(name)
+        if required and (
+            value is None or (isinstance(value, str) and not value.strip())
+        ):
+            raise ValueError(
+                f"Action payload field '{name}' is required for module '{module_slug}'."
+            )
+        if value is None:
+            continue
+        field_type = str(field.get("type") or "string").strip().lower()
+        if field_type == "string":
+            if not isinstance(value, str):
+                raise ValueError(f"Action payload field '{name}' must be a string.")
+        elif field_type == "integer":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"Action payload field '{name}' must be an integer.")
+        elif field_type == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"Action payload field '{name}' must be a number.")
+        elif field_type == "boolean":
+            if not isinstance(value, bool):
+                raise ValueError(f"Action payload field '{name}' must be a boolean.")
+        elif field_type == "json":
+            # Any JSON-compatible value is allowed; type-specific validation should
+            # be implemented by module handlers for advanced cases.
+            pass
+
+        enum_values = field.get("enum")
+        if enum_values and isinstance(enum_values, list) and value not in enum_values:
+            raise ValueError(
+                f"Action payload field '{name}' must be one of: {', '.join(str(v) for v in enum_values)}."
+            )
+
+
+async def list_trigger_action_modules() -> list[dict[str, Any]]:
+    """Return modules that can be used as trigger actions in automations.
+
+    This filters out modules that are only ingesters (e.g., IMAP) or interfaces
+    (e.g., Ollama, ChatGPT MCP) that cannot output actions, as well as modules
+    that have been explicitly excluded (Xero, UptimeKuma, Syncro).
+
+    Additionally, disabled modules are filtered out to prevent them from appearing
+    in the trigger actions menu.
+    """
+    modules = await module_repo.list_modules()
+    actionable_by_slug: dict[str, dict[str, Any]] = {}
+    for module in modules:
+        module_slug = _normalise_slug(str(module.get("slug") or ""))
+        if module_slug in _NON_TRIGGERABLE_MODULE_SLUGS or not module.get(
+            "enabled", False
+        ):
+            continue
+        redacted = _redact_module_settings(module)
+        redacted["payload_schema"] = get_action_payload_schema(module_slug)
+        actionable_by_slug[module_slug] = redacted
+    for module in _ALWAYS_ON_TICKET_ACTION_MODULES:
+        module_slug = module["slug"]
+        internal_module = dict(module)
+        internal_module["payload_schema"] = get_action_payload_schema(module_slug)
+        actionable_by_slug[module_slug] = internal_module
+    return sorted(
+        actionable_by_slug.values(),
+        key=lambda module: str(module.get("name") or "").lower(),
+    )
+
+
+async def get_module(slug: str, *, redact: bool = True) -> dict[str, Any] | None:
+    module = await module_repo.get_module(slug)
+    if not module:
+        return None
+    resolved = _resolve_module_for_runtime(module)
+    return _redact_module_settings(resolved) if redact else resolved
+
+
+async def update_module(
+    slug: str,
+    *,
+    enabled: bool | None = None,
+    settings: Mapping[str, Any] | None = None,
+    notifier: RefreshNotifier | None = None,
+) -> dict[str, Any] | None:
+    capabilities = MODULE_CAPABILITIES.get(slug)
+    if capabilities and capabilities.always_on:
+        # Internal action modules are catalogue entries, not kill switches.
+        enabled = True
+    existing = await module_repo.get_module(slug)
+    coerced = (
+        _coerce_settings(slug, settings, existing) if settings is not None else None
+    )
+    updated = await module_repo.update_module(slug, enabled=enabled, settings=coerced)
+    if updated:
+        # When a module is disabled, deactivate any scheduled tasks that belong to it.
+        if enabled is False:
+            module_commands = COMMANDS_BY_MODULE.get(slug, set())
+            if module_commands:
+                await scheduled_tasks_repo.disable_tasks_for_commands(module_commands, module_slug=slug)
+        elif enabled is True:
+            await scheduled_tasks_repo.restore_tasks_disabled_by_module(slug)
+        resolved_notifier = notifier or refresh_notifier
+        await resolved_notifier.broadcast_refresh(reason=f"modules:updated:{slug}")
+    return _redact_module_settings(updated) if updated else None
+
+
+def _normalise_logged_username(value: Any) -> str:
+    username = str(value or "").strip().casefold()
+    if "\\" in username:
+        username = username.rsplit("\\", 1)[-1]
+    if "@" in username:
+        username = username.split("@", 1)[0]
+    return username
+
+
+async def _invoke_suggest_assets(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Find imported assets whose logged-in user matches the requester."""
+    del settings, event_future
+    ticket_id = _extract_ticket_id_from_email_payload(payload)
+    if not ticket_id:
+        return {"status": "skipped", "reason": "Ticket context is required"}
+    requester = await db.fetch_one(
+        """
+        SELECT t.company_id, c.tacticalrmm_client_id,
+               COALESCE(rs.email, u.email) AS email,
+               COALESCE(rs.first_name, es.first_name) AS first_name,
+               COALESCE(rs.last_name, es.last_name) AS last_name
+        FROM tickets t
+        INNER JOIN companies c ON c.id = t.company_id
+        LEFT JOIN users u ON u.id = t.requester_id
+        LEFT JOIN staff rs ON rs.id = t.requester_staff_id
+        LEFT JOIN staff es ON es.company_id = t.company_id AND es.email = u.email
+        WHERE t.id = %s
+        LIMIT 1
+        """,
+        (ticket_id,),
+    )
+    if not requester:
+        return {"status": "skipped", "reason": "Ticket requester could not be resolved"}
+
+    email = str(requester.get("email") or "").strip()
+    first = str(requester.get("first_name") or "").strip()
+    last = str(requester.get("last_name") or "").strip()
+    candidates = []
+    for candidate in (email.split("@", 1)[0], f"{first}.{last}", first):
+        normalised = _normalise_logged_username(candidate)
+        if normalised and normalised not in candidates:
+            candidates.append(normalised)
+
+    suggestions: list[tuple[int, str]] = []
+    seen_asset_ids: set[int] = set()
+
+    # Imported assets already contain the last logged-in user. Search those
+    # records first so suggestions do not depend on a live integration request.
+    assets = await db.fetch_all(
+        "SELECT id, last_user FROM assets WHERE company_id = %s",
+        (requester["company_id"],),
+    )
+    for candidate in candidates:
+        matches = [
+            asset
+            for asset in (assets or [])
+            if _normalise_logged_username(asset.get("last_user")) == candidate
+        ]
+        if matches:
+            for asset in matches:
+                asset_id = int(asset["id"])
+                if asset_id not in seen_asset_ids:
+                    suggestions.append((asset_id, candidate))
+                    seen_asset_ids.add(asset_id)
+            break
+
+    # Merge live Tactical RMM matches with cached matches when the company has
+    # an integration mapping, catching devices whose imported user is stale.
+    tactical_client_id = requester.get("tacticalrmm_client_id")
+    if tactical_client_id:
+        from app.services import tacticalrmm
+
+        agents = await tacticalrmm.fetch_agents(str(tactical_client_id))
+        matched_agents: list[tuple[Mapping[str, Any], str]] = []
+        for candidate in candidates:
+            matched_agents = [
+                (agent, candidate)
+                for agent in agents
+                if _normalise_logged_username(tacticalrmm.extract_agent_details(agent).get("last_user"))
+                == candidate
+            ]
+            if matched_agents:
+                break
+
+        for agent, matched_username in matched_agents:
+            agent_id = str(agent.get("agent_id") or agent.get("id") or agent.get("pk") or "").strip()
+            if not agent_id:
+                continue
+            asset = await db.fetch_one(
+                "SELECT id FROM assets WHERE company_id = %s AND tactical_asset_id = %s",
+                (requester["company_id"], agent_id),
+            )
+            if asset:
+                asset_id = int(asset["id"])
+                if asset_id not in seen_asset_ids:
+                    suggestions.append((asset_id, matched_username))
+                    seen_asset_ids.add(asset_id)
+    await tickets_repo.replace_ticket_suggested_assets(ticket_id, suggestions)
+    return {"status": "ok", "ticket_id": ticket_id, "suggested": len(suggestions)}
+
+
+async def trigger_module(
+    slug: str,
+    payload: Mapping[str, Any] | None = None,
+    *,
+    background: bool = True,
+    on_complete: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    module = _get_always_on_ticket_action_module(slug)
+    if not module:
+        module = await module_repo.get_module(slug)
+        if not module:
+            raise ValueError(f"Module {slug} is not configured")
+        if not module.get("enabled"):
+            return {"status": "skipped", "reason": "Module disabled", "module": slug}
+    settings = _resolve_module_settings_for_runtime(slug, module)
+    handler_map: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
+        "suggest-assets": _invoke_suggest_assets,
+        "syncro": _validate_syncro,
+        "ollama": _invoke_ollama,
+        "smtp": _invoke_smtp,
+        "smtp2go": _invoke_smtp2go,
+        "tacticalrmm": _invoke_tacticalrmm,
+        "ntfy": _invoke_ntfy,
+        "apprise": _invoke_apprise,
+        "uptimekuma": _validate_uptimekuma,
+        "chatgpt-mcp": _invoke_chatgpt_mcp,
+        "xero": _validate_xero,
+        "sms-gateway": _invoke_sms_gateway,
+        "create-ticket": _invoke_create_ticket,
+        "create-task": _invoke_create_task,
+        "call-recordings": _validate_call_recordings,
+        "unifi-talk": _invoke_unifi_talk,
+        "plausible": _validate_plausible,
+        "update-ticket": _invoke_update_ticket,
+        "update-ticket-description": _invoke_update_ticket_description,
+        "ai-rename-ticket": _invoke_ai_rename_ticket,
+        "reprocess-ai": _invoke_reprocess_ai,
+        "add-ticket-reply": _invoke_add_ticket_reply,
+        "smart-attachment-removal": _invoke_smart_attachment_removal,
+        "whisperx": _invoke_whisperx,
+        "password-pusher": _invoke_password_pusher,
+        "hudu": _validate_hudu,
+        "trello": _invoke_trello_add_comment,
+        "solidtime": _invoke_solidtime_reconcile,
+    }
+    handler = handler_map.get(slug)
+    if not handler:
+        raise ValueError(f"No handler registered for module {slug}")
+
+    async def _invoke_handler(
+        *,
+        event_future: asyncio.Future[int | None] | None,
+    ) -> dict[str, Any]:
+        try:
+            result = await handler(settings, payload or {}, event_future=event_future)
+        except Exception as exc:
+            logger.exception(
+                "Module background task encountered an error",
+                module=slug,
+                error=str(exc),
+            )
+            if event_future and not event_future.done():
+                event_future.set_result(None)
+            result = {
+                "status": "error",
+                "error": "An internal module error occurred",
+                "module": slug,
+            }
+        if event_future and not event_future.done():
+            event_id_value = result.get("event_id")
+            event_future.set_result(
+                event_id_value if isinstance(event_id_value, int) else None
+            )
+        if on_complete:
+            try:
+                await on_complete(result)
+            except Exception as callback_exc:  # pragma: no cover - defensive logging
+                logger.error(
+                    "Module completion callback failed",
+                    module=slug,
+                    error=str(callback_exc),
+                )
+        return result
+
+    if not background:
+        return await _invoke_handler(event_future=None)
+
+    loop = asyncio.get_running_loop()
+    event_future: asyncio.Future[int | None] = loop.create_future()
+
+    async def _runner() -> dict[str, Any]:
+        return await _invoke_handler(event_future=event_future)
+
+    task: asyncio.Task[dict[str, Any]] = asyncio.create_task(_runner())
+    _BACKGROUND_TASKS.add(task)
+
+    def _cleanup(completed: asyncio.Task[dict[str, Any]]) -> None:
+        _BACKGROUND_TASKS.discard(completed)
+        try:
+            completed.result()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error("Module background task failed", module=slug, error=str(exc))
+
+    task.add_done_callback(_cleanup)
+
+    event_id_value: int | None = None
+    try:
+        event_id_value = await asyncio.wait_for(event_future, timeout=0.5)
+    except asyncio.TimeoutError:  # pragma: no cover - timing dependent
+        event_id_value = None
+
+    queued_result: dict[str, Any] = {"status": "queued", "module": slug}
+    if event_id_value is not None:
+        queued_result["event_id"] = event_id_value
+    return queued_result
+
+
+def _parse_event_response(event: Mapping[str, Any]) -> Any:
+    response_body = event.get("response_body")
+    if response_body is None:
+        return None
+    if isinstance(response_body, (dict, list)):
+        return response_body
+    if isinstance(response_body, str):
+        try:
+            return json.loads(response_body)
+        except json.JSONDecodeError:
+            return response_body
+    return response_body
+
+
+def _extract_openai_compatible_text(payload: Any) -> str | None:
+    """Extract assistant text from OpenAI-compatible chat completion payloads.
+
+    llama.cpp's OpenAI-compatible server returns successful generations in the
+    ``choices[].message.content`` shape. Ticket AI processors expect an
+    Ollama-like ``response``/``message`` field, so normalize that text into the
+    parsed response while preserving the original provider payload.
+    """
+
+    if not isinstance(payload, Mapping):
+        return None
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return None
+
+    message = first.get("message")
+    if isinstance(message, Mapping):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, Mapping):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(item, str):
+                    parts.append(item)
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+
+    text = first.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+
+    return None
+
+
+def _normalise_ai_response_payload(payload: Any) -> Any:
+    """Add Ollama-style text keys to OpenAI-compatible AI responses."""
+
+    text = _extract_openai_compatible_text(payload)
+    if not text or not isinstance(payload, Mapping):
+        return payload
+
+    normalised = dict(payload)
+    normalised.setdefault("response", text)
+    normalised.setdefault("message", text)
+    normalised.setdefault("text", text)
+    return normalised
+
+
+def _build_event_result(
+    event: Mapping[str, Any], extra: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if extra:
+        result.update(extra)
+    event_id = event.get("id")
+    if event_id is not None:
+        result["event_id"] = int(event_id)
+    status = str(event.get("status") or "pending")
+    result["status"] = status
+    result["event_status"] = status
+    if event.get("response_status") is not None:
+        result["response_status"] = event.get("response_status")
+    if event.get("attempt_count") is not None:
+        result["attempt_count"] = event.get("attempt_count")
+    if event.get("last_error"):
+        result["last_error"] = event.get("last_error")
+    parsed_response = _parse_event_response(event)
+    if parsed_response is not None:
+        result["response"] = _normalise_ai_response_payload(parsed_response)
+    return result
+
+
+async def _record_success(
+    event_id: int,
+    *,
+    attempt_number: int,
+    response_status: int | None,
+    response_body: str | None,
+    request_headers: Mapping[str, Any] | None = None,
+    request_body: Any = None,
+) -> dict[str, Any]:
+    await webhook_repo.record_attempt(
+        event_id=event_id,
+        attempt_number=attempt_number,
+        status="succeeded",
+        response_status=response_status,
+        response_body=response_body,
+        error_message=None,
+        request_headers=request_headers,
+        request_body=request_body,
+    )
+    await webhook_repo.mark_event_completed(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=response_status,
+        response_body=response_body,
+    )
+    refreshed = await webhook_repo.get_event(event_id)
+    return refreshed or {"id": event_id, "status": "succeeded"}
+
+
+async def _record_failure(
+    event_id: int,
+    *,
+    attempt_number: int,
+    status: str,
+    error_message: str | None,
+    response_status: int | None,
+    response_body: str | None,
+    request_headers: Mapping[str, Any] | None = None,
+    request_body: Any = None,
+) -> dict[str, Any]:
+    await webhook_repo.record_attempt(
+        event_id=event_id,
+        attempt_number=attempt_number,
+        status=status,
+        response_status=response_status,
+        response_body=response_body,
+        error_message=error_message,
+        request_headers=request_headers,
+        request_body=request_body,
+    )
+    await webhook_repo.mark_event_failed(
+        event_id,
+        attempt_number=attempt_number,
+        error_message=error_message,
+        response_status=response_status,
+        response_body=response_body,
+    )
+    refreshed = await webhook_repo.get_event(event_id)
+    return refreshed or {
+        "id": event_id,
+        "status": "failed",
+        "last_error": error_message,
+    }
+
+
+async def _invoke_ollama(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    provider = (
+        str(payload.get("provider") or settings.get("provider") or "ollama")
+        .strip()
+        .lower()
+    )
+    if provider not in {"ollama", "openai", "llamacpp"}:
+        provider = "ollama"
+
+    default_base_url = (
+        "https://api.openai.com" if provider == "openai" else _DEFAULT_OLLAMA_BASE_URL
+    )
+    configured_base_url = str(settings.get("base_url") or "").strip()
+    if provider == "openai" and configured_base_url.rstrip(
+        "/"
+    ) == _DEFAULT_OLLAMA_BASE_URL.rstrip("/"):
+        configured_base_url = ""
+    base_url = (configured_base_url or default_base_url).rstrip("/")
+
+    payload_model = payload.get("model")
+    configured_model = str(settings.get("model") or "").strip()
+    model = (
+        str(payload_model or "").strip() or configured_model or _DEFAULT_OLLAMA_MODEL
+    )
+
+    default_prompt = str(settings.get("prompt") or "")
+    prompt = str(payload.get("prompt") or payload.get("text") or default_prompt)
+    if not prompt:
+        raise ValueError("Ollama prompt cannot be empty")
+
+    request_headers = {"Content-Type": "application/json"}
+    if provider == "ollama":
+        endpoint = urljoin(f"{base_url}/", "api/generate")
+        body: dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
+        payload_format = payload.get("format")
+        if payload_format is not None:
+            body["format"] = payload_format
+    else:
+        endpoint = urljoin(f"{base_url}/", "v1/chat/completions")
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            messages = [{"role": "user", "content": prompt}]
+        body = {"model": model, "messages": messages, "stream": False}
+        if payload.get("temperature") is not None:
+            body["temperature"] = payload.get("temperature")
+        if payload.get("max_tokens") is not None:
+            body["max_tokens"] = payload.get("max_tokens")
+        if payload.get("response_format") is not None:
+            body["response_format"] = payload.get("response_format")
+        elif payload.get("format") == "json":
+            body["response_format"] = {"type": "json_object"}
+        api_key = str(payload.get("api_key") or settings.get("api_key") or "").strip()
+        if api_key:
+            request_headers["Authorization"] = f"Bearer {api_key}"
+
+    event = await webhook_monitor.create_manual_event(
+        name=f"module.ollama.{provider}.generate",
+        target_url=endpoint,
+        payload={"request_body": body},
+        headers={
+            k: ("********" if k.lower() == "authorization" else v)
+            for k, v in request_headers.items()
+        },
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for Ollama request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+    attempt_number = 1
+    recorded_headers = {
+        k: ("********" if k.lower() == "authorization" else v)
+        for k, v in request_headers.items()
+    }
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(endpoint, json=body, headers=request_headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        response_body = exc.response.text if exc.response is not None else None
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="failed",
+            error_message=(
+                f"HTTP {exc.response.status_code}" if exc.response else str(exc)
+            ),
+            response_status=exc.response.status_code if exc.response else None,
+            response_body=response_body,
+            request_headers=recorded_headers,
+            request_body=body,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"model": model, "endpoint": endpoint, "provider": provider},
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+            request_headers=recorded_headers,
+            request_body=body,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"model": model, "endpoint": endpoint, "provider": provider},
+        )
+
+    response_body = response.text
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=response.status_code,
+        response_body=response_body,
+        request_headers=recorded_headers,
+        request_body=body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={"model": model, "endpoint": endpoint, "provider": provider},
+    )
+
+
+async def _invoke_smtp(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    # Support both 'to' (SMTP2Go API format) and 'recipients' (legacy format)
+    recipients = _ensure_list(
+        payload.get("to") or payload.get("recipients")
+    ) or _ensure_list(settings.get("default_recipients"))
+    subject_prefix = str(settings.get("subject_prefix") or "").strip()
+    # Use payload value if key exists, even if empty string (template may have rendered to empty)
+    if "subject" in payload:
+        subject = str(payload["subject"])
+    else:
+        subject = "Automation notification"
+    if subject_prefix:
+        subject = f"{subject_prefix} {subject}".strip()
+    # Use payload value if key exists, even if empty string (template may have rendered to empty)
+    # Support 'html', 'html_body', and 'body' keys for compatibility with SMTP2Go format
+    if "html" in payload:
+        html_body = str(payload["html"])
+    elif "html_body" in payload:
+        html_body = str(payload["html_body"])
+    elif "body" in payload:
+        html_body = str(payload["body"])
+    else:
+        html_body = "<p>Automation triggered.</p>"
+    # Support both 'text' and 'text_body' keys
+    text_body = payload.get("text") or payload.get("text_body")
+    # Payload sender takes precedence over settings from_address
+    sender = str(payload.get("sender") or settings.get("from_address") or "") or None
+    attachments = (
+        payload.get("attachments")
+        if isinstance(payload.get("attachments"), list)
+        else None
+    )
+    if attachments is None:
+        attachments = await _load_ticket_email_attachments(payload)
+
+    # Extract ticket reply ID from context if present, to enable email tracking
+    enable_tracking = False
+    ticket_reply_id: int | None = None
+    context = payload.get("context")
+    if isinstance(context, Mapping):
+        # Check if this is a ticket reply notification
+        # Try metadata first (for direct notification events)
+        metadata = context.get("metadata")
+        if isinstance(metadata, Mapping):
+            # Look for reply_id or ticket_reply_id in metadata
+            reply_id_value = metadata.get("reply_id") or metadata.get("ticket_reply_id")
+            if reply_id_value is not None:
+                try:
+                    ticket_reply_id = int(reply_id_value)
+                    enable_tracking = True
+                except (TypeError, ValueError):
+                    pass
+
+        # If not found in metadata, check ticket.latest_reply.id (for automation events)
+        if ticket_reply_id is None:
+            ticket = context.get("ticket")
+            if isinstance(ticket, Mapping):
+                latest_reply = ticket.get("latest_reply")
+                if isinstance(latest_reply, Mapping):
+                    reply_id_value = latest_reply.get("id")
+                    if reply_id_value is not None:
+                        try:
+                            ticket_reply_id = int(reply_id_value)
+                            enable_tracking = True
+                        except (TypeError, ValueError):
+                            pass
+
+    event = await webhook_monitor.create_manual_event(
+        name="module.smtp.send",
+        target_url="smtp://send",
+        payload={
+            "subject": subject,
+            "recipients": recipients,
+            "html": html_body,
+            "text": text_body,
+            "sender": sender,
+            "enable_tracking": enable_tracking,
+            "ticket_reply_id": ticket_reply_id,
+        },
+        headers={"X-Module": "smtp"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for SMTP request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+    attempt_number = 1
+    try:
+        sent, email_event_metadata = await email_service.send_email(
+            subject=subject,
+            recipients=recipients,
+            html_body=html_body,
+            text_body=str(text_body) if text_body is not None else None,
+            sender=sender,
+            enable_tracking=enable_tracking,
+            ticket_reply_id=ticket_reply_id,
+            attachments=attachments,
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"recipients": recipients, "subject": subject},
+        )
+
+    if not sent:
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="failed",
+            error_message="SMTP service declined to send message",
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={
+                "recipients": recipients,
+                "subject": subject,
+                "email_event_id": (
+                    (email_event_metadata or {}).get("id")
+                    if isinstance(email_event_metadata, dict)
+                    else None
+                ),
+            },
+        )
+
+    response_body = json.dumps({"recipients": recipients, "subject": subject})
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=250,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "recipients": recipients,
+            "subject": subject,
+            "email_event_id": (
+                (email_event_metadata or {}).get("id")
+                if isinstance(email_event_metadata, dict)
+                else None
+            ),
+        },
+    )
+
+
+async def _invoke_smtp2go(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Invoke SMTP2Go module to send email.
+
+    Supports both direct payload and template-based email sending.
+
+    Direct payload format:
+        {
+            "recipients": ["user@example.com"],
+            "subject": "Email subject",
+            "html": "<p>HTML body</p>",
+            "text": "Plain text body",
+            "sender": "sender@example.com"
+        }
+
+    Template-based format:
+        {
+            "template": "password_reset",
+            "recipients": ["user@example.com"],
+            "variables": {
+                "recipient_name": "John Doe",
+                "reset_link": "https://...",
+                "expiry_time": "1 hour"
+            },
+            "sender": "noreply@example.com"
+        }
+    """
+    from app.services import smtp2go
+
+    # Check if using template
+    template_type = payload.get("template")
+    recipients: list[str] = []
+    if template_type:
+        # Template-based email
+        try:
+            variables = payload.get("variables", {})
+            recipients = _ensure_list(payload.get("recipients"))
+            sender = str(payload.get("sender") or "").strip() or None
+
+            # Format payload using template
+            formatted_payload = smtp2go.format_template_payload(
+                template_type,
+                variables,
+                recipients,
+                sender,
+            )
+
+            subject = formatted_payload["subject"]
+            html_body = formatted_payload["html_body"]
+            text_body = formatted_payload.get("text_body")
+            sender = formatted_payload.get("sender")
+
+        except ValueError as exc:
+            raise ValueError(f"Template error: {str(exc)}") from exc
+    else:
+        # Direct payload format
+        # Support both 'to' (SMTP2Go API format) and 'recipients' (legacy format)
+        recipients = _ensure_list(payload.get("to") or payload.get("recipients"))
+
+        subject = str(payload.get("subject") or "Automation notification")
+        html_body = str(
+            payload.get("html")
+            or payload.get("html_body")
+            or payload.get("body")
+            or "<p>Automation triggered.</p>"
+        )
+        text_body = payload.get("text") or payload.get("text_body")
+        sender = str(payload.get("sender") or "").strip() or None
+
+    if not recipients:
+        logger.warning(
+            "SMTP2Go module skipped because no recipients were provided after rendering",
+            module="smtp2go",
+            context_keys=(
+                list(payload.get("context", {}).keys())
+                if isinstance(payload.get("context"), Mapping)
+                else None
+            ),
+        )
+        return {"status": "skipped", "reason": "no_recipients", "module": "smtp2go"}
+
+    reply_to = str(payload.get("reply_to") or "").strip() or None
+
+    # Extract additional SMTP2Go API fields
+    cc = _ensure_list(payload.get("cc"))
+    bcc = _ensure_list(payload.get("bcc"))
+    attachments = (
+        payload.get("attachments")
+        if isinstance(payload.get("attachments"), list)
+        else None
+    )
+    if attachments is None:
+        attachments = _attachments_for_smtp2go(
+            await _load_ticket_email_attachments(payload)
+        )
+    template_id = str(payload.get("template_id") or "").strip() or None
+    template_data = (
+        payload.get("template_data")
+        if isinstance(payload.get("template_data"), dict)
+        else None
+    )
+
+    # Extract custom_headers - support both dict and list formats
+    custom_headers_input = payload.get("custom_headers")
+    custom_headers_dict: dict[str, str] | None = None
+    if isinstance(custom_headers_input, dict):
+        # Dict format: {"X-Header": "value"}
+        custom_headers_dict = {str(k): str(v) for k, v in custom_headers_input.items()}
+    elif isinstance(custom_headers_input, list):
+        # List format: [{"header": "X-Header", "value": "value"}]
+        custom_headers_dict = {}
+        for item in custom_headers_input:
+            if isinstance(item, dict):
+                header_name = str(item.get("header") or "").strip()
+                header_value = str(item.get("value") or "")
+                if header_name:
+                    custom_headers_dict[header_name] = header_value
+
+    enable_tracking = _ensure_bool(settings.get("enable_tracking"), True)
+    ticket_reply_id: int | None = None
+    context = payload.get("context")
+    if isinstance(context, Mapping):
+        metadata = context.get("metadata")
+        if isinstance(metadata, Mapping):
+            reply_id_value = metadata.get("reply_id") or metadata.get("ticket_reply_id")
+            if reply_id_value is not None:
+                try:
+                    ticket_reply_id = int(reply_id_value)
+                except (TypeError, ValueError):
+                    ticket_reply_id = None
+
+        if ticket_reply_id is None:
+            ticket = context.get("ticket")
+            if isinstance(ticket, Mapping):
+                latest_reply = ticket.get("latest_reply")
+                if isinstance(latest_reply, Mapping):
+                    reply_id_value = latest_reply.get("id")
+                    if reply_id_value is not None:
+                        try:
+                            ticket_reply_id = int(reply_id_value)
+                        except (TypeError, ValueError):
+                            ticket_reply_id = None
+
+    event = await webhook_monitor.create_manual_event(
+        name="module.smtp2go.send",
+        target_url="smtp2go://send",
+        payload={
+            "subject": subject,
+            "recipients": recipients,
+            "html": html_body,
+            "text": text_body,
+            "sender": sender,
+            "reply_to": reply_to,
+            "enable_tracking": enable_tracking,
+            "ticket_reply_id": ticket_reply_id,
+        },
+        headers={"X-Module": "smtp2go"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for SMTP2Go request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        tracking_id = smtp2go.generate_tracking_id() if enable_tracking else None
+        result = await smtp2go.send_email_via_api(
+            to=recipients,
+            subject=subject,
+            html_body=html_body,
+            text_body=str(text_body) if text_body is not None else None,
+            sender=sender,
+            reply_to=reply_to,
+            cc=cc,
+            bcc=bcc,
+            custom_headers=custom_headers_dict,
+            attachments=attachments,
+            template_id=template_id,
+            template_data=template_data,
+            tracking_id=tracking_id,
+        )
+
+        smtp2go_message_id = result.get("smtp2go_message_id") or result.get("email_id")
+        response_tracking_id = result.get("tracking_id") or tracking_id
+        # Store smtp2go_message_id and tracking_id for webhook correlation
+        # email_sent_at will be set when the 'processed' webhook event arrives
+        if (
+            enable_tracking
+            and ticket_reply_id
+            and response_tracking_id
+            and smtp2go_message_id
+        ):
+            await smtp2go.record_smtp2go_message_id(
+                ticket_reply_id=ticket_reply_id,
+                tracking_id=response_tracking_id,
+                smtp2go_message_id=smtp2go_message_id,
+            )
+        elif enable_tracking and ticket_reply_id:
+            logger.warning(
+                "SMTP2Go email sent but tracking data not available for storage",
+                ticket_reply_id=ticket_reply_id,
+                has_smtp2go_message_id=smtp2go_message_id is not None,
+                has_tracking_id=response_tracking_id is not None,
+            )
+
+        # Record per-recipient rows for the To/CC/BCC fan-out so the
+        # delivery-status badge popup can show each recipient independently.
+        # email_sent_at is intentionally left NULL here for SMTP2Go; it is
+        # stamped when the 'processed' webhook arrives per recipient.
+        if ticket_reply_id:
+            try:
+                from app.services import email_recipients as _email_recipients
+
+                await _email_recipients.record_recipients(
+                    reply_id=ticket_reply_id,
+                    tracking_id=response_tracking_id,
+                    smtp2go_message_id=smtp2go_message_id,
+                    to=recipients,
+                    cc=cc,
+                    bcc=bcc,
+                    sent_at=None,
+                )
+            except Exception as recipients_exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Failed to record per-recipient rows for SMTP2Go module send",
+                    reply_id=ticket_reply_id,
+                    error=str(recipients_exc),
+                )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"recipients": recipients, "subject": subject},
+        )
+
+    response_body = json.dumps(
+        {
+            "recipients": recipients,
+            "subject": subject,
+            "smtp2go_message_id": smtp2go_message_id,
+            "tracking_id": response_tracking_id,
+        }
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "recipients": recipients,
+            "subject": subject,
+            "smtp2go_message_id": smtp2go_message_id,
+            "tracking_id": response_tracking_id,
+        },
+    )
+
+
+async def _invoke_tacticalrmm(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    base_url = str(settings.get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise ValueError("Tactical RMM base URL is not configured")
+    api_key = str(settings.get("api_key") or "").strip()
+    verify_ssl = _ensure_bool(settings.get("verify_ssl"), True)
+    task_identifier = payload.get("task") or payload.get("task_id")
+    endpoint_path: str
+    if payload.get("endpoint") or payload.get("path"):
+        endpoint_path = str(payload.get("endpoint") or payload.get("path")).lstrip("/")
+    elif task_identifier is not None:
+        endpoint_path = f"automation/tasks/{task_identifier}/run/"
+    else:
+        endpoint_path = "automation/tasks/run/"
+    method = str(payload.get("method") or "POST").upper()
+    headers = {"Content-Type": "application/json"}
+    auth_header = str(payload.get("auth_header") or "X-API-KEY")
+    if api_key:
+        headers[auth_header] = payload.get("auth_prefix", "") + api_key
+    extra_headers = payload.get("headers")
+    if isinstance(extra_headers, Mapping):
+        for key, value in extra_headers.items():
+            headers[str(key)] = str(value)
+    request_body = payload.get("body")
+    url = urljoin(f"{base_url}/", endpoint_path)
+    event = await webhook_monitor.create_manual_event(
+        name="module.tacticalrmm.invoke",
+        target_url=url,
+        payload={
+            "method": method,
+            "json": request_body,
+            "verify_ssl": verify_ssl,
+        },
+        headers=headers,
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for TacticalRMM request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+    attempt_number = 1
+    try:
+        await _throttle_tacticalrmm_request()
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, verify=True) as client:
+            response = await client.request(
+                method, url, json=request_body, headers=headers
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        response_body = exc.response.text if exc.response is not None else None
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="failed",
+            error_message=(
+                f"HTTP {exc.response.status_code}" if exc.response else str(exc)
+            ),
+            response_status=exc.response.status_code if exc.response else None,
+            response_body=response_body,
+        )
+        result = _build_event_result(
+            updated_event,
+            extra={"url": url, "method": method},
+        )
+        if "response_status" in result:
+            result["status_code"] = result["response_status"]
+        return result
+    except Exception as exc:  # pragma: no cover - defensive
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        result = _build_event_result(
+            updated_event,
+            extra={"url": url, "method": method},
+        )
+        if "response_status" in result:
+            result["status_code"] = result["response_status"]
+        return result
+
+    response_body = response.text
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=response.status_code,
+        response_body=response_body,
+    )
+    result = _build_event_result(
+        updated_event,
+        extra={"url": url, "method": method},
+    )
+    if "response_status" in result:
+        result["status_code"] = result["response_status"]
+    return result
+
+
+async def _invoke_ntfy(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    def _lookup(source: Mapping[str, Any], *keys: str) -> tuple[Any, bool]:
+        seen: set[str] = set()
+        for key in keys:
+            if key is None:
+                continue
+            candidates = [key]
+            lower = key.lower()
+            upper = key.upper()
+            title = key.title()
+            capitalized = key.capitalize()
+            candidates.extend([lower, upper, title, capitalized])
+            swapped_dash = key.replace("-", "_")
+            swapped_underscore = key.replace("_", "-")
+            candidates.extend([swapped_dash, swapped_underscore])
+            candidates.extend([swapped_dash.lower(), swapped_dash.upper()])
+            candidates.extend([swapped_underscore.lower(), swapped_underscore.upper()])
+            camel_source = swapped_dash
+            parts = [part for part in camel_source.split("_") if part]
+            if parts:
+                camel = parts[0].lower() + "".join(
+                    part.capitalize() for part in parts[1:]
+                )
+                pascal = "".join(part.capitalize() for part in parts)
+                candidates.extend([camel, pascal])
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if candidate in source:
+                    return source[candidate], True
+        return None, False
+
+    def _coerce_header_value(value: Any) -> str:
+        if isinstance(value, Mapping):
+            return json.dumps(value)
+        if isinstance(value, (list, tuple)):
+            return ",".join(str(item) for item in value if item is not None)
+        if isinstance(value, set):
+            return ",".join(str(item) for item in sorted(value))
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return ""
+        return str(value)
+
+    def _canonical_header(name: str) -> str:
+        aliases = {
+            "title": "Title",
+            "priority": "Priority",
+            "tags": "Tags",
+            "tag": "Tags",
+            "icon": "Icon",
+            "click": "Click",
+            "actions": "Actions",
+            "attach": "Attach",
+            "attachment": "Attach",
+            "filename": "Filename",
+            "email": "Email",
+            "delay": "Delay",
+            "cache": "Cache",
+            "content-type": "Content-Type",
+            "content_type": "Content-Type",
+            "authorization": "Authorization",
+        }
+        lowered = name.lower()
+        return aliases.get(lowered, name)
+
+    payload_dict: dict[str, Any] = dict(payload) if isinstance(payload, Mapping) else {}
+    json_overrides = payload_dict.get("json")
+    if isinstance(json_overrides, Mapping):
+        merged_payload: dict[str, Any] = dict(json_overrides)
+        for key, value in payload_dict.items():
+            if key == "json":
+                continue
+            merged_payload[key] = value
+    else:
+        merged_payload = dict(payload_dict)
+
+    base_url_value, has_base_url = _lookup(
+        merged_payload, "base_url", "base-url", "baseUrl"
+    )
+    if not has_base_url:
+        base_url_value = settings.get("base_url")
+    base_url = str(base_url_value or "https://ntfy.sh").rstrip("/")
+
+    topic_value, has_topic = _lookup(merged_payload, "topic", "Topic")
+    if not has_topic:
+        topic_value = settings.get("topic")
+    topic = str(topic_value or "").strip()
+    if not topic:
+        raise ValueError("ntfy topic must be configured")
+
+    message_value, has_message = _lookup(
+        merged_payload, "message", "body", "Message", "Body"
+    )
+    if not has_message:
+        message_value = "Automation triggered"
+    if isinstance(message_value, Mapping) or (
+        isinstance(message_value, (list, tuple))
+        and not isinstance(message_value, (str, bytes, bytearray))
+    ):
+        message_text = json.dumps(message_value)
+    elif message_value is None:
+        message_text = ""
+    else:
+        message_text = str(message_value)
+
+    priority_value, has_priority = _lookup(merged_payload, "priority", "Priority")
+    if not has_priority:
+        priority_value = "default"
+    priority_text = ""
+    if priority_value is not None:
+        priority_text = str(priority_value).strip()
+    if not priority_text:
+        priority_text = "default"
+
+    title_value, has_title = _lookup(merged_payload, "title", "Title")
+    if not has_title:
+        title_value = "Automation event"
+    title_text = ""
+    if title_value is not None:
+        title_text = str(title_value).strip()
+    if not title_text:
+        title_text = "Automation event"
+
+    headers: dict[str, str] = {}
+    raw_headers = merged_payload.get("headers")
+    if isinstance(raw_headers, Mapping):
+        for name, value in raw_headers.items():
+            if value is None:
+                continue
+            canonical = _canonical_header(str(name))
+            headers[canonical] = _coerce_header_value(value)
+
+    header_aliases = {
+        "title": "Title",
+        "priority": "Priority",
+        "tags": "Tags",
+        "tag": "Tags",
+        "icon": "Icon",
+        "click": "Click",
+        "actions": "Actions",
+        "attach": "Attach",
+        "attachment": "Attach",
+        "filename": "Filename",
+        "email": "Email",
+        "delay": "Delay",
+        "cache": "Cache",
+        "content_type": "Content-Type",
+        "content-type": "Content-Type",
+    }
+    for key, canonical in header_aliases.items():
+        value, exists = _lookup(merged_payload, key, key.capitalize())
+        if not exists or value is None:
+            continue
+        if canonical not in headers:
+            headers[canonical] = _coerce_header_value(value)
+
+    if "Title" in headers:
+        title_text = headers["Title"]
+    else:
+        headers["Title"] = _coerce_header_value(title_text)
+        title_text = headers["Title"]
+
+    if "Priority" in headers:
+        priority_text = headers["Priority"]
+    else:
+        headers["Priority"] = _coerce_header_value(priority_text)
+        priority_text = headers["Priority"]
+
+    token_value, has_token = _lookup(
+        merged_payload, "auth_token", "token", "auth-token", "authToken"
+    )
+    if not has_token:
+        token_value = settings.get("auth_token")
+    token_text = str(token_value).strip() if token_value else ""
+    if token_text and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {token_text}"
+
+    url = f"{base_url}/{topic}"
+
+    # Ensure any remaining canonical header aliases are applied exactly once more.
+    for header_name, value in list(headers.items()):
+        headers[header_name] = _coerce_header_value(value)
+
+    message = message_text
+    priority = priority_text
+    title = title_text
+
+    event_payload = {
+        "topic": topic,
+        "message": message,
+        "priority": priority,
+        "title": title,
+        "headers": headers,
+    }
+    event = await webhook_monitor.create_manual_event(
+        name="module.ntfy.publish",
+        target_url=url,
+        payload=event_payload,
+        headers=headers,
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for ntfy request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+    attempt_number = 1
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(
+                url,
+                data=message.encode("utf-8"),
+                headers=headers,
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        response_body = exc.response.text if exc.response is not None else None
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="failed",
+            error_message=(
+                f"HTTP {exc.response.status_code}" if exc.response else str(exc)
+            ),
+            response_status=exc.response.status_code if exc.response else None,
+            response_body=response_body,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"topic": topic, "priority": priority, "title": title, "url": url},
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"topic": topic, "priority": priority, "title": title, "url": url},
+        )
+
+    response_body = response.text
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=response.status_code,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={"topic": topic, "priority": priority, "title": title, "url": url},
+    )
+
+
+class _SMSHTMLTextParser(HTMLParser):
+    """Convert rich-text editor HTML into SMS-friendly plain text."""
+
+    _BLOCK_TAGS = frozenset({
+        "address", "article", "aside", "blockquote", "div", "footer", "h1",
+        "h2", "h3", "h4", "h5", "h6", "header", "li", "p", "section", "tr",
+    })
+    _SKIP_TAGS = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_name = tag.lower()
+        if tag_name in self._SKIP_TAGS:
+            self._skip_depth += 1
+        elif self._skip_depth == 0 and tag_name == "br":
+            self._append_newline()
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_name = tag.lower()
+        if tag_name in self._SKIP_TAGS:
+            if self._skip_depth > 0:
+                self._skip_depth -= 1
+        elif self._skip_depth == 0 and tag_name in self._BLOCK_TAGS:
+            self._append_newline()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._parts.append(data)
+
+    def _append_newline(self) -> None:
+        if self._parts and not self._parts[-1].endswith("\n"):
+            self._parts.append("\n")
+
+    def get_text(self) -> str:
+        text = "".join(self._parts).replace("\xa0", " ")
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+        result: list[str] = []
+        for line in lines:
+            if line or (result and result[-1]):
+                result.append(line)
+        return "\n".join(result).strip()
+
+
+def _sms_plain_text(value: Any) -> str:
+    """Return plain text while preserving rich-text paragraph line breaks."""
+    parser = _SMSHTMLTextParser()
+    parser.feed(unescape(str(value or "")))
+    parser.close()
+    return parser.get_text()
+
+
+async def _invoke_sms_gateway(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    gateway_url = str(settings.get("gateway_url") or "").strip()
+    if not gateway_url:
+        raise ValueError("SMS Gateway URL is not configured")
+
+    authorization = str(settings.get("authorization") or "").strip()
+    if not authorization:
+        raise ValueError("SMS Gateway authorization is not configured")
+
+    # Extract message and phone numbers from payload
+    # Accepts both "phoneNumbers" (camelCase) and "phone_numbers" (snake_case)
+    # for flexibility, but always outputs "phoneNumbers" in the request body
+    message = _sms_plain_text(payload.get("message"))
+    phone_numbers = payload.get("phoneNumbers") or payload.get("phone_numbers") or []
+
+    if not isinstance(phone_numbers, list):
+        phone_numbers = [str(phone_numbers)]
+
+    # Build the request body
+    request_body = {
+        "message": message,
+        "phoneNumbers": phone_numbers,
+    }
+
+    # Set up headers
+    headers = {
+        "Content-Type": "application/json",
+        "authorization": authorization,
+    }
+
+    # Create webhook event for monitoring
+    event = await webhook_monitor.create_manual_event(
+        name="module.sms-gateway.send",
+        target_url=gateway_url,
+        payload=request_body,
+        headers=headers,
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for SMS Gateway request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(
+                gateway_url,
+                json=request_body,
+                headers=headers,
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        response_body = exc.response.text if exc.response is not None else None
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="failed",
+            error_message=(
+                f"HTTP {exc.response.status_code}" if exc.response else str(exc)
+            ),
+            response_status=exc.response.status_code if exc.response else None,
+            response_body=response_body,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"gateway_url": gateway_url, "phone_count": len(phone_numbers)},
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"gateway_url": gateway_url, "phone_count": len(phone_numbers)},
+        )
+
+    response_body = response.text
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=response.status_code,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={"gateway_url": gateway_url, "phone_count": len(phone_numbers)},
+    )
+
+
+async def _invoke_apprise(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    import apprise as apprise_lib
+
+    raw_urls = settings.get("urls")
+    if isinstance(raw_urls, list):
+        urls = [str(u).strip() for u in raw_urls if u and str(u).strip()]
+    else:
+        urls = []
+
+    if not urls:
+        raise ValueError("At least one Apprise notification URL must be configured")
+
+    message = str(payload.get("message") or "Automation triggered").strip()
+    title_value = payload.get("title") or settings.get("title") or "MyPortal"
+    title = str(title_value).strip() or "MyPortal"
+
+    event = await webhook_monitor.create_manual_event(
+        name="module.apprise.notify",
+        target_url="apprise://",
+        payload={"title": title, "message": message, "url_count": len(urls)},
+        headers={},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for Apprise request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        ap = apprise_lib.Apprise()
+        for url in urls:
+            ap.add(url)
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(
+            None,
+            lambda: ap.notify(body=message, title=title),
+        )
+        if not success:
+            updated_event = await _record_failure(
+                event_id,
+                attempt_number=attempt_number,
+                status="failed",
+                error_message="One or more Apprise notifications failed to send",
+                response_status=None,
+                response_body=None,
+            )
+            return _build_event_result(
+                updated_event,
+                extra={"title": title, "url_count": len(urls)},
+            )
+    except Exception as exc:
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"title": title, "url_count": len(urls)},
+        )
+
+    response_body = json.dumps(
+        {"title": title, "message": message, "url_count": len(urls)}
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={"title": title, "url_count": len(urls)},
+    )
+
+
+async def _invoke_create_ticket(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Create a new ticket from automation payload.
+
+    Accepts a JSON payload with ticket details, supporting variable interpolation
+    for all fields. Required fields: subject. Optional fields: description,
+    company_id, assigned_user_id, requester_id, priority, status, category.
+
+    When both requester_id and description are provided, the description is
+    automatically added as the initial conversation history entry, attributed
+    to the requester. This ensures the conversation history is properly populated
+    from the start for tickets created by scheduled automations.
+    """
+    # Extract ticket details from payload with defaults
+    subject = str(payload.get("subject", "")).strip()
+    if not subject:
+        raise ValueError("Ticket subject is required")
+
+    description = payload.get("description")
+    if description is not None:
+        description = str(description).strip() or None
+
+    # Get optional fields with appropriate defaults
+    company_id = payload.get("company_id")
+    if company_id is not None:
+        try:
+            company_id = int(company_id)
+        except (TypeError, ValueError):
+            company_id = None
+
+    assigned_user_id = payload.get("assigned_user_id")
+    if assigned_user_id is not None:
+        try:
+            assigned_user_id = int(assigned_user_id)
+        except (TypeError, ValueError):
+            assigned_user_id = None
+
+    requester_id = payload.get("requester_id")
+    if requester_id is not None:
+        try:
+            requester_id = int(requester_id)
+        except (TypeError, ValueError):
+            requester_id = None
+
+    priority = str(payload.get("priority", "normal")).strip().lower()
+    status = str(payload.get("status", "open")).strip().lower()
+
+    category = payload.get("category")
+    if category is not None:
+        category = str(category).strip() or None
+
+    module_slug = payload.get("module_slug")
+    if module_slug is not None:
+        module_slug = str(module_slug).strip() or None
+
+    external_reference = payload.get("external_reference")
+    if external_reference is not None:
+        external_reference = str(external_reference).strip() or None
+
+    try:
+        existing = await tickets_repo.get_ticket(ticket_id_int)
+    except RuntimeError:
+        existing = None
+
+    # Create webhook event for tracking
+    event = await webhook_monitor.create_manual_event(
+        name="module.create-ticket.create",
+        target_url="internal://tickets",
+        payload={
+            "subject": subject,
+            "description": description,
+            "company_id": company_id,
+            "requester_id": requester_id,
+            "assigned_user_id": assigned_user_id,
+            "priority": priority,
+            "status": status,
+            "category": category,
+        },
+        headers={"X-Module": "create-ticket"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for ticket creation")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        # Create the ticket using the tickets service
+        # Note: trigger_automations=False prevents recursive automation execution.
+        # Without this, if a "tickets.created" event automation is configured, it
+        # could trigger when this automation creates a ticket, potentially causing
+        # an infinite loop if that automation also creates tickets.
+        #
+        # When a requester is specified and a description is provided, we set
+        # initial_reply_author_id to the requester to populate the description
+        # as the initial conversation history entry.
+        initial_reply_author_id = (
+            requester_id if (requester_id and description) else None
+        )
+        ticket = await tickets_service.create_ticket(
+            subject=subject,
+            description=description,
+            requester_id=requester_id,
+            company_id=company_id,
+            assigned_user_id=assigned_user_id,
+            priority=priority,
+            status=status,
+            category=category,
+            module_slug=module_slug,
+            external_reference=external_reference,
+            trigger_automations=False,
+            initial_reply_author_id=initial_reply_author_id,
+        )
+    except (ValueError, TypeError) as exc:
+        # Handle validation errors from ticket creation
+        logger.error(
+            "Ticket creation validation failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            subject=subject,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=f"{type(exc).__name__}: {str(exc)}",
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"subject": subject},
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard for unexpected errors
+        # Catch any other unexpected errors (e.g., database, network issues)
+        logger.error(
+            "Unexpected error during ticket creation",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            subject=subject,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=f"{type(exc).__name__}: {str(exc)}",
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"subject": subject},
+        )
+
+    # Build success response
+    response_body = json.dumps(
+        {
+            "ticket_id": ticket.get("id"),
+            "ticket_number": ticket.get("ticket_number"),
+            "subject": ticket.get("subject"),
+        }
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "ticket_id": ticket.get("id"),
+            "ticket_number": ticket.get("ticket_number"),
+        },
+    )
+
+
+async def _invoke_create_task(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Create one or more tasks for a ticket from automation payload.
+
+    Accepts either a single task definition (ticket_id, task_name, optional
+    sort_order) or a ``tasks`` list describing multiple tasks. When a list is
+    provided each entry can override ``ticket_id`` and ``sort_order`` while the
+    top-level values act as defaults. ``context.ticket_id`` is also respected as
+    a fallback for convenience when triggering from ticket automations.
+    """
+    from app.repositories import ticket_tasks as ticket_tasks_repo
+
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+
+    def _require_ticket_id(value: Any) -> int:
+        if value is None:
+            raise ValueError("ticket_id is required")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ValueError("ticket_id must be a valid integer")
+
+    def _coerce_sort_order(value: Any, fallback: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    default_ticket_id = payload.get("ticket_id")
+    if default_ticket_id is None:
+        default_ticket_id = context.get("ticket_id")
+
+    default_sort_raw = payload.get("sort_order", 0)
+    default_sort_order = _coerce_sort_order(default_sort_raw, 0)
+
+    raw_tasks = payload.get("tasks")
+    tasks_payload = raw_tasks if isinstance(raw_tasks, list) else None
+    tasks_to_create: list[dict[str, Any]] = []
+
+    if tasks_payload:
+        for index, task_entry in enumerate(tasks_payload, start=1):
+            if not isinstance(task_entry, Mapping):
+                raise ValueError(f"tasks[{index}] must be an object")
+            entry_ticket_id = task_entry.get("ticket_id", default_ticket_id)
+            ticket_id_value = _require_ticket_id(entry_ticket_id)
+            task_name_value = str(task_entry.get("task_name", "")).strip()
+            if not task_name_value:
+                raise ValueError(f"task_name is required for task {index}")
+            sort_fallback = default_sort_order + (index - 1) * 10
+            sort_value = task_entry.get("sort_order", sort_fallback)
+            sort_order_value = _coerce_sort_order(sort_value, sort_fallback)
+            tasks_to_create.append(
+                {
+                    "ticket_id": ticket_id_value,
+                    "task_name": task_name_value,
+                    "sort_order": sort_order_value,
+                }
+            )
+    else:
+        ticket_id_value = _require_ticket_id(default_ticket_id)
+        task_name_value = str(payload.get("task_name", "")).strip()
+        if not task_name_value:
+            raise ValueError("task_name is required")
+        sort_order_value = _coerce_sort_order(payload.get("sort_order", 0), 0)
+        tasks_to_create.append(
+            {
+                "ticket_id": ticket_id_value,
+                "task_name": task_name_value,
+                "sort_order": sort_order_value,
+            }
+        )
+
+    ticket_ids = {task["ticket_id"] for task in tasks_to_create}
+    primary_ticket_id = next(iter(ticket_ids))
+    target_url = (
+        f"internal://tickets/{primary_ticket_id}/tasks"
+        if len(ticket_ids) == 1
+        else "internal://tickets/tasks"
+    )
+    payload_summary = {
+        "tasks": [
+            {
+                "ticket_id": task["ticket_id"],
+                "task_name": task["task_name"],
+                "sort_order": task["sort_order"],
+            }
+            for task in tasks_to_create
+        ]
+    }
+    if len(tasks_to_create) == 1:
+        payload_summary.update(tasks_to_create[0])
+
+    # Create webhook event for tracking
+    event = await webhook_monitor.create_manual_event(
+        name="module.create-task.create",
+        target_url=target_url,
+        payload=payload_summary,
+        headers={"X-Module": "create-task"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for task creation")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    created_tasks: list[dict[str, Any]] = []
+    try:
+        for entry in tasks_to_create:
+            task_id_value = entry["ticket_id"]
+            task_name_value = entry["task_name"]
+            task = await ticket_tasks_repo.create_task(
+                ticket_id=task_id_value,
+                task_name=task_name_value,
+                sort_order=entry["sort_order"],
+            )
+            created_tasks.append(task)
+    except (ValueError, TypeError) as exc:
+        logger.error(
+            "Task creation validation failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            ticket_id=entry.get("ticket_id") if "entry" in locals() else None,
+            task_name=entry.get("task_name") if "entry" in locals() else None,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=f"{type(exc).__name__}: {str(exc)}",
+            response_status=None,
+            response_body=None,
+        )
+        extra = {
+            "ticket_id": entry.get("ticket_id") if "entry" in locals() else None,
+            "task_name": entry.get("task_name") if "entry" in locals() else None,
+        }
+        return _build_event_result(updated_event, extra=extra)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.error(
+            "Unexpected error during task creation",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            ticket_id=entry.get("ticket_id") if "entry" in locals() else None,
+            task_name=entry.get("task_name") if "entry" in locals() else None,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=f"{type(exc).__name__}: {str(exc)}",
+            response_status=None,
+            response_body=None,
+        )
+        extra = {
+            "ticket_id": entry.get("ticket_id") if "entry" in locals() else None,
+            "task_name": entry.get("task_name") if "entry" in locals() else None,
+        }
+        return _build_event_result(updated_event, extra=extra)
+
+    # Build success response
+    if len(created_tasks) == 1:
+        task = created_tasks[0]
+        response_body = json.dumps(
+            {
+                "task_id": task.get("id"),
+                "ticket_id": task.get("ticket_id"),
+                "task_name": task.get("task_name"),
+            }
+        )
+        extra: dict[str, Any] = {
+            "task_id": task.get("id"),
+            "ticket_id": task.get("ticket_id"),
+        }
+    else:
+        response_body = json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": task.get("id"),
+                        "ticket_id": task.get("ticket_id"),
+                        "task_name": task.get("task_name"),
+                        "sort_order": task.get("sort_order"),
+                    }
+                    for task in created_tasks
+                ],
+                "count": len(created_tasks),
+            }
+        )
+        extra = {
+            "task_ids": [
+                task.get("id") for task in created_tasks if task.get("id") is not None
+            ],
+            "ticket_ids": sorted(
+                {
+                    task.get("ticket_id")
+                    for task in created_tasks
+                    if task.get("ticket_id") is not None
+                }
+            ),
+        }
+
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(updated_event, extra=extra)
+
+
+async def _invoke_chatgpt_mcp(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    secret_hash = str(settings.get("shared_secret_hash") or "").strip()
+    if not secret_hash:
+        raise ValueError("Shared secret hash is not configured")
+    allowed_actions = settings.get("allowed_actions") or list(DEFAULT_CHATGPT_TOOLS)
+    allow_updates = _ensure_bool(settings.get("allow_ticket_updates"), False)
+    max_results = _coerce_int(settings.get("max_results"), minimum=1, maximum=200) or 50
+    return {
+        "status": "ok",
+        "allowed_actions": allowed_actions,
+        "allow_ticket_updates": allow_updates,
+        "max_results": max_results,
+    }
+
+
+async def _validate_syncro(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    base_url = str(settings.get("base_url") or "").strip()
+    api_key = str(settings.get("api_key") or "").strip()
+    rate_limit = (
+        _coerce_int(settings.get("rate_limit_per_minute"), minimum=1, maximum=600)
+        or 180
+    )
+    if not base_url:
+        raise ValueError("Syncro base URL is not configured")
+    return {
+        "status": "ok",
+        "base_url": base_url,
+        "has_api_key": bool(api_key),
+        "rate_limit_per_minute": rate_limit,
+    }
+
+
+async def _validate_plausible(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    base_url = str(settings.get("base_url") or "").strip().rstrip("/")
+    site_domain = str(settings.get("site_domain") or "").strip()
+    api_key = str(settings.get("api_key") or "").strip()
+    track_opens = _ensure_bool(settings.get("track_opens"), True)
+    track_clicks = _ensure_bool(settings.get("track_clicks"), True)
+    send_to_plausible = _ensure_bool(settings.get("send_to_plausible"), False)
+    track_pageviews = _ensure_bool(settings.get("track_pageviews"), False)
+    pepper = str(settings.get("pepper") or "").strip()
+    env_pepper = str(os.getenv("PLAUSIBLE_PEPPER", "") or "").strip()
+    if not pepper and env_pepper:
+        pepper = env_pepper
+    send_pii = _ensure_bool(settings.get("send_pii"), False)
+
+    if send_to_plausible or track_pageviews:
+        if not base_url:
+            raise ValueError("Plausible base URL is not configured")
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "Plausible base URL must include http/https and a hostname"
+            )
+        if not site_domain:
+            raise ValueError("Plausible site domain is not configured")
+
+        # Warn if pageview tracking is enabled without a pepper
+        if track_pageviews and not pepper:
+            logger.warning(
+                "Plausible pageview tracking enabled without pepper - using default (not secure)"
+            )
+
+        # Warn if PII is enabled (should only be for self-hosted, compliant instances)
+        if send_pii:
+            logger.warning(
+                "Plausible configured to send PII - ensure this is a self-hosted, compliant instance"
+            )
+
+    return {
+        "status": "ok",
+        "base_url": base_url,
+        "site_domain": site_domain,
+        "has_api_key": bool(api_key),
+        "track_opens": track_opens,
+        "track_clicks": track_clicks,
+        "send_to_plausible": send_to_plausible,
+        "track_pageviews": track_pageviews,
+        "has_pepper": bool(pepper),
+        "send_pii": send_pii,
+    }
+
+
+async def _validate_uptimekuma(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    shared_secret_hash = str(settings.get("shared_secret_hash") or "").strip()
+    return {
+        "status": "ok",
+        "has_shared_secret": bool(shared_secret_hash),
+    }
+
+
+async def _validate_call_recordings(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Validate configuration and synchronise recordings from disk."""
+    configured_path = str(settings.get("recordings_path") or "").strip()
+    override_path = str(
+        payload.get("path") or payload.get("recordings_path") or ""
+    ).strip()
+    recordings_path = override_path or configured_path
+
+    phone_system_type = (
+        str(
+            payload.get("phone_system_type")
+            or settings.get("phone_system_type")
+            or "generic"
+        )
+        .strip()
+        .lower()
+    )
+    if phone_system_type not in CALL_RECORDINGS_PHONE_SYSTEM_TYPES:
+        phone_system_type = "generic"
+
+    if not recordings_path:
+        return {
+            "status": "skipped",
+            "recordings_path": "/var/lib/myportal/call_recordings",
+            "has_recordings_path": False,
+            "phone_system_type": phone_system_type,
+            "message": "No recordings path configured",
+        }
+
+    try:
+        sync_result = await call_recordings_service.sync_recordings_from_filesystem(
+            recordings_path,
+            phone_system_type=phone_system_type,
+            trusted_base=configured_path or None,
+        )
+        return {
+            **sync_result,
+            "recordings_path": recordings_path,
+            "has_recordings_path": True,
+            "phone_system_type": phone_system_type,
+        }
+    except FileNotFoundError as exc:
+        logger.error("Recordings path does not exist", path=recordings_path)
+        return {
+            "status": "error",
+            "recordings_path": recordings_path,
+            "has_recordings_path": False,
+            "phone_system_type": phone_system_type,
+            "error": str(exc),
+        }
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Failed to synchronise call recordings", path=recordings_path)
+        return {
+            "status": "error",
+            "recordings_path": recordings_path,
+            "has_recordings_path": True,
+            "phone_system_type": phone_system_type,
+            "error": str(exc),
+        }
+
+
+async def _invoke_unifi_talk(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Download call recordings from Unifi Talk via SFTP and sync to database."""
+    remote_host = str(settings.get("remote_host") or "").strip()
+    remote_path = (
+        str(settings.get("remote_path") or "").strip()
+        or "/volume1/.srv/unifi-talk/recordings"
+    )
+    username = str(settings.get("username") or "").strip()
+    password = str(settings.get("password") or "").strip()
+    local_path = (
+        str(settings.get("local_path") or "").strip()
+        or "/var/lib/myportal/call_recordings"
+    )
+    port = _coerce_int(settings.get("port"), minimum=1, maximum=65535) or 22
+
+    # Validate required settings
+    if not remote_host:
+        return {
+            "status": "error",
+            "error": "Remote host is not configured",
+            "has_remote_host": False,
+        }
+
+    if not username:
+        return {
+            "status": "error",
+            "error": "Username is not configured",
+            "has_username": False,
+        }
+
+    if not password:
+        return {
+            "status": "error",
+            "error": "Password is not configured",
+            "has_password": False,
+        }
+
+    try:
+        # Download recordings from SFTP
+        logger.info(
+            "Starting Unifi Talk SFTP download",
+            remote_host=remote_host,
+            remote_path=remote_path,
+            local_path=local_path,
+        )
+        download_result = await unifi_talk_service.download_recordings_from_sftp(
+            remote_host=remote_host,
+            remote_path=remote_path,
+            username=username,
+            password=password,
+            local_path=local_path,
+            port=port,
+        )
+
+        # Sync downloaded recordings to database
+        if download_result["downloaded"] > 0:
+            logger.info(
+                f"Downloaded {download_result['downloaded']} recordings, syncing to database",
+                local_path=local_path,
+            )
+            sync_result = await call_recordings_service.sync_recordings_from_filesystem(
+                local_path,
+                trusted_base=local_path,
+            )
+
+            return {
+                "status": "ok",
+                "remote_host": remote_host,
+                "remote_path": remote_path,
+                "local_path": local_path,
+                "downloaded": download_result["downloaded"],
+                "skipped": download_result["skipped"],
+                "total_files": download_result["total_files"],
+                "sync_created": sync_result.get("created", 0),
+                "sync_updated": sync_result.get("updated", 0),
+                "sync_skipped": sync_result.get("skipped", 0),
+                "errors": download_result["errors"] + sync_result.get("errors", []),
+            }
+        else:
+            return {
+                "status": "ok",
+                "remote_host": remote_host,
+                "remote_path": remote_path,
+                "local_path": local_path,
+                "downloaded": 0,
+                "skipped": download_result["skipped"],
+                "total_files": download_result["total_files"],
+                "message": "No new recordings to download",
+                "errors": download_result["errors"],
+            }
+
+    except ValueError as exc:
+        logger.error("Unifi Talk configuration error", error=str(exc))
+        return {
+            "status": "error",
+            "remote_host": remote_host,
+            "error": str(exc),
+        }
+
+    except RuntimeError as exc:
+        logger.error("Unifi Talk SFTP connection error", error=str(exc))
+        return {
+            "status": "error",
+            "remote_host": remote_host,
+            "error": str(exc),
+        }
+
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected error in Unifi Talk module")
+        return {
+            "status": "error",
+            "remote_host": remote_host,
+            "error": str(exc),
+        }
+
+
+async def _discover_xero_tenant_id(
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    company_name: str,
+) -> str | None:
+    """Discover Xero tenant_id by querying the Xero API based on company name.
+
+    Args:
+        client_id: Xero OAuth client ID
+        client_secret: Xero OAuth client secret
+        refresh_token: Xero OAuth refresh token
+        company_name: Company name to match against Xero organisations
+
+    Returns:
+        The tenant_id if found, None otherwise
+    """
+    # Check all required parameters are provided
+    if not (client_id and client_secret and refresh_token and company_name):
+        logger.warning(
+            "Cannot discover tenant_id: missing required credentials or company name",
+            has_client_id=bool(client_id),
+            has_client_secret=bool(client_secret),
+            has_refresh_token=bool(refresh_token),
+            has_company_name=bool(company_name),
+        )
+        return None
+
+    try:
+        # Step 1: Get access token using refresh token
+        token_url = "https://identity.xero.com/connect/token"
+        token_data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            token_response = await client.post(
+                token_url,
+                data=token_data,
+                auth=(client_id, client_secret),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            token_response.raise_for_status()
+            token_data_response = token_response.json()
+            access_token = token_data_response.get("access_token")
+            new_refresh_token = token_data_response.get("refresh_token")
+            expires_in = token_data_response.get("expires_in")
+
+            if not access_token:
+                logger.error("Failed to get access token from Xero")
+                return None
+
+            expires_at = None
+            if isinstance(expires_in, (int, float)):
+                expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=float(expires_in)
+                )
+
+            # Xero rotates refresh tokens on every refresh-token grant.  Persist
+            # any replacement immediately so validation/tenant discovery cannot
+            # leave the module with a stale token that later produces
+            # ``invalid_grant`` and causes syncs to report a missing/unusable
+            # refresh_token.
+            if new_refresh_token:
+                await update_xero_tokens(
+                    access_token=str(access_token),
+                    refresh_token=str(new_refresh_token),
+                    token_expires_at=expires_at,
+                )
+
+            # Step 2: Get connections (tenants)
+            connections_url = "https://api.xero.com/connections"
+            connections_response = await client.get(
+                connections_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            connections_response.raise_for_status()
+            connections = connections_response.json()
+
+            # Step 3: Find matching tenant by company name (case-insensitive)
+            company_name_lower = company_name.strip().lower()
+            # Pre-process all connections for efficient matching
+            normalized_connections = [
+                (str(conn.get("tenantName", "")).strip().lower(), conn.get("tenantId"))
+                for conn in connections
+            ]
+
+            for tenant_name_lower, tenant_id in normalized_connections:
+                if tenant_name_lower == company_name_lower:
+                    logger.info(
+                        "Discovered Xero tenant_id",
+                        company_name=company_name,
+                        tenant_id=tenant_id,
+                    )
+                    return str(tenant_id) if tenant_id else None
+
+            logger.warning(
+                "No matching Xero tenant found for company name",
+                company_name=company_name,
+                available_tenants=[c.get("tenantName") for c in connections],
+            )
+            return None
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "HTTP error while discovering Xero tenant_id",
+            status_code=exc.response.status_code if exc.response else None,
+            error=str(exc),
+        )
+        return None
+    except Exception as exc:
+        logger.error(
+            "Error discovering Xero tenant_id",
+            error=str(exc),
+        )
+        return None
+
+
+async def _validate_xero(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Validate Xero module configuration.
+
+    Returns a status object indicating which credentials are configured.
+    This handler is used when trigger_module is called with the xero module.
+
+    The Xero company name is sourced from the XERO_COMPANY_NAME environment
+    variable when available. During validation the /connections endpoint is
+    queried to discover the tenant_id for the configured company and the
+    resulting identifier is stored for future API calls.
+    """
+    # Get decrypted credentials
+    credentials = await get_xero_credentials()
+    if not credentials:
+        return {
+            "status": "error",
+            "message": "Xero credentials not configured",
+        }
+
+    client_id = credentials.get("client_id", "").strip()
+    client_secret = credentials.get("client_secret", "").strip()
+    refresh_token = credentials.get("refresh_token", "").strip()
+    tenant_id = credentials.get("tenant_id", "").strip()
+    company_name = credentials.get("company_name", "").strip()
+    company_name_env = str(os.getenv("XERO_COMPANY_NAME", "")).strip()
+    if company_name_env:
+        if company_name_env != company_name:
+            company_name = company_name_env
+        result_company_name = company_name_env
+    else:
+        result_company_name = company_name
+    access_token = credentials.get("access_token", "").strip()
+    token_expires_at = credentials.get("token_expires_at")
+
+    result: dict[str, Any] = {
+        "status": "ok",
+        "has_client_id": bool(client_id),
+        "has_client_secret": bool(client_secret),
+        "has_refresh_token": bool(refresh_token),
+        "has_access_token": bool(access_token),
+        "has_tenant_id": bool(tenant_id),
+        "has_company_name": bool(result_company_name),
+    }
+
+    if result_company_name:
+        result["company_name"] = result_company_name
+
+    # Add token expiry info
+    if token_expires_at:
+        result["token_expires_at"] = token_expires_at.isoformat()
+        now = datetime.now(timezone.utc)
+        if token_expires_at.tzinfo is None:
+            token_expires_at = token_expires_at.replace(tzinfo=timezone.utc)
+        result["token_expired"] = now >= token_expires_at
+
+    should_discover = bool(
+        company_name and client_id and client_secret and refresh_token
+    )
+
+    # Track updated settings to avoid reverting previous updates
+    updated_settings = dict(settings)
+
+    if company_name_env and settings.get("company_name") != company_name_env:
+        try:
+            updated_settings["company_name"] = company_name_env
+            await module_repo.update_module(
+                XERO_MODULE_SLUG,
+                settings=dict(updated_settings),  # Pass a copy to avoid mutation issues
+            )
+            result["company_name_updated"] = True
+            logger.info(
+                "Synchronised Xero company name from environment",
+                company_name=company_name_env,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to synchronised Xero company name from environment",
+                error=str(exc),
+            )
+            result["company_name_updated"] = False
+
+    if should_discover:
+        logger.info(
+            "Attempting to discover Xero tenant_id from company name",
+            company_name=company_name,
+        )
+        discovered_tenant_id = await _discover_xero_tenant_id(
+            client_id,
+            client_secret,
+            refresh_token,
+            company_name,
+        )
+        if discovered_tenant_id:
+            result["discovered_tenant_id"] = discovered_tenant_id
+            result["tenant_id_discovery"] = "success"
+            if discovered_tenant_id != tenant_id:
+                try:
+                    # Use updated_settings to preserve company_name update
+                    updated_settings["tenant_id"] = discovered_tenant_id
+                    await module_repo.update_module(
+                        XERO_MODULE_SLUG,
+                        settings=dict(
+                            updated_settings
+                        ),  # Pass a copy to avoid mutation issues
+                    )
+                    result["tenant_id_updated"] = True
+                    logger.info(
+                        "Successfully updated Xero module with discovered tenant_id",
+                        tenant_id=discovered_tenant_id,
+                    )
+                    tenant_id = discovered_tenant_id
+                    result["has_tenant_id"] = True
+                except Exception as exc:
+                    logger.error(
+                        "Failed to update Xero module with discovered tenant_id",
+                        error=str(exc),
+                    )
+                    result["tenant_id_updated"] = False
+            else:
+                result["tenant_id_updated"] = False
+        else:
+            result["tenant_id_discovery"] = "failed"
+
+    if tenant_id:
+        result["tenant_id"] = str(tenant_id)
+
+    return result
+
+
+def _summarise_event_error(result: Mapping[str, Any]) -> str:
+    if not isinstance(result, Mapping):
+        return "Unknown error"
+    messages: list[str] = []
+    last_error = result.get("last_error")
+    if last_error:
+        messages.append(str(last_error))
+    response_status = result.get("response_status") or result.get("status_code")
+    if response_status:
+        messages.append(f"HTTP {response_status}")
+    response = result.get("response")
+    if not last_error and response:
+        if isinstance(response, Mapping):
+            detail = response.get("detail") or response.get("error")
+            if detail:
+                messages.append(str(detail))
+        elif isinstance(response, str) and response:
+            messages.append(response)
+    status_text = result.get("status")
+    if status_text and status_text not in {"succeeded"}:
+        messages.append(str(status_text))
+    if messages:
+        unique_messages = list(dict.fromkeys(messages))
+        return "; ".join(unique_messages)
+    return "Unknown error"
+
+
+async def _load_tacticalrmm_settings() -> dict[str, Any]:
+    module = await module_repo.get_module("tacticalrmm")
+    if not module:
+        raise ValueError("Tactical RMM module is not configured")
+
+    raw_settings: Mapping[str, Any] | None = None
+    if isinstance(module.get("settings"), Mapping):
+        raw_settings = module["settings"]
+    elif isinstance(module.get("settings"), str):
+        try:
+            raw_settings = json.loads(module["settings"])
+        except json.JSONDecodeError:
+            raw_settings = None
+
+    settings = _coerce_settings("tacticalrmm", raw_settings, module)
+    base_url = str(settings.get("base_url") or "").strip()
+    if not base_url:
+        raise ValueError("Tactical RMM base URL is not configured")
+    api_key = str(settings.get("api_key") or "").strip()
+    if not api_key:
+        raise ValueError("Tactical RMM API key is not configured")
+    return settings
+
+
+async def ensure_tacticalrmm_ready() -> None:
+    """Validate Tactical RMM configuration before executing operations."""
+
+    await _load_tacticalrmm_settings()
+
+
+async def push_companies_to_tacticalrmm(
+    default_site_name: str = "Default",
+) -> dict[str, Any]:
+    settings = await _load_tacticalrmm_settings()
+
+    default_site = str(default_site_name or "").strip() or "Default"
+    default_site_key = default_site.casefold()
+
+    companies = await company_repo.list_companies()
+    unique_companies: list[
+        tuple[str, Mapping[str, Any]] | tuple[str, dict[str, Any]]
+    ] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for company in companies:
+        name = str(company.get("name") or "").strip()
+        if not name:
+            identifier = str(company.get("id") or "unknown")
+            skipped.append({"company": identifier, "reason": "missing_name"})
+            continue
+        key = name.casefold()
+        if key in seen:
+            skipped.append({"company": name, "reason": "duplicate_name"})
+            continue
+        seen.add(key)
+        unique_companies.append((name, company))
+
+    logger.info(
+        "Synchronising companies with Tactical RMM", count=len(unique_companies)
+    )
+
+    existing_clients_result = await _invoke_tacticalrmm(
+        settings,
+        {"endpoint": "/clients/", "method": "GET"},
+        event_future=None,
+    )
+
+    if existing_clients_result.get("status") != "succeeded":
+        error = _summarise_event_error(existing_clients_result)
+        raise RuntimeError(f"Failed to fetch Tactical RMM clients: {error}")
+
+    response = existing_clients_result.get("response")
+    raw_clients: list[Mapping[str, Any]] = []
+    if isinstance(response, list):
+        raw_clients = [item for item in response if isinstance(item, Mapping)]
+    elif isinstance(response, Mapping):
+        results = response.get("results")
+        if isinstance(results, list):
+            raw_clients = [item for item in results if isinstance(item, Mapping)]
+
+    client_lookup: dict[str, Mapping[str, Any]] = {}
+    for client in raw_clients:
+        name = str(client.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key not in client_lookup:
+            client_lookup[key] = client
+
+    summary: dict[str, Any] = {
+        "processed_companies": len(unique_companies),
+        "created_clients": [],
+        "existing_clients": [],
+        "created_sites": [],
+        "existing_sites": [],
+        "skipped": skipped,
+        "errors": [],
+    }
+
+    for company_name, company in unique_companies:
+        client_key = company_name.casefold()
+        existing_client = client_lookup.get(client_key)
+
+        if not existing_client:
+            logger.info("Creating Tactical RMM client", company=company_name)
+            create_payload = {
+                "endpoint": "/clients/",
+                "method": "POST",
+                "body": {
+                    "client": {"name": company_name},
+                    "site": {"name": default_site},
+                },
+            }
+            create_result = await _invoke_tacticalrmm(
+                settings, create_payload, event_future=None
+            )
+            if create_result.get("status") == "succeeded":
+                summary["created_clients"].append(company_name)
+                summary["created_sites"].append(
+                    {
+                        "company": company_name,
+                        "site": default_site,
+                        "action": "created_with_client",
+                    }
+                )
+                client_lookup[client_key] = {
+                    "name": company_name,
+                    "id": None,
+                    "sites": [{"name": default_site}],
+                }
+            else:
+                error_message = _summarise_event_error(create_result)
+                summary["errors"].append(
+                    {
+                        "company": company_name,
+                        "action": "create_client",
+                        "error": error_message,
+                        "event_id": create_result.get("event_id"),
+                    }
+                )
+            continue
+
+        summary["existing_clients"].append(company_name)
+        existing_sites = []
+        raw_sites = (
+            existing_client.get("sites")
+            if isinstance(existing_client, Mapping)
+            else None
+        )
+        if isinstance(raw_sites, list):
+            existing_sites = [site for site in raw_sites if isinstance(site, Mapping)]
+
+        has_default_site = False
+        for site in existing_sites:
+            site_name = str(site.get("name") or "").strip()
+            if site_name.casefold() == default_site_key:
+                has_default_site = True
+                summary["existing_sites"].append(
+                    {"company": company_name, "site": site_name}
+                )
+                break
+
+        if has_default_site:
+            continue
+
+        client_id = existing_client.get("id")
+        try:
+            client_id_int = int(client_id) if client_id is not None else None
+        except (TypeError, ValueError):
+            client_id_int = None
+
+        if client_id_int is None:
+            summary["errors"].append(
+                {
+                    "company": company_name,
+                    "action": "resolve_client_id",
+                    "error": "Client ID missing; unable to create default site.",
+                    "event_id": existing_clients_result.get("event_id"),
+                }
+            )
+            continue
+
+        logger.info(
+            "Creating Tactical RMM default site",
+            company=company_name,
+            client_id=client_id_int,
+        )
+        site_payload = {
+            "endpoint": "/clients/sites/",
+            "method": "POST",
+            "body": {"site": {"client": client_id_int, "name": default_site}},
+        }
+        site_result = await _invoke_tacticalrmm(
+            settings, site_payload, event_future=None
+        )
+        if site_result.get("status") == "succeeded":
+            summary["created_sites"].append(
+                {
+                    "company": company_name,
+                    "site": default_site,
+                    "action": "created_for_existing_client",
+                }
+            )
+        else:
+            error_message = _summarise_event_error(site_result)
+            summary["errors"].append(
+                {
+                    "company": company_name,
+                    "action": "create_site",
+                    "error": error_message,
+                    "event_id": site_result.get("event_id"),
+                }
+            )
+
+    return summary
+
+
+async def pull_companies_from_tacticalrmm() -> dict[str, Any]:
+    """Pull clients from Tactical RMM and create or update matching companies in MyPortal."""
+    settings = await _load_tacticalrmm_settings()
+
+    clients_result = await _invoke_tacticalrmm(
+        settings,
+        {"endpoint": "/clients/", "method": "GET"},
+        event_future=None,
+    )
+
+    if clients_result.get("status") != "succeeded":
+        error = _summarise_event_error(clients_result)
+        raise RuntimeError(f"Failed to fetch Tactical RMM clients: {error}")
+
+    response = clients_result.get("response")
+    raw_clients: list[Mapping[str, Any]] = []
+    if isinstance(response, list):
+        raw_clients = [item for item in response if isinstance(item, Mapping)]
+    elif isinstance(response, Mapping):
+        results = response.get("results")
+        if isinstance(results, list):
+            raw_clients = [item for item in results if isinstance(item, Mapping)]
+
+    logger.info("Pulling Tactical RMM clients into MyPortal", count=len(raw_clients))
+
+    summary: dict[str, Any] = {
+        "fetched": len(raw_clients),
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    for client in raw_clients:
+        client_id = client.get("id")
+        name = str(client.get("name") or "").strip()
+
+        if not name:
+            summary["skipped"] += 1
+            continue
+
+        try:
+            tactical_id_str = (
+                str(client_id).strip()
+                if client_id is not None and client_id != ""
+                else None
+            )
+            if not tactical_id_str:
+                tactical_id_str = None
+
+            existing = None
+            if tactical_id_str:
+                existing = await company_repo.get_company_by_tactical_id(
+                    tactical_id_str
+                )
+            if not existing:
+                if tactical_id_str:
+                    logger.info(
+                        "Tactical RMM client not matched by ID, falling back to name lookup",
+                        tactical_id=tactical_id_str,
+                        name=name,
+                    )
+                existing = await company_repo.get_company_by_name(name)
+
+            if existing:
+                updates: dict[str, Any] = {}
+                if (
+                    tactical_id_str
+                    and str(existing.get("tacticalrmm_client_id") or "").strip()
+                    != tactical_id_str
+                ):
+                    updates["tacticalrmm_client_id"] = tactical_id_str
+                if str(existing.get("name") or "").strip() != name:
+                    updates["name"] = name
+                if updates:
+                    await company_repo.update_company(int(existing["id"]), **updates)
+                    summary["updated"] += 1
+                else:
+                    summary["skipped"] += 1
+            else:
+                payload: dict[str, Any] = {"name": name}
+                if tactical_id_str:
+                    payload["tacticalrmm_client_id"] = tactical_id_str
+                await company_repo.create_company(**payload)
+                summary["created"] += 1
+        except Exception as exc:
+            logger.error(
+                "Failed to import Tactical RMM client",
+                client_id=client_id,
+                name=name,
+                error=str(exc),
+            )
+            summary["errors"].append(
+                {"client_id": client_id, "name": name, "error": str(exc)}
+            )
+
+    logger.info(
+        "Tactical RMM client pull completed",
+        fetched=summary["fetched"],
+        created=summary["created"],
+        updated=summary["updated"],
+        skipped=summary["skipped"],
+        errors=len(summary["errors"]),
+    )
+    return summary
+
+
+async def _invoke_update_ticket(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Update ticket fields from automation payload.
+
+    Accepts a JSON payload with ``ticket_id`` and any editable ticket field.  Shipment
+    tracking settings are handled as ticket fields even though they are persisted in
+    the related shipment-watch record.
+
+    The ticket_id can be provided directly or via context.ticket.id or context.ticket_id.
+    """
+    from app.repositories import tickets as tickets_repo
+
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+
+    # Resolve ticket_id from payload or context
+    ticket_id = payload.get("ticket_id")
+    if ticket_id is None:
+        ticket_id = context.get("ticket_id")
+    if ticket_id is None:
+        ticket_context = context.get("ticket")
+        if isinstance(ticket_context, Mapping):
+            ticket_id = ticket_context.get("id")
+
+    if ticket_id is None:
+        raise ValueError("ticket_id is required")
+
+    try:
+        ticket_id_int = int(ticket_id)
+    except (TypeError, ValueError):
+        raise ValueError("ticket_id must be a valid integer")
+
+    # Check ticket exists
+    existing = await tickets_repo.get_ticket(ticket_id_int)
+    if not existing:
+        raise ValueError(f"Ticket {ticket_id_int} not found")
+
+    # Build update dict from explicitly supported columns.  Do not pass arbitrary
+    # payload keys to the repository: update_ticket constructs column assignments and
+    # therefore relies on this boundary to prevent SQL identifier injection.
+    update_fields: dict[str, Any] = {}
+
+    # Status
+    if "status" in payload:
+        status_value = str(payload["status"]).strip()
+        if status_value:
+            normalised_status = re.sub(r"[^a-z0-9]+", "_", status_value.lower()).strip(
+                "_"
+            )
+            update_fields["status"] = normalised_status
+
+    # Priority
+    if "priority" in payload:
+        priority_value = str(payload["priority"]).strip().lower()
+        if priority_value:
+            update_fields["priority"] = priority_value
+
+    # Assigned user
+    if "assigned_user_id" in payload:
+        parsed_assigned = _parse_nullable_int(payload["assigned_user_id"])
+        if (
+            payload["assigned_user_id"] is None
+            or payload["assigned_user_id"] == ""
+            or payload["assigned_user_id"] == "null"
+        ):
+            update_fields["assigned_user_id"] = None
+        elif parsed_assigned is not None:
+            update_fields["assigned_user_id"] = parsed_assigned
+
+    # Requester
+    if "requester_id" in payload:
+        parsed_requester = _parse_nullable_int(payload["requester_id"])
+        if (
+            payload["requester_id"] is None
+            or payload["requester_id"] == ""
+            or payload["requester_id"] == "null"
+        ):
+            update_fields["requester_id"] = None
+        elif parsed_requester is not None:
+            update_fields["requester_id"] = parsed_requester
+
+    # Company
+    if "company_id" in payload:
+        parsed_company = _parse_nullable_int(payload["company_id"])
+        if (
+            payload["company_id"] is None
+            or payload["company_id"] == ""
+            or payload["company_id"] == "null"
+        ):
+            update_fields["company_id"] = None
+        elif parsed_company is not None:
+            update_fields["company_id"] = parsed_company
+
+    # Category
+    if "category" in payload:
+        category_value = payload.get("category")
+        if category_value is None:
+            update_fields["category"] = None
+        else:
+            update_fields["category"] = str(category_value).strip() or None
+
+    nullable_text_fields = (
+        "description",
+        "module_slug",
+        "external_reference",
+        "ticket_number",
+        "xero_invoice_number",
+    )
+    for field in nullable_text_fields:
+        if field in payload:
+            value = payload.get(field)
+            update_fields[field] = None if value is None else str(value).strip() or None
+
+    if "subject" in payload:
+        subject = str(payload.get("subject") or "").strip()
+        if not subject:
+            raise ValueError("subject cannot be empty")
+        update_fields["subject"] = subject
+
+    for field in ("requester_staff_id",):
+        if field in payload:
+            value = payload.get(field)
+            parsed = _parse_nullable_int(value)
+            if value is None or value == "" or str(value).lower() == "null":
+                update_fields[field] = None
+            elif parsed is None:
+                raise ValueError(f"{field} must be a valid integer or null")
+            else:
+                update_fields[field] = parsed
+
+    if "review_date" in payload:
+        raw_review_date = payload.get("review_date")
+        if raw_review_date is None or str(raw_review_date).strip() == "":
+            update_fields["review_date"] = None
+        else:
+            try:
+                update_fields["review_date"] = date.fromisoformat(
+                    str(raw_review_date).strip()[:10]
+                )
+            except ValueError as exc:
+                raise ValueError("review_date must be a valid ISO date (YYYY-MM-DD)") from exc
+
+    shipment_keys = {
+        "shipment_tracking_url",
+        "shipment_poll_interval_seconds",
+        "shipment_monitoring_enabled",
+        "shipment_public_comments_enabled",
+    }
+    shipment_requested = any(key in payload for key in shipment_keys)
+
+    if not update_fields and not shipment_requested:
+        return {
+            "status": "skipped",
+            "reason": "No update fields provided",
+            "ticket_id": ticket_id_int,
+        }
+
+    # Create webhook event for tracking
+    event = await webhook_monitor.create_manual_event(
+        name="module.update-ticket.update",
+        target_url=f"internal://tickets/{ticket_id_int}",
+        payload={"ticket_id": ticket_id_int, **update_fields},
+        headers={"X-Module": "update-ticket"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for ticket update")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        if update_fields:
+            await tickets_repo.update_ticket(ticket_id_int, **update_fields)
+
+        shipment_updated_fields: list[str] = []
+        if shipment_requested:
+            from app.services import ticket_shipment_tracking as shipment_tracking
+
+            current_watch = await shipment_tracking.get_watch_for_ticket(ticket_id_int)
+            tracking_url = payload.get("shipment_tracking_url")
+            if tracking_url is None:
+                tracking_url = (current_watch or {}).get("tracking_url")
+            tracking_url = str(tracking_url or "").strip()
+            if not tracking_url:
+                raise ValueError(
+                    "shipment_tracking_url is required when the ticket has no shipment watch"
+                )
+
+            raw_interval = payload.get(
+                "shipment_poll_interval_seconds",
+                (current_watch or {}).get("poll_interval_seconds", 900),
+            )
+            try:
+                poll_interval = max(0, min(86_400, int(raw_interval)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "shipment_poll_interval_seconds must be a whole number"
+                ) from exc
+            active = payload.get(
+                "shipment_monitoring_enabled",
+                (current_watch or {}).get("active", poll_interval > 0),
+            )
+            public_comments = payload.get(
+                "shipment_public_comments_enabled",
+                (current_watch or {}).get("public_comments_enabled", True),
+            )
+            await shipment_tracking.upsert_watch(
+                ticket_id=ticket_id_int,
+                tracking_url=tracking_url,
+                poll_interval_seconds=poll_interval,
+                active=_coerce_boolean(active),
+                public_comments_enabled=_coerce_boolean(public_comments),
+            )
+            shipment_updated_fields = [
+                key for key in shipment_keys if key in payload
+            ]
+
+        # Emit ticket updated event
+        await tickets_service.emit_ticket_updated_event(
+            ticket_id_int,
+            actor_type="automation",
+            trigger_automations=False,
+        )
+    except Exception as exc:
+        logger.error(
+            "Ticket update failed",
+            error=str(exc),
+            ticket_id=ticket_id_int,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"ticket_id": ticket_id_int},
+        )
+
+    updated_field_names = [*update_fields.keys(), *shipment_updated_fields]
+    previous_values = {field: existing.get(field) for field in update_fields.keys()}
+    if shipment_requested:
+        shipment_previous_keys = {
+            "shipment_tracking_url": "tracking_url",
+            "shipment_poll_interval_seconds": "poll_interval_seconds",
+            "shipment_monitoring_enabled": "active",
+            "shipment_public_comments_enabled": "public_comments_enabled",
+        }
+        previous_values.update(
+            {
+                field: (current_watch or {}).get(shipment_previous_keys[field])
+                for field in shipment_updated_fields
+            }
+        )
+    response_body = json.dumps(
+        {
+            "ticket_id": ticket_id_int,
+            "updated_fields": updated_field_names,
+            "previous_values": previous_values,
+        }
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "ticket_id": ticket_id_int,
+            "updated_fields": updated_field_names,
+            "previous_values": previous_values,
+        },
+    )
+
+
+async def _invoke_update_ticket_description(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Update ticket description from automation payload.
+
+    Accepts a JSON payload with ticket_id and description.
+    The ticket_id can be provided directly or via context.ticket.id or context.ticket_id.
+    """
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+
+    # Resolve ticket_id from payload or context
+    ticket_id = payload.get("ticket_id")
+    if ticket_id is None:
+        ticket_id = context.get("ticket_id")
+    if ticket_id is None:
+        ticket_context = context.get("ticket")
+        if isinstance(ticket_context, Mapping):
+            ticket_id = ticket_context.get("id")
+
+    if ticket_id is None:
+        raise ValueError("ticket_id is required")
+
+    try:
+        ticket_id_int = int(ticket_id)
+    except (TypeError, ValueError):
+        raise ValueError("ticket_id must be a valid integer")
+
+    # Get description (allow empty string to clear description)
+    if "description" not in payload:
+        raise ValueError("description is required")
+
+    description = payload.get("description")
+    if description is not None:
+        description = str(description)
+
+    from app.repositories import tickets as tickets_repo
+
+    try:
+        existing = await tickets_repo.get_ticket(ticket_id_int)
+    except RuntimeError:
+        existing = None
+    previous_description = existing.get("description") if existing else None
+
+    # Create webhook event for tracking
+    event = await webhook_monitor.create_manual_event(
+        name="module.update-ticket-description.update",
+        target_url=f"internal://tickets/{ticket_id_int}/description",
+        payload={
+            "ticket_id": ticket_id_int,
+            "description": (
+                description[:WEBHOOK_PAYLOAD_DESCRIPTION_MAX_LENGTH]
+                if description
+                else None
+            ),
+        },
+        headers={"X-Module": "update-ticket-description"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError(
+            "Failed to create webhook event for ticket description update"
+        )
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        updated_ticket = await tickets_service.update_ticket_description(
+            ticket_id_int, description
+        )
+        if not updated_ticket:
+            raise ValueError(f"Ticket {ticket_id_int} not found")
+    except Exception as exc:
+        logger.error(
+            "Ticket description update failed",
+            error=str(exc),
+            ticket_id=ticket_id_int,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"ticket_id": ticket_id_int},
+        )
+
+    response_body = json.dumps(
+        {"ticket_id": ticket_id_int, "description_updated": True}
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "ticket_id": ticket_id_int,
+            "description_updated": True,
+            "previous_values": {"description": previous_description},
+            "updated_fields": ["description"],
+        },
+    )
+
+
+def _extract_ai_ticket_subject(payload: Any) -> str | None:
+    """Return a clean AI-generated subject only when it is 3 to 12 words."""
+
+    if isinstance(payload, Mapping):
+        candidate = payload.get("subject")
+        if candidate is None:
+            candidate = (
+                payload.get("response") or payload.get("message") or payload.get("text")
+            )
+    else:
+        candidate = payload
+    if not isinstance(candidate, str):
+        return None
+    text = candidate.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    if isinstance(parsed, Mapping):
+        text = str(parsed.get("subject") or "").strip()
+    elif isinstance(parsed, str):
+        text = parsed.strip()
+    text = re.sub(r"^(?:subject|title)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip().strip("\"'`").strip()
+    words = text.split()
+    return text if 3 <= len(words) <= 12 else None
+
+
+async def _invoke_ai_rename_ticket(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Generate and persist a concise, descriptive ticket subject with AI."""
+
+    context = (
+        payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
+    )
+    context_ticket = (
+        context.get("ticket") if isinstance(context.get("ticket"), Mapping) else {}
+    )
+    raw_ticket_id = (
+        payload.get("ticket_id") or context_ticket.get("id") or context.get("ticket_id")
+    )
+    try:
+        ticket_id = int(raw_ticket_id)
+    except (TypeError, ValueError):
+        raise ValueError("ticket_id is required and must be a valid integer")
+    ticket = await tickets_repo.get_ticket(ticket_id)
+    if not ticket:
+        raise ValueError(f"Ticket {ticket_id} not found")
+
+    current_subject = str(ticket.get("subject") or "").strip()
+    initial_description = str(ticket.get("description") or "").strip()
+    if not current_subject and not initial_description:
+        return {
+            "status": "skipped",
+            "reason": "Ticket has no subject or description",
+            "ticket_id": ticket_id,
+        }
+
+    ollama_module = await module_repo.get_module("ollama")
+    if not ollama_module or not ollama_module.get("enabled"):
+        raise ValueError("Ollama AI module is not configured or enabled")
+    ollama_settings = _resolve_module_settings_for_runtime("ollama", ollama_module)
+    prompt = (
+        "Create a more descriptive support ticket subject using the current subject "
+        "and initial problem description below. Return only the new subject, with no "
+        "quotes, label, explanation, analysis, or punctuation-only words. The subject must be "
+        "between 3 and 12 words long.\n\n"
+        f"Current subject: {current_subject}\n"
+        f"Initial problem description: {initial_description}"
+    )
+    ai_result = await _invoke_ollama(
+        ollama_settings,
+        # Reasoning-capable llama.cpp models consume completion tokens while
+        # thinking before placing the final answer in message.content. Sixty
+        # tokens routinely ended with finish_reason="length" and empty content,
+        # even though the HTTP request itself succeeded.
+        {"prompt": prompt, "temperature": 0.2, "max_tokens": 512},
+        event_future=event_future,
+    )
+    if str(ai_result.get("status") or "").lower() != "succeeded":
+        return {**ai_result, "ticket_id": ticket_id}
+    new_subject = _extract_ai_ticket_subject(ai_result.get("response"))
+    if not new_subject:
+        return {
+            **ai_result,
+            "status": "error",
+            "error": (
+                "AI returned no usable subject. The generated subject must contain "
+                "between 3 and 12 words."
+            ),
+            "ticket_id": ticket_id,
+        }
+
+    await tickets_repo.update_ticket(ticket_id, subject=new_subject)
+    await tickets_service.emit_ticket_updated_event(
+        ticket_id, actor_type="automation", trigger_automations=False
+    )
+    return {
+        **ai_result,
+        "ticket_id": ticket_id,
+        "ticket_number": ticket.get("ticket_number"),
+        "subject": new_subject,
+        "previous_values": {"subject": current_subject},
+        "updated_fields": ["subject"],
+    }
+
+
+async def _invoke_reprocess_ai(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Re-trigger AI processing for a ticket.
+
+    This will regenerate the AI summary and tags using the Ollama model.
+    The ticket_id can be provided directly or via context.ticket.id or context.ticket_id.
+
+    Optional parameters:
+    - refresh_summary: bool (default: True) - Whether to refresh the AI summary
+    - refresh_tags: bool (default: True) - Whether to refresh the AI tags
+    """
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+
+    # Resolve ticket_id from payload or context
+    ticket_id = payload.get("ticket_id")
+    if ticket_id is None:
+        ticket_id = context.get("ticket_id")
+    if ticket_id is None:
+        ticket_context = context.get("ticket")
+        if isinstance(ticket_context, Mapping):
+            ticket_id = ticket_context.get("id")
+
+    if ticket_id is None:
+        raise ValueError("ticket_id is required")
+
+    try:
+        ticket_id_int = int(ticket_id)
+    except (TypeError, ValueError):
+        raise ValueError("ticket_id must be a valid integer")
+
+    # Check options
+    refresh_summary = _ensure_bool(payload.get("refresh_summary"), True)
+    refresh_tags = _ensure_bool(payload.get("refresh_tags"), True)
+
+    if not refresh_summary and not refresh_tags:
+        return {
+            "status": "skipped",
+            "reason": "No AI processing requested (both refresh_summary and refresh_tags are false)",
+            "ticket_id": ticket_id_int,
+        }
+
+    # Create webhook event for tracking
+    event = await webhook_monitor.create_manual_event(
+        name="module.reprocess-ai.process",
+        target_url=f"internal://tickets/{ticket_id_int}/ai",
+        payload={
+            "ticket_id": ticket_id_int,
+            "refresh_summary": refresh_summary,
+            "refresh_tags": refresh_tags,
+        },
+        headers={"X-Module": "reprocess-ai"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for AI reprocessing")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    processed = []
+    try:
+        if refresh_summary:
+            await tickets_service.refresh_ticket_ai_summary(ticket_id_int)
+            processed.append("summary")
+        if refresh_tags:
+            await tickets_service.refresh_ticket_ai_tags(ticket_id_int)
+            processed.append("tags")
+    except Exception as exc:
+        logger.error(
+            "AI reprocessing failed",
+            error=str(exc),
+            ticket_id=ticket_id_int,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"ticket_id": ticket_id_int, "processed": processed},
+        )
+
+    response_body = json.dumps(
+        {
+            "ticket_id": ticket_id_int,
+            "processed": processed,
+        }
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={"ticket_id": ticket_id_int, "processed": processed},
+    )
+
+
+async def _invoke_add_ticket_reply(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Add a reply to a ticket from automation payload.
+
+    Accepts a JSON payload with:
+    - ticket_id: Required (can come from context.ticket.id)
+    - body: Required - The reply content (HTML or plain text)
+    - is_internal: Optional (default: false) - Whether this is an internal note
+    - author_id: Optional - User ID of the author
+    - minutes_spent: Optional - Time tracking in minutes
+    - is_billable: Optional (default: false) - Whether time is billable
+    - labour_type_id: Optional - Labour type for billing
+    - send_notification: Optional (default: false) - Whether to send email notification
+    """
+    from app.repositories import tickets as tickets_repo
+
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+
+    # Resolve ticket_id from payload or context
+    ticket_id = payload.get("ticket_id")
+    if ticket_id is None:
+        ticket_id = context.get("ticket_id")
+    if ticket_id is None:
+        ticket_context = context.get("ticket")
+        if isinstance(ticket_context, Mapping):
+            ticket_id = ticket_context.get("id")
+
+    if ticket_id is None:
+        raise ValueError("ticket_id is required")
+
+    try:
+        ticket_id_int = int(ticket_id)
+    except (TypeError, ValueError):
+        raise ValueError("ticket_id must be a valid integer")
+
+    # Get reply body
+    body = payload.get("body")
+    if body is None or str(body).strip() == "":
+        raise ValueError("body is required and cannot be empty")
+    body_str = str(body)
+
+    # Get optional fields
+    is_internal = _ensure_bool(payload.get("is_internal"), False)
+
+    author_id = _parse_nullable_int(payload.get("author_id"))
+
+    minutes_spent = _parse_nullable_int(payload.get("minutes_spent"))
+    if minutes_spent is not None and minutes_spent < 0:
+        minutes_spent = None
+
+    is_billable = _ensure_bool(payload.get("is_billable"), False)
+
+    labour_type_id = _parse_nullable_int(payload.get("labour_type_id"))
+
+    send_notification = _ensure_bool(payload.get("send_notification"), False)
+
+    # Create webhook event for tracking
+    event = await webhook_monitor.create_manual_event(
+        name="module.add-ticket-reply.create",
+        target_url=f"internal://tickets/{ticket_id_int}/replies",
+        payload={
+            "ticket_id": ticket_id_int,
+            "is_internal": is_internal,
+            "has_body": bool(body_str),
+            "minutes_spent": minutes_spent,
+            "is_billable": is_billable,
+            "send_notification": send_notification,
+        },
+        headers={"X-Module": "add-ticket-reply"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for ticket reply")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        # Check ticket exists
+        existing = await tickets_repo.get_ticket(ticket_id_int)
+        if not existing:
+            raise ValueError(f"Ticket {ticket_id_int} not found")
+
+        # Create the reply
+        reply = await tickets_repo.create_reply(
+            ticket_id=ticket_id_int,
+            author_id=author_id,
+            body=body_str,
+            is_internal=is_internal,
+            minutes_spent=minutes_spent,
+            is_billable=is_billable,
+            labour_type_id=labour_type_id,
+        )
+
+        # Emit ticket updated event
+        await tickets_service.emit_ticket_updated_event(
+            ticket_id_int,
+            actor_type="automation",
+            trigger_automations=False,
+        )
+
+        reply_id = reply.get("id") if reply else None
+
+        # Optionally send notification (future enhancement)
+        if send_notification and not is_internal and reply_id:
+            # Note: Email notification would be triggered here
+            # This is a placeholder for future notification integration
+            logger.info(
+                "Reply notification requested",
+                ticket_id=ticket_id_int,
+                reply_id=reply_id,
+            )
+    except Exception as exc:
+        logger.error(
+            "Ticket reply creation failed",
+            error=str(exc),
+            ticket_id=ticket_id_int,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"ticket_id": ticket_id_int},
+        )
+
+    response_body = json.dumps(
+        {
+            "ticket_id": ticket_id_int,
+            "reply_id": reply_id,
+            "is_internal": is_internal,
+            "minutes_spent": minutes_spent,
+            "is_billable": is_billable,
+        }
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "ticket_id": ticket_id_int,
+            "reply_id": reply_id,
+            "is_internal": is_internal,
+        },
+    )
+
+
+def _resolve_ticket_id_from_payload(payload: Mapping[str, Any]) -> int:
+    """Resolve a ticket id from an action payload or automation context."""
+
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+    ticket_id = payload.get("ticket_id")
+    if ticket_id is None:
+        ticket_id = context.get("ticket_id")
+    if ticket_id is None:
+        ticket_context = context.get("ticket")
+        if isinstance(ticket_context, Mapping):
+            ticket_id = ticket_context.get("id")
+    if ticket_id is None:
+        raise ValueError("ticket_id is required")
+    try:
+        ticket_id_int = int(ticket_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ticket_id must be a valid integer") from exc
+    if ticket_id_int <= 0:
+        raise ValueError("ticket_id must be a positive integer")
+    return ticket_id_int
+
+
+def _normalised_svg_bytes(contents: bytes) -> bytes | None:
+    """Return a stable SVG representation for hashing, if parsing succeeds."""
+
+    try:
+        text = contents.decode("utf-8-sig")
+        root = DefusedET.fromstring(text)
+        for element in root.iter():
+            if element.attrib:
+                sorted_attributes = sorted(element.attrib.items())
+                element.attrib.clear()
+                element.attrib.update(sorted_attributes)
+            if element.text and not element.text.strip():
+                element.text = None
+            if element.tail and not element.tail.strip():
+                element.tail = None
+        return DefusedET.tostring(root, encoding="utf-8", short_empty_elements=False)
+    except (DefusedET.ParseError, DefusedXmlException, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _attachment_hash_key(
+    contents: bytes,
+    *,
+    algorithm: str,
+    filename: str,
+    original_filename: Any,
+    mime_type: Any,
+) -> tuple[str, str]:
+    """Build a content hash key for duplicate attachment detection.
+
+    Most attachments use an exact byte hash. SVG files are XML documents, so the
+    same content can be serialized with different insignificant whitespace. For
+    SVGs we hash a canonical XML representation so equal SVG content is treated
+    as a duplicate even if serialization differs.
+    """
+
+    extension_source = str(original_filename or filename).lower()
+    mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if extension_source.endswith(".svg") or mime in {"image/svg+xml", "image/svg"}:
+        normalised = _normalised_svg_bytes(contents)
+        if normalised is not None:
+            digest = hashlib.new(algorithm)
+            digest.update(normalised)
+            return f"svg-c14n:{digest.hexdigest()}", "svg-c14n"
+
+    digest = hashlib.new(algorithm)
+    digest.update(contents)
+    return f"bytes:{digest.hexdigest()}", "bytes"
+
+
+async def _invoke_smart_attachment_removal(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Remove duplicate ticket attachments by comparing content hashes."""
+
+    from app.repositories import tickets as tickets_repo
+    from app.repositories import ticket_attachments as attachments_repo
+    from app.services import ticket_attachments as attachments_service
+
+    ticket_id = _resolve_ticket_id_from_payload(payload)
+    existing = await tickets_repo.get_ticket(ticket_id)
+    if not existing:
+        raise ValueError(f"Ticket {ticket_id} not found")
+
+    algorithm = str(payload.get("hash_algorithm") or "sha256").strip().lower()
+    if algorithm not in {"sha256", "md5"}:
+        raise ValueError("hash_algorithm must be one of: sha256, md5")
+    dry_run = bool(payload.get("dry_run", False))
+
+    attachments = await attachments_repo.list_attachments(ticket_id)
+    for poll_attempt in range(_SMART_ATTACHMENT_POLL_ATTEMPTS):
+        missing_ready_files = []
+        for attachment in attachments:
+            filename = str(attachment.get("filename") or "").strip()
+            if not filename:
+                continue
+            file_path = attachments_service.get_attachment_file_path(filename)
+            if not file_path.exists() or not file_path.is_file():
+                missing_ready_files.append(filename)
+
+        if not missing_ready_files:
+            break
+
+        if poll_attempt < _SMART_ATTACHMENT_POLL_ATTEMPTS - 1:
+            logger.info(
+                "Ticket attachments found but files are not yet present; retrying",
+                ticket_id=ticket_id,
+                missing_files=len(missing_ready_files),
+                poll_attempt=poll_attempt + 1,
+            )
+            await asyncio.sleep(_SMART_ATTACHMENT_POLL_DELAY_SECONDS)
+
+    seen: dict[str, dict[str, Any]] = {}
+    duplicates: list[dict[str, Any]] = []
+    missing_files: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for attachment in attachments:
+        filename = str(attachment.get("filename") or "").strip()
+        attachment_id = attachment.get("id")
+        if not filename or attachment_id is None:
+            errors.append(
+                {
+                    "attachment_id": attachment_id,
+                    "error": "Attachment record has no stored filename",
+                }
+            )
+            continue
+        file_path = attachments_service.get_attachment_file_path(filename)
+        if not file_path.exists() or not file_path.is_file():
+            missing_files.append(
+                {
+                    "attachment_id": attachment_id,
+                    "filename": filename,
+                    "original_filename": attachment.get("original_filename"),
+                }
+            )
+            continue
+        try:
+            with open(file_path, "rb") as handle:
+                contents = handle.read()
+        except OSError as exc:
+            errors.append(
+                {
+                    "attachment_id": attachment_id,
+                    "filename": filename,
+                    "error": str(exc),
+                }
+            )
+            continue
+        file_hash, hash_type = _attachment_hash_key(
+            contents,
+            algorithm=algorithm,
+            filename=filename,
+            original_filename=attachment.get("original_filename"),
+            mime_type=attachment.get("mime_type"),
+        )
+        original = seen.get(file_hash)
+        if original is None:
+            seen[file_hash] = attachment
+            continue
+        duplicate_entry = {
+            "attachment_id": attachment_id,
+            "original_attachment_id": original.get("id"),
+            "filename": filename,
+            "original_filename": attachment.get("original_filename"),
+            "hash": file_hash,
+            "hash_type": hash_type,
+        }
+        duplicates.append(duplicate_entry)
+        if dry_run:
+            continue
+        try:
+            await attachments_service.delete_attachment_file(attachment)
+        except Exception as exc:  # pragma: no cover - defensive per-file guard
+            duplicate_entry["deleted"] = False
+            duplicate_entry["error"] = str(exc)
+            errors.append(
+                {
+                    "attachment_id": attachment_id,
+                    "filename": filename,
+                    "error": str(exc),
+                }
+            )
+        else:
+            duplicate_entry["deleted"] = True
+
+    removed = sum(1 for entry in duplicates if entry.get("deleted"))
+    return {
+        "status": "succeeded" if not errors else "partial",
+        "ticket_id": ticket_id,
+        "hash_algorithm": algorithm,
+        "dry_run": dry_run,
+        "scanned": len(attachments),
+        "unique": len(seen),
+        "duplicates_found": len(duplicates),
+        "removed": 0 if dry_run else removed,
+        "missing_files": missing_files,
+        "duplicates": duplicates,
+        "errors": errors,
+    }
+
+
+# Audio MIME types accepted for WhisperX transcription
+_WHISPERX_AUDIO_MIME_TYPES = {
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/ogg",
+    "audio/flac",
+    "audio/x-flac",
+    "audio/webm",
+    "audio/mp4",
+    "audio/x-m4a",
+}
+
+# File extensions accepted when MIME type is missing or generic
+_WHISPERX_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".ogg",
+    ".flac",
+    ".webm",
+    ".m4a",
+    ".mp4",
+    ".mpeg",
+}
+
+
+_WHISPERX_ATTACHMENT_POLL_ATTEMPTS = 3
+_WHISPERX_ATTACHMENT_POLL_DELAY_SECONDS = 1.5
+
+# Sample-width → array type-code for little-endian PCM WAV.
+_WAV_TYPECODES: dict[int, str] = {1: "b", 2: "h", 4: "l"}
+
+
+def _is_audio_attachment(attachment: Mapping[str, Any]) -> bool:
+    """Return True if the attachment is an audio file suitable for transcription."""
+    mime = (attachment.get("mime_type") or "").lower().strip()
+    if mime in _WHISPERX_AUDIO_MIME_TYPES:
+        return True
+    original = attachment.get("original_filename") or ""
+    ext = original.rsplit(".", 1)[-1].lower() if "." in original else ""
+    return f".{ext}" in _WHISPERX_AUDIO_EXTENSIONS
+
+
+def _is_wav_attachment(attachment: Mapping[str, Any]) -> bool:
+    """Return True when an attachment is a WAV file."""
+    mime = (attachment.get("mime_type") or "").lower().strip()
+    if mime in {"audio/wav", "audio/x-wav", "audio/wave"}:
+        return True
+    original = attachment.get("original_filename") or attachment.get("filename") or ""
+    return Path(str(original)).suffix.lower() == ".wav"
+
+
+def _attachment_sort_key(attachment: Mapping[str, Any]) -> tuple[str, int]:
+    """Sort attachments chronologically, using id as a stable tie breaker."""
+    uploaded_at = attachment.get("uploaded_at")
+    uploaded_key = (
+        uploaded_at.isoformat()
+        if hasattr(uploaded_at, "isoformat")
+        else str(uploaded_at or "")
+    )
+    try:
+        attachment_id = int(attachment.get("id") or 0)
+    except (TypeError, ValueError):
+        attachment_id = 0
+    return uploaded_key, attachment_id
+
+
+def _resolve_ticket_attachment_path(
+    attachments_service: Any, attachment: Mapping[str, Any]
+) -> Path | None:
+    """Return the existing storage path for an attachment, including legacy storage."""
+    filename = attachment.get("filename")
+    if not filename:
+        return None
+    file_path = attachments_service.get_attachment_file_path(filename)
+    if file_path.exists():
+        return file_path
+    legacy_file_path = attachments_service.get_legacy_attachment_file_path(filename)
+    if legacy_file_path.exists():
+        return legacy_file_path
+    return None
+
+
+def _split_stereo_wav(file_path: Path) -> tuple[Path, Path] | None:
+    """Split a stereo WAV file into two temporary mono channel files.
+
+    For Grandstream UCM recordings the **right** channel carries the **caller**
+    and the **left** channel carries the **callee**.
+
+    Returns ``(callee_path, caller_path)`` on success, or ``None`` when the
+    file is not a 2-channel PCM WAV (e.g. mono, non-WAV, or unsupported
+    sample width).  The caller is responsible for deleting both files.
+    """
+    try:
+        with wave.open(str(file_path), "rb") as wav:
+            if wav.getnchannels() != 2:
+                return None
+            sample_width = wav.getsampwidth()
+            frame_rate = wav.getframerate()
+            n_frames = wav.getnframes()
+            raw_data = wav.readframes(n_frames)
+    except (wave.Error, EOFError, OSError):
+        return None
+
+    typecode = _WAV_TYPECODES.get(sample_width)
+    if typecode is None:
+        logger.debug(
+            "Unsupported WAV sample width {} for stereo split of {}; skipping",
+            sample_width,
+            file_path.name,
+        )
+        return None
+
+    samples: array.array = array.array(typecode, raw_data)
+    # Stereo samples are interleaved: [L0, R0, L1, R1, …]
+    callee_samples = samples[0::2]  # left  channel = callee
+    caller_samples = samples[1::2]  # right channel = caller
+
+    stem = file_path.stem
+    callee_path = file_path.parent / f"{stem}_callee_ch.wav"
+    caller_path = file_path.parent / f"{stem}_caller_ch.wav"
+
+    try:
+        for path, channel in (
+            (callee_path, callee_samples),
+            (caller_path, caller_samples),
+        ):
+            with wave.open(str(path), "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(sample_width)
+                out.setframerate(frame_rate)
+                out.writeframes(channel.tobytes())
+    except (wave.Error, OSError):
+        callee_path.unlink(missing_ok=True)
+        caller_path.unlink(missing_ok=True)
+        return None
+
+    return callee_path, caller_path
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format a timestamp in seconds as ``MM:SS``."""
+    secs = max(0, int(seconds))
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
+def _parse_whisperx_response(
+    response: httpx.Response,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Parse a WhisperX ``/asr`` response.
+
+    Returns ``(text, segments)`` where *segments* is a (possibly empty) list
+    of dicts with at least ``start`` and ``text`` keys.
+    """
+    try:
+        result = response.json()
+        text = (result.get("text") or "").strip()
+        segments = result.get("segments") or []
+        return text, [s for s in segments if isinstance(s, dict)]
+    except ValueError:
+        return response.text.strip(), []
+
+
+def _split_text_to_lines(text: str) -> list[str]:
+    """Split a transcription text into individual sentence lines.
+
+    Splits on sentence-ending punctuation (.!?) followed by whitespace
+    (preserving the punctuation via lookbehind), or on newlines.
+    """
+    lines = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+    return [line.strip() for line in lines if line.strip()]
+
+
+def _build_stereo_transcription(
+    caller_text: str,
+    caller_segments: list[dict[str, Any]],
+    callee_text: str,
+    callee_segments: list[dict[str, Any]],
+) -> str:
+    """Combine caller and callee channel results into a labelled transcription.
+
+    When either channel supplies timing segments the output is a single
+    chronologically-ordered conversation with timestamps on each line.
+    Otherwise the text from each channel is split into individual sentences
+    and presented as labelled lines.
+    """
+    if caller_segments or callee_segments:
+        tagged: list[dict[str, Any]] = []
+        for seg in caller_segments:
+            tagged.append(
+                {
+                    "start": seg.get("start", 0.0),
+                    "label": "Caller",
+                    "text": (seg.get("text") or "").strip(),
+                }
+            )
+        for seg in callee_segments:
+            tagged.append(
+                {
+                    "start": seg.get("start", 0.0),
+                    "label": "Callee",
+                    "text": (seg.get("text") or "").strip(),
+                }
+            )
+        tagged = [s for s in tagged if s["text"]]
+        tagged.sort(key=lambda s: s["start"])
+        lines = [
+            f"[{_fmt_time(s['start'])}] **{s['label']}:** {s['text']}" for s in tagged
+        ]
+        return "\n".join(lines)
+
+    lines: list[str] = []
+    for sentence in _split_text_to_lines(caller_text):
+        lines.append(f"**Caller:** {sentence}")
+    for sentence in _split_text_to_lines(callee_text):
+        lines.append(f"**Callee:** {sentence}")
+    return "\n".join(lines)
+
+
+async def _invoke_whisperx(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Transcribe audio attachments on a ticket using WhisperX.
+
+    Accepts a JSON payload with:
+    - ticket_id: Required (can come from context.ticket.id)
+    - add_note: Optional (default: true) – add an internal note with the transcription
+    - language: Optional – override the module-level language setting
+
+    The handler finds all audio attachments on the ticket, sends each to the
+    WhisperX ``/asr`` endpoint, and (when *add_note* is true) posts the
+    resulting transcription as an internal note on the ticket.
+    """
+    from app.repositories import tickets as tickets_repo
+    from app.repositories import ticket_attachments as attachments_repo
+    from app.services import ticket_attachments as attachments_service
+
+    raw_context = payload.get("context")
+    context = raw_context if isinstance(raw_context, Mapping) else {}
+
+    # -- resolve ticket_id ------------------------------------------------
+    ticket_id = payload.get("ticket_id")
+    if ticket_id is None:
+        ticket_id = context.get("ticket_id")
+    if ticket_id is None:
+        ticket_ctx = context.get("ticket")
+        if isinstance(ticket_ctx, Mapping):
+            ticket_id = ticket_ctx.get("id")
+
+    if ticket_id is None:
+        raise ValueError("ticket_id is required")
+
+    try:
+        ticket_id_int = int(ticket_id)
+    except (TypeError, ValueError):
+        raise ValueError("ticket_id must be a valid integer")
+
+    add_note = _ensure_bool(payload.get("add_note"), True)
+    language = payload.get("language") or settings.get("language") or ""
+
+    # -- validate WhisperX settings ---------------------------------------
+    base_url = (settings.get("base_url") or "").strip().rstrip("/")
+    api_key = settings.get("api_key") or ""
+    if not base_url:
+        raise ValueError("WhisperX base_url is not configured")
+
+    target_url = f"{base_url}/asr"
+
+    # -- create webhook event for tracking --------------------------------
+    event = await webhook_monitor.create_manual_event(
+        name="module.whisperx.transcribe",
+        target_url=target_url,
+        payload={
+            "ticket_id": ticket_id_int,
+            "add_note": add_note,
+            "language": language,
+        },
+        headers={"X-Module": "whisperx"},
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for WhisperX transcription")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        # -- verify ticket exists -----------------------------------------
+        existing = await tickets_repo.get_ticket(ticket_id_int)
+        if not existing:
+            raise ValueError(f"Ticket {ticket_id_int} not found")
+
+        # -- list attachments and filter audio files (with short polling) --
+        audio_attachments: list[Mapping[str, Any]] = []
+        ready_attachment_paths: list[tuple[Mapping[str, Any], Path]] = []
+        for poll_attempt in range(_WHISPERX_ATTACHMENT_POLL_ATTEMPTS):
+            all_attachments = await attachments_repo.list_attachments(ticket_id_int)
+            audio_attachments = [a for a in all_attachments if _is_audio_attachment(a)]
+
+            wav_attachments = [a for a in audio_attachments if _is_wav_attachment(a)]
+            if wav_attachments:
+                # Voicemail tickets can collect multiple WAV attachments; process only
+                # the newest WAV to avoid transcribing stale voicemail copies.
+                audio_attachments = [max(wav_attachments, key=_attachment_sort_key)]
+
+            ready_attachment_paths = [
+                (a, path)
+                for a in audio_attachments
+                if (path := _resolve_ticket_attachment_path(attachments_service, a))
+                is not None
+            ]
+
+            if ready_attachment_paths:
+                break
+
+            if poll_attempt < _WHISPERX_ATTACHMENT_POLL_ATTEMPTS - 1:
+                # Give the ticket importer a moment to finish writing attachments
+                if audio_attachments:
+                    logger.info(
+                        "Audio attachments found but files not yet present; retrying",
+                        ticket_id=ticket_id_int,
+                        poll_attempt=poll_attempt + 1,
+                    )
+                await asyncio.sleep(_WHISPERX_ATTACHMENT_POLL_DELAY_SECONDS)
+
+        if not audio_attachments:
+            raise ValueError(f"No audio attachments found on ticket {ticket_id_int}")
+
+        if not ready_attachment_paths:
+            raise ValueError(
+                f"Audio attachments not yet available on disk for ticket {ticket_id_int}"
+            )
+
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        transcriptions: list[dict[str, Any]] = []
+
+        stereo_split = settings.get("stereo_split", False)
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            for attachment, file_path in ready_attachment_paths:
+                original_name = (
+                    attachment.get("original_filename") or attachment["filename"]
+                )
+
+                # Attempt stereo channel split when requested
+                # (Grandstream UCM: right channel = caller, left channel = callee)
+                stereo_paths: tuple[Path, Path] | None = None
+                if stereo_split:
+                    stereo_paths = _split_stereo_wav(file_path)
+                    if stereo_paths is None:
+                        logger.info(
+                            "Stereo split requested but {} is not a 2-channel WAV; "
+                            "transcribing as a single channel",
+                            original_name,
+                        )
+
+                # WhisperX /asr uses FastAPI Query(...) parameters, so options
+                # like ``output`` and ``language`` MUST be sent as URL query
+                # parameters. Sending them as form data is silently ignored
+                # and the server falls back to its default ``output=txt``,
+                # which omits the segment timestamps.
+                params: dict[str, str] = {"output": "json"}
+                if language:
+                    params["language"] = language
+
+                if stereo_paths:
+                    callee_path, caller_path = stereo_paths
+                    try:
+                        with open(caller_path, "rb") as cf:
+                            resp_caller = await client.post(
+                                target_url,
+                                files={"audio_file": (original_name, cf, "audio/wav")},
+                                params=params,
+                                headers=headers,
+                            )
+                        resp_caller.raise_for_status()
+                        caller_text, caller_segs = _parse_whisperx_response(resp_caller)
+
+                        with open(callee_path, "rb") as cf:
+                            resp_callee = await client.post(
+                                target_url,
+                                files={"audio_file": (original_name, cf, "audio/wav")},
+                                params=params,
+                                headers=headers,
+                            )
+                        resp_callee.raise_for_status()
+                        callee_text, callee_segs = _parse_whisperx_response(resp_callee)
+                    finally:
+                        callee_path.unlink(missing_ok=True)
+                        caller_path.unlink(missing_ok=True)
+
+                    transcription = _build_stereo_transcription(
+                        caller_text, caller_segs, callee_text, callee_segs
+                    )
+                else:
+                    mime = (attachment.get("mime_type") or "audio/wav").strip()
+                    with open(file_path, "rb") as audio_file:
+                        files = {"audio_file": (original_name, audio_file, mime)}
+
+                        response = await client.post(
+                            target_url,
+                            files=files,
+                            params=params,
+                            headers=headers,
+                        )
+                        response.raise_for_status()
+
+                    # parse response – JSON with "text" key, or plain text
+                    transcription, _ = _parse_whisperx_response(response)
+
+                if transcription:
+                    transcriptions.append(
+                        {
+                            "attachment_id": attachment["id"],
+                            "filename": original_name,
+                            "transcription": transcription,
+                        }
+                    )
+
+        if not transcriptions:
+            raise ValueError(
+                "WhisperX returned empty transcriptions for all audio attachments"
+            )
+
+        # -- optionally post an internal note -----------------------------
+        reply_id = None
+        if add_note:
+            parts: list[str] = []
+            for t in transcriptions:
+                parts.append(
+                    f"**Transcription of {t['filename']}:**\n\n{t['transcription']}"
+                )
+            note_body = "\n\n---\n\n".join(parts)
+            reply = await tickets_repo.create_reply(
+                ticket_id=ticket_id_int,
+                author_id=None,
+                body=note_body,
+                is_internal=True,
+            )
+            reply_id = reply.get("id") if reply else None
+
+            await tickets_service.emit_ticket_updated_event(
+                ticket_id_int,
+                actor_type="automation",
+                trigger_automations=False,
+            )
+
+    except Exception as exc:
+        logger.error(
+            "WhisperX transcription failed",
+            error=str(exc),
+            ticket_id=ticket_id_int,
+        )
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event,
+            extra={"ticket_id": ticket_id_int},
+        )
+
+    response_body = json.dumps(
+        {
+            "ticket_id": ticket_id_int,
+            "transcriptions": [
+                {"attachment_id": t["attachment_id"], "filename": t["filename"]}
+                for t in transcriptions
+            ],
+            "reply_id": reply_id,
+        }
+    )
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=200,
+        response_body=response_body,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={
+            "ticket_id": ticket_id_int,
+            "transcription_count": len(transcriptions),
+            "reply_id": reply_id,
+        },
+    )
+
+
+async def _invoke_password_pusher(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Push a secret to Password Pusher and return the share URL.
+
+    The generated ``push_url`` is included in the result so it can be
+    referenced as a variable (e.g. ``${vars.push_url}``) in subsequent
+    workflow steps.
+
+    Settings:
+    - base_url: Password Pusher instance URL (default: https://pwpush.com)
+    - api_key: API token for authenticated instances
+    - user_email: User email paired with api_key for authentication
+    - expire_after_days: Default expiry in days
+    - expire_after_views: Default view count expiry
+    - deletable_by_viewer: Allow viewer to delete the push
+    - retrieval_step: Add an extra confirmation step before revealing the secret
+
+    Payload (overrides settings defaults):
+    - payload: The secret text to push (required)
+    - expire_after_days: Override expiry in days
+    - expire_after_views: Override view count expiry
+    - deletable_by_viewer: Override deletable_by_viewer
+    - retrieval_step: Override retrieval_step
+    - note: Optional note (shown to the viewer on some pwpush versions)
+
+    Note: Authentication headers (Authorization, X-User-Token) are excluded
+    from webhook event tracking to prevent credential leakage in audit logs.
+    The secret payload is never stored in event tracking – only expiry metadata.
+    """
+    base_url = str(settings.get("base_url") or "https://pwpush.com").strip().rstrip("/")
+    api_key = str(settings.get("api_key") or "").strip()
+    user_email = str(settings.get("user_email") or "").strip()
+
+    secret_text = str(payload.get("payload") or "").strip()
+    if not secret_text:
+        raise ValueError("Password Pusher payload (secret text) is required")
+
+    expire_after_days = (
+        _coerce_int(payload.get("expire_after_days"), minimum=1, maximum=90)
+        or _coerce_int(settings.get("expire_after_days"), minimum=1, maximum=90)
+        or 7
+    )
+    expire_after_views = (
+        _coerce_int(payload.get("expire_after_views"), minimum=1, maximum=100)
+        or _coerce_int(settings.get("expire_after_views"), minimum=1, maximum=100)
+        or 5
+    )
+    deletable_by_viewer = _ensure_bool(
+        (
+            payload.get("deletable_by_viewer")
+            if payload.get("deletable_by_viewer") is not None
+            else settings.get("deletable_by_viewer")
+        ),
+        True,
+    )
+    retrieval_step = _ensure_bool(
+        (
+            payload.get("retrieval_step")
+            if payload.get("retrieval_step") is not None
+            else settings.get("retrieval_step")
+        ),
+        False,
+    )
+    note = str(payload.get("note") or "").strip() or None
+
+    push_body: dict[str, Any] = {
+        "payload": secret_text,
+        "expire_after_days": expire_after_days,
+        "expire_after_views": expire_after_views,
+        "deletable_by_viewer": deletable_by_viewer,
+        "retrieval_step": retrieval_step,
+    }
+    if note:
+        push_body["note"] = note
+
+    request_body = {"password": push_body}
+    target_url = f"{base_url}/p.json"
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if api_key and user_email:
+        headers["X-User-Email"] = user_email
+        headers["X-User-Token"] = api_key
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    event = await webhook_monitor.create_manual_event(
+        name="module.password-pusher.push",
+        target_url=target_url,
+        payload={
+            "expire_after_days": expire_after_days,
+            "expire_after_views": expire_after_views,
+        },
+        headers={
+            k: v
+            for k, v in headers.items()
+            if k not in {"Authorization", "X-User-Token"}
+        },
+        max_attempts=1,
+        backoff_seconds=60,
+    )
+    event_id = int(event.get("id")) if event.get("id") is not None else None
+    if event_id is None:
+        raise RuntimeError("Failed to create webhook event for Password Pusher request")
+    if event_future and not event_future.done():
+        event_future.set_result(event_id)
+
+    attempt_number = 1
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(target_url, json=request_body, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        response_body = exc.response.text if exc.response is not None else None
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="failed",
+            error_message=(
+                f"HTTP {exc.response.status_code}" if exc.response else str(exc)
+            ),
+            response_status=exc.response.status_code if exc.response else None,
+            response_body=response_body,
+        )
+        return _build_event_result(
+            updated_event, extra={"push_url": None, "url_token": None}
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        updated_event = await _record_failure(
+            event_id,
+            attempt_number=attempt_number,
+            status="error",
+            error_message=str(exc),
+            response_status=None,
+            response_body=None,
+        )
+        return _build_event_result(
+            updated_event, extra={"push_url": None, "url_token": None}
+        )
+
+    response_text = response.text
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+
+    url_token = str(data.get("url_token") or "").strip()
+    html_url = str(data.get("html_url") or "").strip()
+    if not html_url and url_token:
+        html_url = f"{base_url}/p/{url_token}"
+
+    updated_event = await _record_success(
+        event_id,
+        attempt_number=attempt_number,
+        response_status=response.status_code,
+        response_body=response_text,
+    )
+    return _build_event_result(
+        updated_event,
+        extra={"push_url": html_url, "url_token": url_token},
+    )
+
+
+async def _validate_hudu(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Validate Hudu module configuration by verifying connectivity."""
+    if event_future and not event_future.done():
+        event_future.set_result(None)
+
+    base_url = str(settings.get("base_url") or "").strip().rstrip("/")
+    api_key = str(settings.get("api_key") or "").strip()
+
+    if not base_url:
+        return {"status": "error", "message": "Hudu base URL is not configured"}
+    if not api_key:
+        return {"status": "error", "message": "Hudu API key is not configured"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{base_url}/api/v1/companies",
+                headers={"x-api-key": api_key, "Accept": "application/json"},
+                params={"page_size": 1},
+            )
+        if response.status_code == 401:
+            return {"status": "error", "message": "Invalid Hudu API key"}
+        response.raise_for_status()
+        return {"status": "ok", "message": "Hudu connection successful"}
+    except httpx.HTTPStatusError as exc:
+        return {
+            "status": "error",
+            "message": f"Hudu API returned HTTP {exc.response.status_code}",
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"Failed to connect to Hudu: {exc}"}
+
+
+async def _validate_trello(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Validate Trello module configuration by verifying API connectivity."""
+    if event_future and not event_future.done():
+        event_future.set_result(None)
+
+    from app.services.trello import validate_credentials
+
+    return await validate_credentials()
+
+
+async def _invoke_trello_add_comment(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Post a comment on a Trello card.
+
+    Payload:
+    - card_id: Trello card ID to comment on (required). Supports ``{{ticket.external_reference}}``.
+    - text: Comment text to post on the card (required).
+
+    The comment is prefixed with ``[MyPortal]`` automatically by the Trello service
+    to prevent feedback loops when the webhook handler processes incoming comments.
+    """
+    card_id_input = str(payload.get("card_id") or "").strip()
+    if not card_id_input:
+        raise ValueError("card_id is required for the Trello add-comment action")
+
+    from app.services.trello import card_id_from_external_reference
+
+    card_id = card_id_from_external_reference(card_id_input)
+    if not card_id:
+        raise ValueError("card_id is required for the Trello add-comment action")
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required for the Trello add-comment action")
+
+    company = await _resolve_trello_company_for_action(payload, card_id)
+
+    if event_future and not event_future.done():
+        event_future.set_result(None)
+
+    from app.services.trello import add_comment_to_card
+
+    result = await add_comment_to_card(card_id, text, company=company)
+    if result is None:
+        return {
+            "status": "skipped",
+            "reason": "Trello comment was not posted (module disabled, credentials missing, or API error)",
+            "card_id": card_id,
+        }
+    return {
+        "status": "succeeded",
+        "card_id": card_id,
+        "comment_id": result.get("id"),
+    }
+
+
+async def _resolve_trello_company_for_action(
+    payload: Mapping[str, Any],
+    card_id: str,
+) -> dict[str, Any] | None:
+    """Resolve company credentials for a Trello automation action.
+
+    Automation contexts are not guaranteed to include an embedded
+    ``ticket.company`` record. Some flows only provide ``company_id`` on the
+    ticket, while manually-triggered actions may provide only a Trello card
+    reference. Resolve those common shapes before posting so company-scoped
+    Trello credentials are still used.
+    """
+    context = payload.get("context")
+    ticket_ctx: Mapping[str, Any] | None = None
+    if isinstance(context, Mapping):
+        raw_ticket_ctx = context.get("ticket")
+        if isinstance(raw_ticket_ctx, Mapping):
+            ticket_ctx = raw_ticket_ctx
+
+    if ticket_ctx is not None:
+        company_value = ticket_ctx.get("company")
+        if isinstance(company_value, Mapping):
+            return dict(company_value)
+
+        company = await _resolve_company_by_id(ticket_ctx.get("company_id"))
+        if company is not None:
+            return company
+
+    if isinstance(context, Mapping):
+        company = await _resolve_company_by_id(context.get("company_id"))
+        if company is not None:
+            return company
+
+        ticket_id = context.get("ticket_id")
+        if ticket_id is None and ticket_ctx is not None:
+            ticket_id = ticket_ctx.get("id")
+        company = await _resolve_company_from_ticket_id(ticket_id)
+        if company is not None:
+            return company
+
+    # Last resort: use the linked Trello ticket to discover the company. This
+    # covers payloads that render only ``{{ticket.external_reference}}`` into
+    # ``card_id`` without carrying the full ticket context.
+    try:
+        from app.services import trello as trello_service
+
+        ticket = await trello_service.find_ticket_for_card(card_id)
+    except Exception as exc:  # pragma: no cover - defensive lookup fallback
+        logger.debug("Trello company lookup by card failed for {}: {}", card_id, exc)
+        ticket = None
+    if isinstance(ticket, Mapping):
+        return await _resolve_company_by_id(ticket.get("company_id"))
+
+    return None
+
+
+async def _resolve_company_from_ticket_id(
+    ticket_id_value: Any,
+) -> dict[str, Any] | None:
+    try:
+        ticket_id = int(ticket_id_value)
+    except (TypeError, ValueError):
+        return None
+    if ticket_id <= 0:
+        return None
+    try:
+        from app.repositories import tickets as tickets_repo
+
+        ticket = await tickets_repo.get_ticket(ticket_id)
+    except Exception as exc:  # pragma: no cover - defensive lookup fallback
+        logger.debug("Trello company lookup by ticket {} failed: {}", ticket_id, exc)
+        return None
+    if not isinstance(ticket, Mapping):
+        return None
+    return await _resolve_company_by_id(ticket.get("company_id"))
+
+
+async def _resolve_company_by_id(company_id_value: Any) -> dict[str, Any] | None:
+    try:
+        company_id = int(company_id_value)
+    except (TypeError, ValueError):
+        return None
+    if company_id <= 0:
+        return None
+    try:
+        return await company_repo.get_company_by_id(company_id)
+    except Exception as exc:  # pragma: no cover - defensive lookup fallback
+        logger.debug("Trello company lookup by company {} failed: {}", company_id, exc)
+        return None
+
+
+async def _invoke_solidtime_reconcile(
+    settings: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    event_future: asyncio.Future[int | None] | None = None,
+) -> dict[str, Any]:
+    """Run the Solidtime reconciliation loop on demand.
+
+    Triggers the same inbound/outbound reconciliation that the scheduled
+    ``solidtime-reconcile`` job runs every 5 minutes.  Calling
+    ``trigger_module("solidtime", ...)`` is the programmatic equivalent of
+    hitting ``POST /api/v1/solidtime/reconcile``.
+    """
+    if event_future and not event_future.done():
+        event_future.set_result(None)
+
+    from app.services.solidtime import reconcile_once
+
+    return await reconcile_once()

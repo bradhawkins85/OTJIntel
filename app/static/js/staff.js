@@ -1,0 +1,1709 @@
+(function () {
+  function parseJson(elementId, fallback) {
+    const element = document.getElementById(elementId);
+    if (!element) {
+      return fallback;
+    }
+    try {
+      return JSON.parse(element.textContent || 'null') ?? fallback;
+    } catch (error) {
+      console.error('Unable to parse JSON data for', elementId, error);
+      return fallback;
+    }
+  }
+
+  function getCookie(name) {
+    const pattern = `(?:^|; )${name.replace(/([.$?*|{}()\[\]\\\/\+^])/g, '\\$1')}=([^;]*)`;
+    const matches = document.cookie.match(new RegExp(pattern));
+    return matches ? decodeURIComponent(matches[1]) : '';
+  }
+
+  function getCsrfToken() {
+    return getCookie('myportal_session_csrf');
+  }
+
+  async function requestJson(url, options) {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCsrfToken(),
+        ...(options && options.headers ? options.headers : {}),
+      },
+      ...options,
+    });
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const data = await response.json();
+        if (data && data.detail) {
+          detail = Array.isArray(data.detail)
+            ? data.detail.map((entry) => entry.msg || entry).join(', ')
+            : data.detail;
+        }
+      } catch (error) {
+        // ignore json parsing errors
+      }
+      throw new Error(detail);
+    }
+    if (response.status === 204) {
+      return null;
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function submitOnChange(container) {
+    container.querySelectorAll('[data-submit-on-change]').forEach((input) => {
+      input.addEventListener('change', () => {
+        const form = input.closest('form');
+        if (form) {
+          form.submit();
+        }
+      });
+    });
+  }
+
+  function openModal(modal) {
+    if (!modal) {
+      return;
+    }
+    modal.hidden = false;
+    modal.classList.add('is-visible');
+    const focusTarget = modal.querySelector('[autofocus], input, select, textarea, button');
+    if (focusTarget && typeof focusTarget.focus === 'function') {
+      focusTarget.focus();
+    }
+  }
+
+  function closeModal(modal) {
+    if (!modal) {
+      return;
+    }
+    modal.classList.remove('is-visible');
+    modal.hidden = true;
+  }
+
+  function bindModalDismissal(modal) {
+    if (!modal) {
+      return;
+    }
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal || event.target.hasAttribute('data-modal-close')) {
+        closeModal(modal);
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !modal.hidden) {
+        closeModal(modal);
+      }
+    });
+  }
+
+  function getField(id) {
+    return document.getElementById(id);
+  }
+
+  function setValue(element, value) {
+    if (!element) {
+      return;
+    }
+    element.value = value ?? '';
+  }
+
+  function normalizeValue(value) {
+    return String(value ?? '').trim().toLowerCase();
+  }
+
+  function getBrowserTimezone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function makeIdempotencyKey(prefix, staffId) {
+    const randomPart = Math.random().toString(36).slice(2, 12);
+    return `${prefix}-${staffId}-${Date.now()}-${randomPart}`;
+  }
+
+  function getInputCurrentValue(input) {
+    if (!input) {
+      return '';
+    }
+    if (input.type === 'checkbox') {
+      return input.checked ? '1' : '0';
+    }
+    return input.value ?? '';
+  }
+
+  function evaluateCondition(input, operator, expectedValue) {
+    const normalizedOperator = normalizeValue(operator);
+    if (!input) {
+      return false;
+    }
+    if (!normalizedOperator) {
+      if (input.type === 'checkbox') {
+        return Boolean(input.checked);
+      }
+      const actualFallback = normalizeValue(getInputCurrentValue(input));
+      const expectedFallback = normalizeValue(expectedValue);
+      if (expectedFallback) {
+        return actualFallback === expectedFallback;
+      }
+      return Boolean(actualFallback);
+    }
+    if (normalizedOperator === 'is_checked') {
+      return Boolean(input.checked);
+    }
+    if (normalizedOperator === 'is_not_checked') {
+      return !input.checked;
+    }
+    const actual = normalizeValue(getInputCurrentValue(input));
+    const expected = normalizeValue(expectedValue);
+    if (normalizedOperator === 'one_of') {
+      const acceptedValues = String(expectedValue || '')
+        .split(',')
+        .map((value) => normalizeValue(value))
+        .filter(Boolean);
+      return acceptedValues.includes(actual);
+    }
+    if (normalizedOperator === 'not_equals') {
+      return actual !== expected;
+    }
+    return actual === expected;
+  }
+
+  function parseConditionalSelectOptions(rawValue) {
+    const rawText = String(rawValue || '').trim();
+    if (!rawText) {
+      return null;
+    }
+
+    if (rawText.startsWith('{')) {
+      try {
+        const parsedJson = JSON.parse(rawText);
+        if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+          const matchToOptions = new Map();
+          let fallbackOptions = null;
+          Object.entries(parsedJson).forEach(([rawMatch, rawOptions]) => {
+            const normalizedMatch = normalizeValue(rawMatch);
+            const parsedOptions = Array.isArray(rawOptions)
+              ? rawOptions.map((option) => String(option || '').trim()).filter(Boolean)
+              : String(rawOptions || '')
+                .split(/[,|]/)
+                .map((option) => option.trim())
+                .filter(Boolean);
+            if (!parsedOptions.length) {
+              return;
+            }
+            if (normalizedMatch === '*' || normalizedMatch === 'fallback' || normalizedMatch === 'default') {
+              if (!fallbackOptions) {
+                fallbackOptions = parsedOptions;
+              }
+              return;
+            }
+            if (!normalizedMatch || matchToOptions.has(normalizedMatch)) {
+              return;
+            }
+            matchToOptions.set(normalizedMatch, parsedOptions);
+          });
+          if (matchToOptions.size || fallbackOptions) {
+            return { matchToOptions, fallbackOptions };
+          }
+        }
+      } catch (error) {
+        // Fall back to legacy parser format.
+      }
+    }
+
+    const separatorNormalized = rawText.replace(/\r?\n/g, ';');
+    const chunks = separatorNormalized.split(';').map((entry) => entry.trim()).filter(Boolean);
+    if (!chunks.length) {
+      return null;
+    }
+
+    const matchToOptions = new Map();
+    let fallbackOptions = null;
+
+    chunks.forEach((chunk) => {
+      const arrowIndex = chunk.indexOf('=>');
+      if (arrowIndex < 0) {
+        return;
+      }
+      const rawMatch = normalizeValue(chunk.slice(0, arrowIndex));
+      const rawOptions = chunk.slice(arrowIndex + 2).trim();
+      if (!rawOptions) {
+        return;
+      }
+      const parsedOptions = rawOptions
+        .split('|')
+        .map((option) => option.trim())
+        .filter(Boolean);
+      if (!parsedOptions.length) {
+        return;
+      }
+
+      if (rawMatch === '*' || rawMatch === 'fallback') {
+        if (!fallbackOptions) {
+          fallbackOptions = parsedOptions;
+        }
+        return;
+      }
+
+      if (!rawMatch || matchToOptions.has(rawMatch)) {
+        return;
+      }
+      matchToOptions.set(rawMatch, parsedOptions);
+    });
+
+    if (!matchToOptions.size && !fallbackOptions) {
+      return null;
+    }
+
+    return {
+      matchToOptions,
+      fallbackOptions,
+    };
+  }
+
+  function updateMappedSelectOptions({
+    selectInput,
+    expectedMatch,
+    optionMap,
+    fallbackOptions,
+    allOptions,
+    fieldLabel,
+  }) {
+    if (!selectInput) {
+      return false;
+    }
+    const normalizedParentValue = normalizeValue(expectedMatch);
+    const desiredValues = optionMap.get(normalizedParentValue) || fallbackOptions || [];
+    const availableValues = new Set(desiredValues.map((value) => normalizeValue(value)));
+    const matchingOptions = [];
+    const matchedValues = new Set();
+    allOptions.forEach((option) => {
+      const optionValue = normalizeValue(option.value);
+      const optionLabel = normalizeValue(option.label || option.value);
+      if (!availableValues.has(optionValue) && !availableValues.has(optionLabel)) {
+        return;
+      }
+      matchingOptions.push(option);
+      matchedValues.add(optionValue);
+      if (optionLabel) {
+        matchedValues.add(optionLabel);
+      }
+    });
+    desiredValues.forEach((value) => {
+      const normalizedValue = normalizeValue(value);
+      if (!normalizedValue || matchedValues.has(normalizedValue)) {
+        return;
+      }
+      matchingOptions.push({
+        value,
+        label: value,
+      });
+      matchedValues.add(normalizedValue);
+    });
+    const currentValue = normalizeValue(selectInput.value);
+
+    while (selectInput.firstChild) {
+      selectInput.removeChild(selectInput.firstChild);
+    }
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = `Select ${String(fieldLabel || '').toLowerCase() || 'an option'}`;
+    selectInput.appendChild(placeholder);
+
+    matchingOptions.forEach((option) => {
+      const optionElement = document.createElement('option');
+      optionElement.value = option.value;
+      optionElement.textContent = option.label || option.value;
+      selectInput.appendChild(optionElement);
+    });
+
+    if (matchingOptions.some((option) => normalizeValue(option.value) === currentValue)) {
+      selectInput.value = currentValue;
+    } else {
+      selectInput.value = '';
+    }
+
+    return matchingOptions.length > 0;
+  }
+
+  function initCustomFieldConditionals({
+    wrappers,
+    getInputByName,
+    getFieldDefinitionByName,
+  }) {
+    if (!Array.isArray(wrappers) || wrappers.length === 0) {
+      return;
+    }
+
+    const applyVisibility = () => {
+      wrappers.forEach((wrapper) => {
+        const parentName = wrapper.dataset.conditionParentName || '';
+        const operator = wrapper.dataset.conditionOperator || '';
+        const expected = wrapper.dataset.conditionValue || '';
+        const parentInput = parentName ? getInputByName(parentName) : null;
+        const selectInput = wrapper.querySelector('select');
+        const fieldName = wrapper.dataset.customFieldName || '';
+        const fieldDefinition = fieldName ? getFieldDefinitionByName(fieldName) : null;
+        const mappedOptions = operator === 'select_map'
+          ? parseConditionalSelectOptions(expected)
+          : null;
+        let shouldShow = !parentName
+          ? true
+          : (parentInput ? evaluateCondition(parentInput, operator, expected) : false);
+        if (mappedOptions && selectInput && parentInput && fieldDefinition) {
+          const fieldLabel = fieldDefinition.display_name || fieldDefinition.name || fieldName;
+          const hasVisibleOptions = updateMappedSelectOptions({
+            selectInput,
+            expectedMatch: getInputCurrentValue(parentInput),
+            optionMap: mappedOptions.matchToOptions,
+            fallbackOptions: mappedOptions.fallbackOptions,
+            allOptions: Array.isArray(fieldDefinition.options) ? fieldDefinition.options : [],
+            fieldLabel,
+          });
+          shouldShow = hasVisibleOptions;
+        }
+        wrapper.hidden = !shouldShow;
+        wrapper.querySelectorAll('input, select, textarea').forEach((input) => {
+          if (!shouldShow) {
+            if (input.tagName === 'SELECT') {
+              input.value = '';
+            } else if (input.type === 'checkbox' || input.type === 'radio') {
+              input.checked = false;
+            } else {
+              input.value = '';
+            }
+          }
+          input.disabled = !shouldShow;
+        });
+      });
+
+      const sections = new Set();
+      wrappers.forEach((wrapper) => {
+        const section = wrapper.closest('[data-custom-field-section], fieldset[data-custom-field-group]');
+        if (section) {
+          sections.add(section);
+        }
+      });
+      sections.forEach((section) => {
+        const sectionWrappers = Array.from(section.querySelectorAll('[data-custom-field-wrapper]'));
+        const hasVisible = sectionWrappers.some((w) => !w.hidden);
+        section.hidden = !hasVisible;
+      });
+    };
+
+    const parents = new Map();
+    wrappers.forEach((wrapper) => {
+      const parentName = wrapper.dataset.conditionParentName || '';
+      if (!parentName || parents.has(parentName)) {
+        return;
+      }
+      const parentInput = getInputByName(parentName);
+      if (!parentInput) {
+        return;
+      }
+      parents.set(parentName, parentInput);
+      parentInput.addEventListener('change', applyVisibility);
+      parentInput.addEventListener('input', applyVisibility);
+    });
+
+    applyVisibility();
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const container = document.body;
+    const staffList = parseJson('staff-data', []);
+    const customFieldDefinitions = parseJson('staff-custom-field-definitions', []);
+    const flags = parseJson('staff-flags', {});
+    const activeStaffForOffboarding = parseJson('active-staff-for-offboarding', []);
+    const staffById = new Map(staffList.map((member) => [member.id, member]));
+
+    submitOnChange(container);
+
+    const editModal = document.getElementById('staff-edit-modal');
+    const addModal = document.getElementById('staff-add-modal');
+    const editForm = document.getElementById('staff-edit-form');
+    const editIdField = getField('edit-staff-id');
+    const editCustomFieldsGrid = getField('edit-custom-fields-grid');
+    const offboardingModal = document.getElementById('staff-offboarding-modal');
+    const ticketsModal = document.getElementById('staff-tickets-modal');
+    const offboardingForm = document.getElementById('staff-offboarding-form');
+    const offboardingStaffIdField = getField('offboarding-staff-id');
+    const offboardingDateField = getField('offboarding-date');
+    const offboardingTimeField = getField('offboarding-time');
+    const offboardingTimezoneField = getField('offboarding-timezone');
+    const offboardingTypeField = getField('offboarding-type');
+    const offboardingReasonNotesField = getField('offboarding-reason-notes');
+    const offboardingOutOfOfficeField = getField('offboarding-out-of-office');
+    const offboardingEmailForwardToField = getField('offboarding-email-forward-to');
+    const offboardingMailboxGrantField = getField('offboarding-mailbox-grant');
+    const offboardingImmediateButton = getField('offboarding-immediate');
+    const offboardingFormError = getField('offboarding-form-error');
+    const addForm = container.querySelector('form.staff-form');
+    const editModalStaffName = getField('edit-modal-staff-name');
+    const editActionNoteField = getField('edit-action-note');
+    const editActionStepField = getField('edit-action-step');
+    const editActionError = getField('edit-action-error');
+    const editFormError = getField('edit-form-error');
+    const editDeleteConfirm = getField('edit-delete-confirm');
+    const editDangerZone = getField('edit-danger-zone');
+
+    const editFields = {
+      first_name: getField('edit-first-name'),
+      last_name: getField('edit-last-name'),
+      email: getField('edit-email'),
+      mobile_phone: getField('edit-mobile'),
+      date_onboarded: getField('edit-date-onboarded'),
+      date_offboarded: getField('edit-date-offboarded'),
+      enabled: getField('edit-enabled'),
+      street: getField('edit-street'),
+      city: getField('edit-city'),
+      state: getField('edit-state'),
+      postcode: getField('edit-postcode'),
+      country: getField('edit-country'),
+      department: getField('edit-department'),
+      job_title: getField('edit-job-title'),
+      org_company: getField('edit-company'),
+      manager_name: getField('edit-manager-name'),
+      account_action: getField('edit-account-action'),
+      m365_last_sign_in: getField('edit-m365-last-sign-in'),
+    };
+
+    bindModalDismissal(editModal);
+    bindModalDismissal(addModal);
+    bindModalDismissal(offboardingModal);
+    bindModalDismissal(ticketsModal);
+
+    const ticketsBody = ticketsModal?.querySelector('[data-staff-tickets-body]');
+    const ticketsSubtitle = ticketsModal?.querySelector('[data-staff-tickets-subtitle]');
+    const ticketsLoading = ticketsModal?.querySelector('[data-staff-tickets-loading]');
+    const ticketsError = ticketsModal?.querySelector('[data-staff-tickets-error]');
+
+    function ticketCell(row, label, value) {
+      const cell = document.createElement('td');
+      cell.dataset.label = label;
+      cell.textContent = value == null || value === '' ? '—' : String(value);
+      row.appendChild(cell);
+      return cell;
+    }
+
+    container.querySelectorAll('[data-staff-tickets]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const staffId = button.getAttribute('data-staff-tickets');
+        if (!staffId || !ticketsModal || !ticketsBody) return;
+        ticketsBody.replaceChildren();
+        if (ticketsSubtitle) ticketsSubtitle.textContent = '';
+        if (ticketsError) ticketsError.hidden = true;
+        if (ticketsLoading) ticketsLoading.hidden = false;
+        openModal(ticketsModal);
+        try {
+          const payload = await requestJson(`/api/staff/${encodeURIComponent(staffId)}/tickets`, {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+          });
+          if (ticketsSubtitle) ticketsSubtitle.textContent = `Tickets under ${payload.staffName}`;
+          const tickets = Array.isArray(payload.tickets) ? payload.tickets : [];
+          if (!tickets.length) {
+            const row = document.createElement('tr');
+            const cell = ticketCell(row, '', 'No tickets found for this staff member.');
+            cell.colSpan = 7;
+            cell.className = 'table__empty';
+            ticketsBody.appendChild(row);
+          }
+          tickets.forEach((ticket) => {
+            const row = document.createElement('tr');
+            ticketCell(row, 'ID', ticket.id);
+            const subjectCell = document.createElement('td');
+            subjectCell.dataset.label = 'Subject';
+            const link = document.createElement('a');
+            link.href = `/admin/tickets/${encodeURIComponent(ticket.id)}`;
+            link.textContent = ticket.subject || 'Untitled ticket';
+            subjectCell.appendChild(link);
+            row.appendChild(subjectCell);
+            ticketCell(row, 'Status', ticket.status);
+            ticketCell(row, 'Priority', ticket.priority);
+            ticketCell(row, 'Company', ticket.company);
+            ticketCell(row, 'Assigned', ticket.assigned);
+            const updatedCell = ticketCell(row, 'Updated', '—');
+            if (ticket.updatedAt) {
+              updatedCell.textContent = new Date(ticket.updatedAt).toLocaleString();
+              updatedCell.dataset.value = ticket.updatedAt;
+            }
+            ticketsBody.appendChild(row);
+          });
+        } catch (error) {
+          if (ticketsError) {
+            ticketsError.textContent = `Unable to load tickets: ${error.message}`;
+            ticketsError.hidden = false;
+          }
+        } finally {
+          if (ticketsLoading) ticketsLoading.hidden = true;
+        }
+      });
+    });
+
+    function resetAddStaffForm() {
+      if (!addForm) {
+        return;
+      }
+      addForm.reset();
+      const timezoneField = addForm.querySelector('input[name="browser_timezone"]');
+      if (timezoneField) {
+        timezoneField.value = getBrowserTimezone();
+      }
+      addForm.querySelectorAll('input, select, textarea').forEach((field) => {
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    }
+
+    container.querySelectorAll('[data-open-add-staff-modal]').forEach((button) => {
+      button.addEventListener('click', () => {
+        resetAddStaffForm();
+        openModal(addModal);
+      });
+    });
+
+    const editCustomFieldInputs = new Map();
+    const editCustomFieldGroups = new Map();
+    let currentEditStaffId = null;
+    const editActionButtons = {
+      invite: container.querySelector('[data-edit-action="invite"]'),
+      offboardingRequest: container.querySelector('[data-edit-action="offboarding-request"]'),
+      approve: container.querySelector('[data-edit-action="approve"]'),
+      deny: container.querySelector('[data-edit-action="deny"]'),
+      workflowRerun: container.querySelector('[data-edit-action="workflow-rerun"]'),
+      workflowRetry: container.querySelector('[data-edit-action="workflow-retry"]'),
+      workflowResume: container.querySelector('[data-edit-action="workflow-resume"]'),
+      workflowForceComplete: container.querySelector('[data-edit-action="workflow-force-complete"]'),
+      m365ExportOneDrive: container.querySelector('[data-edit-action="m365-export-onedrive"]'),
+      m365ResetPassword: container.querySelector('[data-edit-action="m365-reset-password"]'),
+      m365EnableSignIn: container.querySelector('[data-edit-action="m365-enable-sign-in"]'),
+      m365DisableSignIn: container.querySelector('[data-edit-action="m365-disable-sign-in"]'),
+      delete: container.querySelector('[data-edit-action="delete"]'),
+    };
+
+    function isCurrentMemberOffboardingRequest() {
+      const member = staffById.get(currentEditStaffId);
+      return String(member && member.account_action || '').toLowerCase() === 'offboard requested';
+    }
+    if (editCustomFieldsGrid && Array.isArray(customFieldDefinitions)) {
+      const normalizeGroupLabel = (group) => {
+        const raw = typeof group === 'string' ? group.trim() : '';
+        return raw || 'Additional details';
+      };
+
+      const editCustomFieldRows = new Map();
+
+      const ensureGroupSection = (groupLabel) => {
+        const normalized = normalizeGroupLabel(groupLabel);
+        if (editCustomFieldGroups.has(normalized)) {
+          return editCustomFieldGroups.get(normalized);
+        }
+        const section = document.createElement('fieldset');
+        section.className = 'fieldset staff-modal__subsection';
+        section.dataset.customFieldGroup = normalized;
+        const legend = document.createElement('legend');
+        legend.textContent = normalized;
+        section.appendChild(legend);
+        editCustomFieldsGrid.appendChild(section);
+        editCustomFieldGroups.set(normalized, section);
+        return section;
+      };
+
+      const ensureRowContainer = (groupLabel, displayOrder) => {
+        const normalized = normalizeGroupLabel(groupLabel);
+        const rowKey = `${normalized}::${displayOrder}`;
+        if (editCustomFieldRows.has(rowKey)) {
+          return editCustomFieldRows.get(rowKey);
+        }
+        const section = ensureGroupSection(normalized);
+        const row = document.createElement('div');
+        row.className = 'staff-custom-field-row';
+        section.appendChild(row);
+        editCustomFieldRows.set(rowKey, row);
+        return row;
+      };
+
+      customFieldDefinitions.forEach((field) => {
+        if (!field || !field.name) {
+          return;
+        }
+        const groupLabel = normalizeGroupLabel(field.field_group);
+        const displayOrder = field.display_order != null ? field.display_order : 0;
+        const wrapper = document.createElement('div');
+        wrapper.className = field.field_type === 'checkbox' ? 'form-field form-field--checkbox' : 'form-field';
+        wrapper.dataset.customFieldWrapper = '1';
+        wrapper.dataset.customFieldName = field.name;
+        wrapper.dataset.customFieldGroup = groupLabel;
+        wrapper.dataset.conditionParentName = field.condition_parent_name || '';
+        wrapper.dataset.conditionOperator = field.condition_operator || '';
+        wrapper.dataset.conditionValue = field.condition_value || '';
+        const inputId = `edit-custom-${field.name}`;
+        if (field.field_type === 'checkbox') {
+          wrapper.innerHTML = `
+            <label class="checkbox" for="${inputId}">
+              <input type="checkbox" id="${inputId}" />
+              <span>${field.display_name || field.name}</span>
+            </label>
+          `;
+        } else if (field.field_type === 'select') {
+          const options = (field.options || [])
+            .map((option) => `<option value="${option.value}">${option.label || option.value}</option>`)
+            .join('');
+          wrapper.innerHTML = `
+            <label class="form-label" for="${inputId}">${field.display_name || field.name}</label>
+            <select class="form-input" id="${inputId}">
+              <option value="">Select ${(field.display_name || field.name).toLowerCase()}</option>
+              ${options}
+            </select>
+          `;
+        } else if (field.field_type === 'multiselect') {
+          const checkboxes = (field.options || [])
+            .map((option, idx) => {
+              const cbId = `${inputId}-opt-${idx}`;
+              return `<label class="checkbox" for="${cbId}"><input type="checkbox" id="${cbId}" value="${option.value}" /><span>${option.label || option.value}</span></label>`;
+            })
+            .join('');
+          wrapper.innerHTML = `
+            <label class="form-label">${field.display_name || field.name}</label>
+            <div class="multiselect-checkboxes" id="${inputId}" data-multiselect-group>
+              ${checkboxes}
+            </div>
+          `;
+        } else {
+          wrapper.innerHTML = `
+            <label class="form-label" for="${inputId}">${field.display_name || field.name}</label>
+            <input class="form-input" id="${inputId}" type="${field.field_type === 'date' ? 'date' : 'text'}" />
+          `;
+        }
+        ensureRowContainer(groupLabel, displayOrder).appendChild(wrapper);
+        editCustomFieldInputs.set(field.name, {
+          field,
+          wrapper,
+          input: wrapper.querySelector(`#${inputId}`),
+        });
+      });
+    }
+
+    if (addForm) {
+      const timezoneField = addForm.querySelector('input[name="browser_timezone"]');
+      if (timezoneField) {
+        timezoneField.value = getBrowserTimezone();
+      }
+      const addWrappers = Array.from(addForm.querySelectorAll('[data-custom-field-wrapper]'));
+      initCustomFieldConditionals({
+        wrappers: addWrappers,
+        getInputByName: (name) => addForm.querySelector(`[name="${name}"]`),
+        getFieldDefinitionByName: (name) => (
+          customFieldDefinitions.find((field) => field && field.name === name) || null
+        ),
+      });
+    }
+
+    if (editCustomFieldsGrid) {
+      const resolveEditParentInput = (name) => {
+        const normalizedName = String(name || '').trim();
+        if (!normalizedName) {
+          return null;
+        }
+
+        const customEntry = editCustomFieldInputs.get(normalizedName);
+        if (customEntry && customEntry.input) {
+          return customEntry.input;
+        }
+
+        const normalizedId = normalizedName.replace(/_/g, '-');
+        const directField = document.getElementById(`edit-${normalizedId}`);
+        if (directField) {
+          return directField;
+        }
+
+        const modalField = staffModal
+          ? staffModal.querySelector(`[name="${normalizedName}"], #edit-${normalizedName}`)
+          : null;
+        return modalField || null;
+      };
+      const editWrappers = Array.from(editCustomFieldsGrid.querySelectorAll('[data-custom-field-wrapper]'));
+      initCustomFieldConditionals({
+        wrappers: editWrappers,
+        getInputByName: resolveEditParentInput,
+        getFieldDefinitionByName: (name) => (
+          customFieldDefinitions.find((field) => field && field.name === name) || null
+        ),
+      });
+    }
+
+    function setInlineError(element, message) {
+      if (!element) {
+        return;
+      }
+      element.textContent = message || '';
+      element.hidden = !message;
+    }
+
+    function getActionNote({ required = false } = {}) {
+      const note = editActionNoteField ? editActionNoteField.value.trim() : '';
+      if (required && !note) {
+        throw new Error('Please enter an action note before continuing.');
+      }
+      return note || null;
+    }
+
+    function getActionStep(defaultStep) {
+      const explicitStep = editActionStepField ? editActionStepField.value.trim() : '';
+      return explicitStep || (defaultStep || '').trim();
+    }
+
+    function setDefaultOffboardingDateTime() {
+      if (!offboardingDateField || !offboardingTimeField) {
+        return;
+      }
+      const now = new Date();
+      const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      const localTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      offboardingDateField.value = localDate;
+      offboardingTimeField.value = localTime;
+    }
+
+    function buildStaffOptions(excludeStaffId) {
+      const seen = new Set();
+      return activeStaffForOffboarding
+        .filter((s) => String(s.id) !== String(excludeStaffId))
+        .filter((s) => {
+          const email = String(s.email || '').trim().toLowerCase();
+          const key = email || String(s.id);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return Boolean(email);
+        })
+        .map((s) => {
+          const nameParts = [s.first_name, s.last_name].filter(Boolean);
+          const email = String(s.email || '').trim();
+          const label = nameParts.length ? `${nameParts.join(' ')} (${email})` : email;
+          return { value: s.id, label };
+        });
+    }
+
+    function populateStaffSelect(selectEl, options, multipleMode) {
+      if (!selectEl) return;
+      while (selectEl.options.length > (multipleMode ? 0 : 1)) {
+        selectEl.remove(multipleMode ? 0 : 1);
+      }
+      options.forEach(({ value, label }) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = label;
+        selectEl.appendChild(opt);
+      });
+    }
+
+    function openOffboardingRequestModal(staffId) {
+      const member = staffById.get(Number(staffId));
+      if (
+        !member
+        || !offboardingStaffIdField
+        || !offboardingDateField
+        || !offboardingTimeField
+        || !offboardingTimezoneField
+        || !offboardingTypeField
+        || !offboardingReasonNotesField
+      ) {
+        return;
+      }
+      offboardingStaffIdField.value = String(staffId);
+      offboardingReasonNotesField.value = '';
+      offboardingTypeField.value = 'Resignation';
+      offboardingTimezoneField.value = getBrowserTimezone() || '';
+      if (offboardingOutOfOfficeField) offboardingOutOfOfficeField.value = '';
+      setDefaultOffboardingDateTime();
+
+      const staffOptions = buildStaffOptions(staffId);
+      populateStaffSelect(offboardingEmailForwardToField, staffOptions, false);
+      populateStaffSelect(offboardingMailboxGrantField, staffOptions, true);
+
+      closeModal(editModal);
+      openModal(offboardingModal);
+    }
+
+    if (offboardingImmediateButton) {
+      offboardingImmediateButton.addEventListener('click', () => {
+        setDefaultOffboardingDateTime();
+      });
+    }
+
+    function getWorkflowContext(member) {
+      const workflow = member && member.workflow_status ? member.workflow_status : {};
+      const workflowState = String((workflow && workflow.state) || member.onboarding_status || 'requested').toLowerCase();
+      const currentStep = String((workflow && workflow.current_step) || '').trim();
+      return {
+        workflow,
+        workflowState,
+        currentStep,
+        canRerun: flags && flags.isAdmin && workflowState !== 'running',
+        canRetry: flags && flags.isAdmin && workflowState === 'failed',
+        canResume: flags && flags.isAdmin && ['paused', 'waiting_external'].includes(workflowState),
+        canForceComplete: flags && flags.isSuperAdmin && Boolean(currentStep) && ['running', 'waiting_external'].includes(workflowState),
+      };
+    }
+
+    function setActionVisibility(button, { visible, disabled }) {
+      if (!button) {
+        return;
+      }
+      button.hidden = !visible;
+      button.disabled = !visible || Boolean(disabled);
+    }
+
+    function updateEditActionButtons(member) {
+      const workflowContext = getWorkflowContext(member);
+      const approvalStatus = String(member.approval_status || '').toLowerCase();
+      const accountAction = String(member.account_action || '').toLowerCase();
+      const isExStaff = Boolean(member.date_offboarded) || accountAction === 'offboarded';
+      const canInvite = Boolean(flags && flags.isAdmin && member.enabled && !isExStaff && member.email);
+      const canRequestOffboarding = Boolean(flags && flags.canRequestStaffOffboarding && member.enabled && !isExStaff && accountAction !== 'offboard requested');
+      const canPrivilegedStaffActions = Boolean(flags && (flags.isSuperAdmin || flags.isHelpdeskTechnician));
+      const canApprove = Boolean(canPrivilegedStaffActions && flags.canApproveOnboarding && ['pending', 'requested'].includes(approvalStatus));
+      const canDeny = Boolean(canPrivilegedStaffActions && flags.canApproveOnboarding && ['pending', 'requested'].includes(approvalStatus));
+
+      setActionVisibility(editActionButtons.invite, { visible: canInvite, disabled: false });
+      setActionVisibility(editActionButtons.offboardingRequest, { visible: canRequestOffboarding, disabled: false });
+      setActionVisibility(editActionButtons.approve, { visible: canApprove, disabled: false });
+      setActionVisibility(editActionButtons.deny, { visible: canDeny, disabled: false });
+      setActionVisibility(editActionButtons.workflowRerun, { visible: workflowContext.canRerun, disabled: false });
+      setActionVisibility(editActionButtons.workflowRetry, { visible: workflowContext.canRetry, disabled: false });
+      setActionVisibility(editActionButtons.workflowResume, { visible: workflowContext.canResume, disabled: false });
+      setActionVisibility(editActionButtons.workflowForceComplete, { visible: workflowContext.canForceComplete, disabled: false });
+      const canM365Actions = Boolean(flags && flags.isSuperAdmin && flags.hasM365 && member.email);
+      const canExportOneDrive = Boolean(canM365Actions && flags.manualOneDriveExportEnabled);
+      setActionVisibility(editActionButtons.m365ExportOneDrive, { visible: canExportOneDrive, disabled: false });
+      setActionVisibility(editActionButtons.m365ResetPassword, { visible: canM365Actions, disabled: false });
+      setActionVisibility(editActionButtons.m365EnableSignIn, { visible: canM365Actions, disabled: false });
+      setActionVisibility(editActionButtons.m365DisableSignIn, { visible: canM365Actions, disabled: false });
+      const canSeeDangerZone = Boolean(flags && flags.isSuperAdmin);
+      if (editDangerZone) {
+        editDangerZone.hidden = !canSeeDangerZone;
+      }
+      setActionVisibility(editActionButtons.delete, { visible: Boolean(flags && flags.isSuperAdmin), disabled: false });
+
+      if (editActionButtons.workflowForceComplete) {
+        editActionButtons.workflowForceComplete.dataset.currentStep = workflowContext.currentStep || '';
+      }
+    }
+
+    function openEditModalForStaff(staffId) {
+      const id = Number(staffId);
+      const member = staffById.get(id);
+      if (!member || !editForm || !editIdField) {
+        return;
+      }
+      currentEditStaffId = id;
+      editIdField.value = String(id);
+      setValue(editFields.first_name, member.first_name);
+      setValue(editFields.last_name, member.last_name);
+      if (editModalStaffName) {
+        editModalStaffName.textContent = `${member.first_name || ''} ${member.last_name || ''}`.trim() || member.email || '';
+      }
+      setValue(editFields.email, member.email);
+      setValue(editFields.mobile_phone, member.mobile_phone);
+      setValue(editFields.date_onboarded, member.date_onboarded ? member.date_onboarded.slice(0, 10) : '');
+      setValue(editFields.date_offboarded, member.date_offboarded ? member.date_offboarded.slice(0, 16) : '');
+      if (editFields.enabled) {
+        editFields.enabled.checked = Boolean(member.enabled);
+      }
+      setValue(editFields.street, member.street);
+      setValue(editFields.city, member.city);
+      setValue(editFields.state, member.state);
+      setValue(editFields.postcode, member.postcode);
+      setValue(editFields.country, member.country);
+      setValue(editFields.department, member.department);
+      setValue(editFields.job_title, member.job_title);
+      setValue(editFields.org_company, member.org_company);
+      setValue(editFields.manager_name, member.manager_name);
+      if (editFields.account_action) {
+        editFields.account_action.value = member.account_action || 'Onboard Requested';
+      }
+      setValue(editFields.m365_last_sign_in, member.m365_last_sign_in ? member.m365_last_sign_in.replace('T', ' ').slice(0, 16) : '');
+      const existingCustom = member.custom_fields || {};
+      editCustomFieldInputs.forEach((entry, name) => {
+        if (!entry || !entry.input) {
+          return;
+        }
+        const value = existingCustom[name];
+        if (entry.field.field_type === 'checkbox') {
+          entry.input.checked = Boolean(value);
+        } else if (entry.field.field_type === 'multiselect') {
+          const selectedValues = new Set(
+            String(value || '').split(',').map((v) => v.trim()).filter(Boolean)
+          );
+          entry.wrapper.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+            cb.checked = selectedValues.has(cb.value);
+          });
+        } else {
+          entry.input.value = value ?? '';
+        }
+      });
+      if (editActionNoteField) {
+        editActionNoteField.value = '';
+      }
+      if (editActionStepField) {
+        editActionStepField.value = '';
+      }
+      if (editDeleteConfirm) {
+        editDeleteConfirm.checked = false;
+      }
+      setInlineError(editActionError, '');
+      setInlineError(editFormError, '');
+      updateEditActionButtons(member);
+      openModal(editModal);
+    }
+
+    async function sendInvite(staffId) {
+      await requestJson(`/staff/${staffId}/invite`, { method: 'POST' });
+      window.location.reload();
+    }
+
+    async function deleteStaff(staffId, isConfirmed) {
+      if (!isConfirmed) {
+        throw new Error('Confirm deletion in the danger zone before deleting.');
+      }
+      await requestJson(`/staff/${staffId}`, { method: 'DELETE' });
+      window.location.reload();
+    }
+
+    async function approveOnboarding(staffId, comment) {
+      await requestJson(`/api/staff/${staffId}/onboarding/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ comment: comment || '' }),
+      });
+      window.location.reload();
+    }
+
+    async function denyOnboarding(staffId, reason) {
+      if (!reason || !reason.trim()) {
+        throw new Error('A deny reason is required.');
+      }
+      await requestJson(`/api/staff/${staffId}/onboarding/deny`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+      window.location.reload();
+    }
+
+    async function approveOffboarding(staffId, comment) {
+      await requestJson(`/api/staff/${staffId}/offboarding/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ comment: comment || '' }),
+      });
+      window.location.reload();
+    }
+
+    async function denyOffboarding(staffId, reason) {
+      if (!reason || !reason.trim()) {
+        throw new Error('A deny reason is required.');
+      }
+      await requestJson(`/api/staff/${staffId}/offboarding/deny`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+      window.location.reload();
+    }
+
+    async function rerunWorkflow(staffId, reason) {
+      await requestJson(`/api/staff/${staffId}/workflow/rerun`, {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': makeIdempotencyKey('rerun', staffId),
+        },
+        body: JSON.stringify({ reason: reason.trim() || null }),
+      });
+      window.location.reload();
+    }
+
+    async function retryWorkflow(staffId, reason) {
+      await requestJson(`/api/staff/${staffId}/workflow/retry-failed-step`, {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': makeIdempotencyKey('retry', staffId),
+        },
+        body: JSON.stringify({ reason: reason.trim() || null }),
+      });
+      window.location.reload();
+    }
+
+    async function resumeWorkflow(staffId, reason) {
+      await requestJson(`/api/staff/${staffId}/workflow/resume`, {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': makeIdempotencyKey('resume', staffId),
+        },
+        body: JSON.stringify({ reason: reason.trim() || null }),
+      });
+      window.location.reload();
+    }
+
+    async function forceCompleteWorkflow(staffId, context, stepName, reason) {
+      const currentStep = (context && context.currentStep) || '';
+      const requestedStepName = (stepName || currentStep || '').trim();
+      if (!requestedStepName) {
+        throw new Error('Provide the workflow step to force-complete.');
+      }
+      await requestJson(`/api/staff/${staffId}/workflow/force-complete-step`, {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': makeIdempotencyKey('force-complete', staffId),
+        },
+        body: JSON.stringify({
+          stepName: requestedStepName,
+          reason: reason.trim() || null,
+        }),
+      });
+      window.location.reload();
+    }
+
+    const m365PasswordModal = document.getElementById('m365-password-modal');
+    const m365NewPasswordInput = document.getElementById('m365-new-password');
+    const m365CopyButton = document.getElementById('m365-copy-password');
+    const m365CopyConfirm = document.getElementById('m365-copy-confirm');
+
+    bindModalDismissal(m365PasswordModal);
+
+    if (m365CopyButton && m365NewPasswordInput) {
+      m365CopyButton.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(m365NewPasswordInput.value);
+          if (m365CopyConfirm) {
+            m365CopyConfirm.hidden = false;
+            setTimeout(() => { m365CopyConfirm.hidden = true; }, 3000);
+          }
+        } catch (error) {
+          m365NewPasswordInput.select();
+        }
+      });
+    }
+
+    async function exportM365OneDrive(staffId) {
+      const member = staffById.get(String(staffId)) || staffById.get(Number(staffId));
+      const name = member ? `${member.first_name || ''} ${member.last_name || ''}`.trim() || member.email || 'this staff member' : 'this staff member';
+      if (!window.confirm(`Export OneDrive for ${name}? This may take some time and uses the SharePoint destination configured in .env.`)) {
+        return;
+      }
+      const data = await requestJson(`/api/staff/${staffId}/m365/export-onedrive`, { method: 'POST' });
+      if (data && data.queued) {
+        window.alert(data.message || 'OneDrive export started. You will receive a notification when it completes.');
+        return;
+      }
+      const exported = data && data.export ? data.export : {};
+      const folderName = exported.destination_folder_name || 'the configured folder';
+      const status = exported.copy_status || 'submitted';
+      window.alert(`OneDrive export ${status} for ${folderName}. Submitted ${exported.source_items_submitted || 0} root item(s).`);
+      window.location.reload();
+    }
+
+    async function resetM365Password(staffId) {
+      const data = await requestJson(`/api/staff/${staffId}/m365/reset-password`, { method: 'POST' });
+      const password = data && data.password ? data.password : '';
+      if (password && m365PasswordModal && m365NewPasswordInput) {
+        m365NewPasswordInput.value = password;
+        if (m365CopyConfirm) {
+          m365CopyConfirm.hidden = true;
+        }
+        closeModal(editModal);
+        openModal(m365PasswordModal);
+      }
+    }
+
+    async function setM365SignIn(staffId, enabled) {
+      await requestJson(`/api/staff/${staffId}/m365/sign-in`, {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      });
+      window.location.reload();
+    }
+
+    container.querySelectorAll('[data-staff-offboarding-request]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const id = button.getAttribute('data-staff-offboarding-request');
+        if (!id) {
+          return;
+        }
+        openOffboardingRequestModal(id);
+      });
+    });
+
+    container.querySelectorAll('[data-staff-export-onedrive]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-export-onedrive');
+        if (!id) {
+          return;
+        }
+        try {
+          await exportM365OneDrive(id);
+        } catch (error) {
+          alert(`Failed to export OneDrive: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-edit]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const id = button.getAttribute('data-staff-edit');
+        if (!id) {
+          return;
+        }
+        openEditModalForStaff(id);
+      });
+    });
+
+    if (offboardingForm) {
+      offboardingForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const staffId = offboardingStaffIdField ? offboardingStaffIdField.value : '';
+        const date = offboardingDateField ? offboardingDateField.value : '';
+        const time = offboardingTimeField ? offboardingTimeField.value : '';
+        const offboardingType = offboardingTypeField ? offboardingTypeField.value.trim() : '';
+        const reasonNotes = offboardingReasonNotesField ? offboardingReasonNotesField.value.trim() : '';
+        const timezone = offboardingTimezoneField ? offboardingTimezoneField.value.trim() : '';
+        const requestedAt = date && time ? `${date}T${time}` : '';
+        if (!staffId || !date || !time || !timezone || !offboardingType) {
+          setInlineError(offboardingFormError, 'Offboarding date, time, timezone, and type are required.');
+          return;
+        }
+        const outOfOfficeMessage = offboardingOutOfOfficeField ? offboardingOutOfOfficeField.value.trim() || null : null;
+        const emailForwardToStaffId = offboardingEmailForwardToField && offboardingEmailForwardToField.value
+          ? Number(offboardingEmailForwardToField.value) : null;
+        const mailboxGrantStaffIds = offboardingMailboxGrantField
+          ? Array.from(offboardingMailboxGrantField.selectedOptions).map((opt) => Number(opt.value))
+          : [];
+        try {
+          setInlineError(offboardingFormError, '');
+          await requestJson(`/api/staff/${staffId}/offboarding/request`, {
+            method: 'POST',
+            body: JSON.stringify({
+              offboardingType,
+              reason: offboardingType,
+              requestedAt,
+              requestedTimezone: timezone,
+              notes: reasonNotes || null,
+              outOfOfficeMessage,
+              emailForwardToStaffId,
+              mailboxGrantStaffIds,
+            }),
+          });
+          window.location.reload();
+        } catch (error) {
+          setInlineError(offboardingFormError, `Failed to submit offboarding request: ${error.message}`);
+        }
+      });
+    }
+
+    if (editForm) {
+      editForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const staffId = editIdField ? editIdField.value : '';
+        if (!staffId || !(flags && flags.canEditStaff)) {
+          return;
+        }
+        const payload = {
+          firstName: editFields.first_name ? editFields.first_name.value : '',
+          lastName: editFields.last_name ? editFields.last_name.value : '',
+          email: editFields.email ? editFields.email.value : '',
+          mobilePhone: editFields.mobile_phone ? editFields.mobile_phone.value : '',
+          enabled: editFields.enabled ? editFields.enabled.checked : false,
+          street: editFields.street ? editFields.street.value : '',
+          city: editFields.city ? editFields.city.value : '',
+          state: editFields.state ? editFields.state.value : '',
+          postcode: editFields.postcode ? editFields.postcode.value : '',
+          country: editFields.country ? editFields.country.value : '',
+          department: editFields.department ? editFields.department.value : '',
+          jobTitle: editFields.job_title ? editFields.job_title.value : '',
+          company: editFields.org_company ? editFields.org_company.value : '',
+          managerName: editFields.manager_name ? editFields.manager_name.value : '',
+          customFields: {},
+        };
+        if (flags && flags.isSuperAdmin) {
+          payload.dateOnboarded = editFields.date_onboarded ? editFields.date_onboarded.value : '';
+          payload.dateOffboarded = editFields.date_offboarded ? editFields.date_offboarded.value : '';
+          payload.accountAction = editFields.account_action ? editFields.account_action.value : '';
+        }
+        editCustomFieldInputs.forEach((entry, name) => {
+          if (!entry || !entry.input) {
+            return;
+          }
+          if (entry.wrapper && entry.wrapper.hidden) {
+            return;
+          }
+          if (entry.field.field_type !== 'multiselect' && entry.input.disabled) {
+            return;
+          }
+          if (entry.field.field_type === 'checkbox') {
+            payload.customFields[name] = Boolean(entry.input.checked);
+          } else if (entry.field.field_type === 'multiselect') {
+            const checked = Array.from(entry.wrapper.querySelectorAll('input[type="checkbox"]:checked'))
+              .map((cb) => cb.value)
+              .filter(Boolean);
+            payload.customFields[name] = checked.length > 0 ? checked.join(',') : null;
+          } else {
+            payload.customFields[name] = entry.input.value || null;
+          }
+        });
+        try {
+          setInlineError(editFormError, '');
+          const result = await requestJson(`/staff/${staffId}`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+          });
+          if (result && result.message && !(flags && flags.isSuperAdmin)) {
+            window.alert(result.message);
+          }
+          window.location.reload();
+        } catch (error) {
+          setInlineError(editFormError, `Unable to update staff member: ${error.message}`);
+        }
+      });
+    }
+
+    container.querySelectorAll('[data-staff-verify]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-verify');
+        if (!id) {
+          return;
+        }
+        try {
+          const data = await requestJson(`/staff/${id}/verify`, { method: 'POST' });
+          const row = button.closest('tr');
+          const codeCell = row ? row.querySelector('.verification-code') : null;
+          if (codeCell) {
+            codeCell.textContent = data && data.code ? data.code : '';
+            codeCell.classList.toggle('text-success', data && data.status === 202);
+          }
+          if (!data || data.status !== 202) {
+            alert('Verification code dispatched, but upstream delivery may have failed.');
+          }
+        } catch (error) {
+          alert(`Failed to send verification code: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-invite]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-invite');
+        if (!id) {
+          return;
+        }
+        try {
+          await sendInvite(id);
+        } catch (error) {
+          alert(`Failed to send invitation: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-delete]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-delete');
+        if (!id) {
+          return;
+        }
+        try {
+          await deleteStaff(id);
+        } catch (error) {
+          alert(`Failed to delete staff record: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-approve]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-approve');
+        if (!id) {
+          return;
+        }
+        try {
+          await approveOnboarding(id);
+        } catch (error) {
+          alert(`Failed to approve onboarding request: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-deny]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-deny');
+        if (!id) {
+          return;
+        }
+        try {
+          await denyOnboarding(id);
+        } catch (error) {
+          alert(`Failed to deny onboarding request: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-workflow-rerun]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-workflow-rerun');
+        if (!id) {
+          return;
+        }
+        try {
+          await rerunWorkflow(id);
+        } catch (error) {
+          alert(`Failed to rerun workflow: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-workflow-retry]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-workflow-retry');
+        if (!id) {
+          return;
+        }
+        try {
+          await retryWorkflow(id);
+        } catch (error) {
+          alert(`Failed to retry failed step: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-workflow-resume]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-workflow-resume');
+        if (!id) {
+          return;
+        }
+        try {
+          await resumeWorkflow(id);
+        } catch (error) {
+          alert(`Failed to resume workflow: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-staff-workflow-force-complete]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-staff-workflow-force-complete');
+        const currentStep = (button.getAttribute('data-current-step') || '').trim();
+        if (!id) {
+          return;
+        }
+        try {
+          await forceCompleteWorkflow(id, { currentStep });
+        } catch (error) {
+          alert(`Failed to force-complete workflow step: ${error.message}`);
+        }
+      });
+    });
+
+    if (editActionButtons.invite) {
+      editActionButtons.invite.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await sendInvite(currentEditStaffId);
+        } catch (error) {
+          setInlineError(editActionError, `Failed to send invitation: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.offboardingRequest) {
+      editActionButtons.offboardingRequest.addEventListener('click', () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        openOffboardingRequestModal(currentEditStaffId);
+      });
+    }
+    if (editActionButtons.approve) {
+      editActionButtons.approve.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          if (isCurrentMemberOffboardingRequest()) {
+            await approveOffboarding(currentEditStaffId, getActionNote());
+          } else {
+            await approveOnboarding(currentEditStaffId, getActionNote());
+          }
+        } catch (error) {
+          setInlineError(editActionError, `Failed to approve request: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.deny) {
+      editActionButtons.deny.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          if (isCurrentMemberOffboardingRequest()) {
+            await denyOffboarding(currentEditStaffId, getActionNote({ required: true }) || '');
+          } else {
+            await denyOnboarding(currentEditStaffId, getActionNote({ required: true }) || '');
+          }
+        } catch (error) {
+          setInlineError(editActionError, `Failed to deny request: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.workflowRerun) {
+      editActionButtons.workflowRerun.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await rerunWorkflow(currentEditStaffId, getActionNote() || '');
+        } catch (error) {
+          setInlineError(editActionError, `Failed to rerun workflow: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.workflowRetry) {
+      editActionButtons.workflowRetry.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await retryWorkflow(currentEditStaffId, getActionNote() || '');
+        } catch (error) {
+          setInlineError(editActionError, `Failed to retry failed step: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.workflowResume) {
+      editActionButtons.workflowResume.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await resumeWorkflow(currentEditStaffId, getActionNote() || '');
+        } catch (error) {
+          setInlineError(editActionError, `Failed to resume workflow: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.workflowForceComplete) {
+      editActionButtons.workflowForceComplete.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await forceCompleteWorkflow(currentEditStaffId, {
+            currentStep: (editActionButtons.workflowForceComplete.dataset.currentStep || '').trim(),
+          }, getActionStep((editActionButtons.workflowForceComplete.dataset.currentStep || '').trim()), getActionNote() || '');
+        } catch (error) {
+          setInlineError(editActionError, `Failed to force-complete workflow step: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.m365ExportOneDrive) {
+      editActionButtons.m365ExportOneDrive.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await exportM365OneDrive(currentEditStaffId);
+        } catch (error) {
+          setInlineError(editActionError, `Failed to export OneDrive: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.m365ResetPassword) {
+      editActionButtons.m365ResetPassword.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await resetM365Password(currentEditStaffId);
+        } catch (error) {
+          setInlineError(editActionError, `Failed to reset O365 password: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.m365EnableSignIn) {
+      editActionButtons.m365EnableSignIn.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await setM365SignIn(currentEditStaffId, true);
+        } catch (error) {
+          setInlineError(editActionError, `Failed to enable O365 sign-in: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.m365DisableSignIn) {
+      editActionButtons.m365DisableSignIn.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await setM365SignIn(currentEditStaffId, false);
+        } catch (error) {
+          setInlineError(editActionError, `Failed to disable O365 sign-in: ${error.message}`);
+        }
+      });
+    }
+    if (editActionButtons.delete) {
+      editActionButtons.delete.addEventListener('click', async () => {
+        if (!currentEditStaffId) {
+          return;
+        }
+        try {
+          setInlineError(editActionError, '');
+          await deleteStaff(currentEditStaffId, Boolean(editDeleteConfirm && editDeleteConfirm.checked));
+        } catch (error) {
+          setInlineError(editActionError, `Failed to delete staff record: ${error.message}`);
+        }
+      });
+    }
+
+    async function approveStaffRequest(requestId, comment) {
+      await requestJson(`/api/staff/requests/${requestId}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ comment: comment || null }),
+      });
+    }
+
+    async function denyStaffRequest(requestId, reason) {
+      if (!reason) {
+        throw new Error('A deny reason is required.');
+      }
+      await requestJson(`/api/staff/requests/${requestId}/deny`, {
+        method: 'POST',
+        body: JSON.stringify({ reason }),
+      });
+    }
+
+    container.querySelectorAll('[data-request-approve]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-request-approve');
+        if (!id) {
+          return;
+        }
+        const comment = window.prompt('Approval comment (optional):') ?? '';
+        try {
+          await approveStaffRequest(id, comment);
+          const row = button.closest('tr');
+          if (row) {
+            row.remove();
+          }
+          const tbody = document.querySelector('#staff-requests-table tbody');
+          if (tbody && !tbody.querySelector('tr')) {
+            const section = document.querySelector('#staff-requests-table')?.closest('section');
+            if (section) {
+              section.remove();
+            }
+          }
+        } catch (error) {
+          alert(`Failed to approve staff request: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-request-deny]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-request-deny');
+        if (!id) {
+          return;
+        }
+        const reason = window.prompt('Deny reason (required):');
+        if (!reason) {
+          return;
+        }
+        try {
+          await denyStaffRequest(id, reason);
+          const row = button.closest('tr');
+          if (row) {
+            row.remove();
+          }
+          const tbody = document.querySelector('#staff-requests-table tbody');
+          if (tbody && !tbody.querySelector('tr')) {
+            const section = document.querySelector('#staff-requests-table')?.closest('section');
+            if (section) {
+              section.remove();
+            }
+          }
+        } catch (error) {
+          alert(`Failed to deny staff request: ${error.message}`);
+        }
+      });
+    });
+
+
+    function removeApprovalRow(button, tableSelector) {
+      const row = button.closest('tr');
+      if (row) {
+        row.remove();
+      }
+      const tbody = document.querySelector(`${tableSelector} tbody`);
+      if (tbody && !tbody.querySelector('tr')) {
+        const section = document.querySelector(tableSelector)?.closest('section');
+        if (section) {
+          section.remove();
+        }
+      }
+    }
+
+    container.querySelectorAll('[data-offboarding-approve]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-offboarding-approve');
+        if (!id) {
+          return;
+        }
+        const comment = window.prompt('Approval comment (optional):') ?? '';
+        try {
+          await approveOffboarding(id, comment);
+          removeApprovalRow(button, '#staff-offboarding-requests-table');
+        } catch (error) {
+          alert(`Failed to approve offboarding request: ${error.message}`);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-offboarding-deny]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const id = button.getAttribute('data-offboarding-deny');
+        if (!id) {
+          return;
+        }
+        const reason = window.prompt('Deny reason (required):');
+        if (!reason) {
+          return;
+        }
+        try {
+          await denyOffboarding(id, reason);
+          removeApprovalRow(button, '#staff-offboarding-requests-table');
+        } catch (error) {
+          alert(`Failed to deny offboarding request: ${error.message}`);
+        }
+      });
+    });
+
+  });
+})();

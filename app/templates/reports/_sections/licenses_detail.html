@@ -1,0 +1,43 @@
+<section class="card card--panel" data-report-section="licenses_detail">
+  <header class="card__header report-section__header">
+    <h2>Licenses — Full breakdown</h2>
+    <span class="report-section__meta">{{ section.detail_data.total or 0 }} license SKUs</span>
+  </header>
+  <div class="card__body">
+    {% set licenses = section.detail_data.licenses or [] %}
+    {% if licenses %}
+      <div class="table-wrapper">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Total</th>
+            <th>Allocated</th>
+            <th>Assigned Users</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for lic in licenses %}
+            <tr>
+              <td>{{ lic.name }}</td>
+              <td>{{ lic.total }}</td>
+              <td>{{ lic.allocated }}</td>
+              <td>
+                {% if lic.assigned_users %}
+                  {% for user in lic.assigned_users %}
+                    <div>{{ user }}</div>
+                  {% endfor %}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="report-empty">No licenses are recorded for this company.</p>
+    {% endif %}
+  </div>
+</section>

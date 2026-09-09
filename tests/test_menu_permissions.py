@@ -1,0 +1,103 @@
+from app.security.menu_permissions import (
+    compact_menu_permissions,
+    menu_has_access,
+    menu_permissions_to_legacy,
+    normalize_menu_permissions,
+)
+
+
+def test_legacy_permissions_normalize_to_tri_state_menu_permissions():
+    permissions = normalize_menu_permissions([
+        "m365_user_mailboxes.access",
+        "licenses.manage",
+        "cart.access",
+    ])
+
+    assert permissions["menu.m365.user_mailboxes"] == "read"
+    assert permissions["menu.m365.licenses"] == "write"
+    assert permissions["menu.subscriptions"] == "write"
+
+
+def test_compact_menu_permissions_removes_no_access_entries():
+    compact = compact_menu_permissions(
+        {
+            "menu.m365.configuration": "No Access",
+            "menu.m365.user_mailboxes": "Read Only",
+            "menu.subscriptions": "Read/Write",
+        }
+    )
+
+    assert compact == {
+        "menu.m365.user_mailboxes": "read",
+        "menu.subscriptions": "write",
+    }
+
+
+def test_menu_has_access_enforces_read_vs_write():
+    menu_access = {"menu.m365.user_mailboxes": "read"}
+
+    assert menu_has_access(menu_access, "menu.m365.user_mailboxes") is True
+    assert menu_has_access(menu_access, "menu.m365.user_mailboxes", write=True) is False
+
+
+def test_network_devices_permission_has_independent_read_and_write_levels():
+    read_access = normalize_menu_permissions({"menu.network_devices": "Read Only"})
+    write_access = normalize_menu_permissions({"menu.network_devices": "Read/Write"})
+
+    assert menu_has_access(read_access, "menu.network_devices") is True
+    assert menu_has_access(read_access, "menu.network_devices", write=True) is False
+    assert menu_has_access(write_access, "menu.network_devices", write=True) is True
+
+
+def test_menu_permissions_to_legacy_keeps_backward_compatibility():
+    legacy = menu_permissions_to_legacy({"menu.m365.user_mailboxes": "read", "menu.assets": "write"})
+
+    assert "m365_user_mailboxes.access" in legacy
+    assert "assets.manage" in legacy
+
+
+def test_bcp_continuity_menu_permission_expands_to_legacy_permissions():
+    legacy_read = menu_permissions_to_legacy({"menu.continuity": "read"})
+    legacy_write = menu_permissions_to_legacy({"menu.continuity": "write"})
+
+    assert "continuity.access" in legacy_read
+    assert "bcp:view" in legacy_read
+    assert "bcp:edit" not in legacy_read
+    assert "bcp:edit" in legacy_write
+
+
+def test_dmarc_menu_permission_maps_read_and_write_access():
+    read_permissions = menu_permissions_to_legacy({"menu.dmarc": "read"})
+    write_permissions = menu_permissions_to_legacy({"menu.dmarc": "write"})
+
+    assert read_permissions == ["dmarc.view"]
+    assert write_permissions == ["dmarc.manage", "dmarc.view"]
+
+
+def test_sidebar_exposes_dmarc_reports_for_authorized_roles():
+    from pathlib import Path
+
+    template = Path("app/templates/base.html").read_text()
+
+    assert "menu_access.get('menu.dmarc') in ['read', 'write']" in template
+    assert 'href="/dmarc"' in template
+    assert "current_path.startswith('/dmarc')" in template
+    assert '<span class="menu__label">DMARC reports</span>' in template
+
+
+def test_technician_permission_is_yes_no_for_catalogue_and_normalization():
+    permissions = normalize_menu_permissions({"menu.admin.technician": "Read Only"})
+
+    assert permissions["menu.admin.technician"] == "write"
+    assert compact_menu_permissions({"menu.admin.technician": "read"}) == {"menu.admin.technician": "write"}
+    assert menu_has_access({"menu.admin.technician": "read"}, "menu.admin.technician", write=True) is True
+
+
+def test_technician_permission_catalogue_exposes_yes_no_levels():
+    from app.security.menu_permissions import catalogue_for_api
+
+    technician_permission = next(
+        permission for permission in catalogue_for_api() if permission["key"] == "menu.admin.technician"
+    )
+
+    assert technician_permission["levels"] == ["none", "write"]

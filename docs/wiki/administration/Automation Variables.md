@@ -1,0 +1,346 @@
+# Ticket automation and notification variables
+
+Ticket-based automations and notifications can access a `ticket` object inside 
+the event context as well as pre-rendered template tokens. The context includes 
+relationship metadata so filters and actions can target the correct recipients 
+without manual lookups.
+
+## Usage in automations vs notifications
+
+- **Automations**: Receive the full ticket context directly in the `tickets.created`, 
+  `tickets.updated`, and other ticket events
+- **Notifications**: When `emit_notification` is called with ticket data in the 
+  `metadata` parameter, the ticket is automatically exposed at the top level of 
+  the context for template rendering and module actions
+
+## Filterable context fields
+
+Use dotted paths in automation filters to reference specific ticket fields. Key
+paths now available include:
+
+- `ticket.number` / `ticket.ticket_number` - Ticket number (e.g., "TKT-123")
+- `ticket.body` - Body associated with the current event. For reply-backed
+  events this is the triggering reply; otherwise it is the initial request body
+- `ticket.initial_body` - Initial request body, using the first public
+  conversation entry when available and falling back to the ticket description
+- `ticket.requester.email` / `ticket.requester.display_name`
+- `ticket.assigned_user.email` / `ticket.assigned_user.display_name`
+- `ticket.company.name`
+- `ticket.category`, `ticket.priority`, and `ticket.external_reference`
+- `ticket.ai_tags` for AI-generated categorisation
+- `ticket.watchers_count` for the number of subscribed users
+- `ticket.watchers.email` for a comma-separated list of every watcher email,
+  which is useful when populating an email CC field for multiple watchers
+- `ticket.watchers[0].email` (and subsequent indexes) for individual watcher
+  details
+- `ticket.latest_reply.body` and `ticket.latest_reply.author_email` for the most
+  recent conversation entry
+- `ticket.sms.recipient` for the mobile number parsed from an SMS ticket external reference
+- `ticket_update.actor_type` to identify whether the update originated from the
+  system, an automation, the requester, a watcher, or a technician
+- `ticket_update.actor_user_email` / `ticket_update.actor_user_display_name`
+  expose the email and display name of the updater when available
+
+## Ticket update actors
+
+Ticket automations include metadata that classifies who performed an update so
+filters can react to specific sources. The following actor types are emitted:
+
+| Actor type | Description |
+| --- | --- |
+| `system` | Updates applied by the platform (for example AI summaries). |
+| `automation` | Changes triggered by configured automation modules or imports. |
+| `requester` | Updates performed by the ticket requester. |
+| `watcher` | Updates performed by a user watching the ticket but not assigned. |
+| `technician` | Updates performed by helpdesk staff within the portal or API. |
+
+Arrays such as `ticket.watchers` can be indexed numerically. For example,
+matching `ticket.watchers[0].email` allows a workflow to react when the first
+watcher is a specific address. Referencing a field directly on an array, such
+as `ticket.watchers.email`, projects that field from each watcher and returns a
+comma-separated list like `watcher.one@example.com, watcher.two@example.com`.
+
+## Template tokens
+
+During action execution every system variable is flattened into uppercase tokens
+that can be interpolated inside payloads (for example when sending outbound
+emails or webhook requests). Newly added tokens include:
+
+| Token | Description |
+| --- | --- |
+| `{{ TICKET_NUMBER }}` | Ticket number (e.g., "TKT-123"). Also available as `{{ TICKET_TICKET_NUMBER }}`. |
+| `{{ TICKET_REQUESTER_EMAIL }}` | Requester email address. |
+| `{{ TICKET_REQUESTER_DISPLAY_NAME }}` | Requester display name derived from their profile. |
+| `{{ TICKET_ASSIGNED_USER_EMAIL }}` | Assigned technician email address. |
+| `{{ TICKET_ASSIGNED_USER_DISPLAY_NAME }}` | Assigned technician display name. |
+| `{{ TICKET_COMPANY_NAME }}` | Linked company name (also exposed as `{{ COMPANY_NAME }}`). |
+| `{{ TICKET_CATEGORY }}` / `{{ TICKET_PRIORITY }}` | Ticket routing metadata. |
+| `{{ TICKET_EXTERNAL_REFERENCE }}` | External system identifier such as an RMM ticket number. |
+| `{{ TICKET_AI_TAGS_0 }}` ... | AI-generated tags (indexed for each tag). |
+| `{{ TICKET_WATCHERS_COUNT }}` | Number of watchers subscribed to the ticket. |
+| `{{ TICKET_WATCHERS_EMAIL }}` | Comma-separated list of all watcher email addresses. |
+| `{{ TICKET_WATCHERS_0_EMAIL }}` ... | Indexed watcher email addresses. |
+| `{{ TICKET_WATCHERS_0_USER_EMAIL }}` ... | Indexed watcher user profile email values. |
+| `{{ TICKET_WATCHER_EMAILS_0 }}` ... | Flattened list of watcher emails for quick iteration. |
+| `{{ TICKET_LATEST_REPLY_BODY }}` | Body of the most recent reply. |
+| `{{ TICKET_LATEST_REPLY_AUTHOR_EMAIL }}` | Email for the author of the latest reply. |
+| `{{ TICKET_LATEST_REPLY_AUTHOR_DISPLAY_NAME }}` | Display name for the latest reply author. |
+| `{{ TICKET_SMS_RECIPIENT }}` | Mobile number parsed from an SMS ticket external reference. |
+| `{{ ACTIVE_ASSETS }}` / `{{ ACTIVE_ASSETS:7 }}` | Count of assets that synced in the current month, or within the last `N` days when the `:N` suffix is provided. |
+| `{{ count:asset:field-name }}` | Count of assets with a specific custom field checkbox set to true (e.g., `{{ count:asset:bitdefender }}` or `{{ count:asset:threatlocker-installed }}`). |
+| `{{ list:asset:field-name }}` | Comma-separated list of asset names with a specific custom field checkbox set to true (e.g., `{{ list:asset:bitdefender }}`). |
+| `{{ count:issue:slug }}` | Count of assets linked to a specific issue type (e.g., `{{ count:issue:network-outage }}`). |
+| `{{ list:issue:slug }}` | Comma-separated list of asset names linked to a specific issue type (e.g., `{{ list:issue:network-outage }}`). |
+| `{{ report.slug.count }}` | Count of rows returned by a saved Reporting query. Replace `slug` with the report slug from **Reporting → Manage reports**. |
+| `{{ report.slug.list }}` | CSV-formatted content returned by a saved Reporting query, including a header row. Replace `slug` with the report slug. |
+
+`{{ ACTIVE_ASSETS }}` tokens scope to the company in the current automation context when available (for example a ticket's company). When no company is present the counts cover the entire tenant. The default form returns assets with a Syncro sync timestamp in the current month; append `:N` to evaluate the past `N` days such as `{{ ACTIVE_ASSETS:1 }}` for the past day.
+
+### Asset custom field count variables
+
+The `{{ count:asset:field-name }}` variables allow you to count assets that have a specific checkbox custom field set to true. These variables are particularly useful for tracking security software installations, compliance status, or any other asset characteristic tracked via checkbox custom fields.
+
+**Usage examples:**
+
+- `{{ count:asset:bitdefender }}` - Count assets with the "bitdefender" checkbox enabled
+- `{{ count:asset:threatlocker-installed }}` - Count assets with the "threatlocker-installed" checkbox enabled
+- `{{ count:asset:warranty-active }}` - Count assets with the "warranty-active" checkbox enabled
+
+**Context scoping:**
+
+Like `ACTIVE_ASSETS`, these counters automatically scope to the company associated with the current ticket when used in ticket automations. When no company context is available, they count across all companies in the tenant.
+
+**Field name matching:**
+
+The field name in the variable (after `count:asset:`) must match the exact name of a checkbox custom field defined in **Admin → Asset Custom Fields**. The comparison is case-sensitive and the field must be of type "checkbox".
+
+**Example automation use case:**
+
+```
+Subject: Security Software Status for {{ COMPANY_NAME }}
+Body: You have {{ count:asset:bitdefender }} assets with Bitdefender and {{ count:asset:threatlocker-installed }} assets with ThreatLocker installed.
+```
+
+### Asset custom field list variables
+
+The `{{ list:asset:field-name }}` variables return a comma-separated list of asset names that have a specific checkbox custom field set to true. These work similarly to the count variables but provide the actual asset names instead of just a count.
+
+**Usage examples:**
+
+- `{{ list:asset:bitdefender }}` - List assets with the "bitdefender" checkbox enabled
+- `{{ list:asset:threatlocker-installed }}` - List assets with the "threatlocker-installed" checkbox enabled
+
+**Context scoping and field matching:**
+
+List variables follow the same scoping and field name matching rules as count variables. The assets are returned as a comma-separated list (e.g., "Server-01, Server-02, Workstation-03"). When no assets match, an empty string is returned.
+
+### Saved report variables
+
+Admins can create SELECT-only reports in **Reporting → Manage reports** and reuse their output anywhere dynamic template variables are rendered, including invoice descriptions/quantities, ticket content, automations, and message templates. Use the report slug in the token:
+
+- `{{ report.billable-assets.count }}` returns the number of rows found by the `billable-assets` report.
+- `{{ report.billable-assets.list }}` returns the report result as CSV text with a header row.
+
+Report variables are useful when the built-in counters are not specific enough. For example, create a report that selects only assets with a particular lifecycle, contract, or custom join, then use `.count` for quantity-based billing or `.list` to include the matching records in ticket/invoice narrative text.
+
+Saved report SQL can include `{{current.company}}` or `{{current.company_id}}` as a numeric context placeholder. At render time this is replaced with the company ID from the current ticket, invoice, automation context, or top-level company context. If no company is available, the placeholder becomes `NULL` so company-filtered reports return no rows instead of leaking tenant-wide results.
+
+Example report SQL:
+
+```sql
+SELECT name, asset_type
+FROM assets
+WHERE company_id = {{current.company}}
+  AND status = 'active'
+ORDER BY name
+```
+
+Example template usage:
+
+```text
+Managed endpoint quantity: {{ report.managed-endpoints.count }}
+Managed endpoints:
+{{ report.managed-endpoints.list }}
+```
+
+Security notes: report SQL is still validated as a single read-only `SELECT`/`WITH` query, dangerous SQL keywords are rejected, result rows are capped for `.list`, and sensitive column names such as password, token, secret, API key, credential, or encrypted values are redacted.
+
+### Conditional logic
+
+Template variables support conditional expressions to dynamically return different values based on conditions. This is particularly useful for showing asset lists only when they exist, providing different messages based on counts, or any other conditional logic.
+
+**Syntax:**
+
+```
+{{ if condition then value_if_true else value_if_false }}
+```
+
+The `else` clause is optional. If omitted and the condition is false, an empty string is returned.
+
+**Comparison operators:**
+
+Conditional expressions support the following comparison operators:
+- `>` - Greater than
+- `<` - Less than
+- `>=` - Greater than or equal to
+- `<=` - Less than or equal to
+- `==` - Equal to
+- `!=` - Not equal to
+
+**Example use cases:**
+
+Show asset list only when assets exist:
+```
+Bitdefender assets: {{ if count:asset:bitdefender > 0 then list:asset:bitdefender else "None installed" }}
+```
+
+Display different messages based on count:
+```
+{{ if count:asset:bitdefender >= 10 then "Many assets protected" else "Few assets protected" }}
+```
+
+Conditional subject line:
+```
+Subject: {{ if count:asset:bitdefender > 0 then "Action Required: Bitdefender Updates" else "No action needed" }}
+```
+
+Multiple conditionals in the same template:
+```
+Security Status:
+- Bitdefender: {{ if count:asset:bitdefender > 0 then list:asset:bitdefender else "Not installed" }}
+- ThreatLocker: {{ if count:asset:threatlocker-installed > 0 then list:asset:threatlocker-installed else "Not installed" }}
+```
+
+**Notes:**
+
+- The `if`, `then`, and `else` keywords are case-insensitive
+- Variable names in conditionals (like `count:asset:bitdefender`) are automatically detected and resolved
+- Numeric comparisons are performed when both sides can be converted to numbers
+- String comparisons are used as a fallback when numeric conversion fails
+- Empty strings and zero values are considered "false" in boolean contexts
+
+## Message templates
+
+Reusable snippets such as email bodies or webhook payloads can be defined as
+message templates. Reference a template anywhere variables are supported using
+either the uppercase or dotted token form:
+
+- `{{ TEMPLATE_WELCOME_EMAIL }}`
+- `{{ template.welcome_email }}`
+
+Template content itself may include other variables like `{{ ticket.id }}` or
+`{{ APP_NAME }}`. During automation execution the template is rendered with the
+same context as the surrounding payload before being substituted.
+
+All tokens resolve to empty strings when the underlying value is missing, so
+payloads can safely reference them without additional guards.
+
+## Staff onboarding/offboarding workflow variables
+
+Staff workflow steps (onboarding and offboarding) support `${vars.*}` interpolation in step fields such as rename/display templates, email subjects, and request payload bodies.
+
+### Staff identity tokens
+
+| Variable | Description | Example |
+| --- | --- | --- |
+| `${vars.staff.first_name}` | Staff first name. | `Alex` |
+| `${vars.staff.last_name}` | Staff last name. | `Morgan` |
+| `${vars.staff.full_name}` | Staff full name (first + last). | `Alex Morgan` |
+| `${vars.staff.email}` | Staff email address. | `alex.morgan@example.com` |
+
+Backward-compatible aliases remain available: `${vars.staff_first_name}`, `${vars.staff_last_name}`, `${vars.staff_full_name}`, and `${vars.staff_email}`.
+
+### Date/time tokens (`now.*`)
+
+Workflow execution context always includes UTC date/time tokens:
+
+| Variable | Format | Example |
+| --- | --- | --- |
+| `${vars.now.iso}` | ISO-8601 UTC datetime | `2026-03-30T14:22:01.123456+00:00` |
+| `${vars.now.date}` | `YYYY-MM-DD` (UTC) | `2026-03-30` |
+| `${vars.now.datetime_utc}` | Display UTC datetime | `2026-03-30 14:22:01 UTC` |
+
+When a valid company or requester timezone is available, local tokens are also populated:
+
+| Variable | Format | Example |
+| --- | --- | --- |
+| `${vars.now.local.iso}` | ISO-8601 local datetime | `2026-03-30T10:22:01.123456-04:00` |
+| `${vars.now.local.date}` | `YYYY-MM-DD` (local) | `2026-03-30` |
+| `${vars.now.local.display}` | Local display date (`Mon DD, YYYY`) | `Mar 30, 2026` |
+| `${vars.now.local.datetime}` | Local display datetime | `2026-03-30 10:22:01 EDT` |
+| `${vars.now.local.timezone}` | Resolved IANA timezone | `America/New_York` |
+
+#### Scheduled ticket and automation payload date expressions
+
+Scheduled ticket JSON payloads and other automation payload fields that use the shared template renderer can use `${vars.now...}` expressions anywhere a string value is accepted. These expressions are evaluated before the ticket is created, so they are safe to use in JSON fields such as `subject`, `description`, `category`, or webhook payload values.
+
+**Common scheduled ticket examples**
+
+```json
+{
+  "subject": "GMP Backup Restore Testing - ${vars.now.local.date}",
+  "description": "Monthly restore test for ${vars.now.local.date}.format(\"MMMM yyyy\")",
+  "priority": "normal",
+  "status": "new"
+}
+```
+
+If this automation runs on March 30, 2026, the subject becomes `GMP Backup Restore Testing - 2026-03-30` and the description includes `March 2026`.
+
+**Formatting**
+
+Append `.format("...")` after a date/time expression to control the output. The formatter supports these common Java-style tokens:
+
+| Token | Meaning | Example output |
+| --- | --- | --- |
+| `yyyy` | Four-digit year | `2026` |
+| `MMMM` | Full month name | `March` |
+| `MMM` | Abbreviated month name | `Mar` |
+| `MM` | Two-digit month | `03` |
+| `dd` | Two-digit day of month | `30` |
+| `EEEE` | Full weekday name | `Monday` |
+| `EEE` | Abbreviated weekday name | `Mon` |
+| `HH` | 24-hour hour | `14` |
+| `mm` | Minutes | `22` |
+| `ss` | Seconds | `01` |
+
+Examples:
+
+| Expression | Example output |
+| --- | --- |
+| `${vars.now.local.date}.format("MMMM")` | `March` |
+| `${vars.now.local.date}.format("MMMM yyyy")` | `March 2026` |
+| `${vars.now.local}.format("EEEE, dd MMMM yyyy")` | `Monday, 30 March 2026` |
+| `${vars.now.utc}.format("yyyy-MM-dd HH:mm:ss")` | `2026-03-30 14:22:01` |
+
+**Offsets for last month, next month, and other relative dates**
+
+Use the built-in month shortcuts or adjustment methods when scheduled tickets need to refer to a different period than the run date:
+
+| Expression | Description | Example output when run on March 30, 2026 |
+| --- | --- | --- |
+| `${vars.now.local.date.last_month}.format("MMMM yyyy")` | Previous calendar month | `February 2026` |
+| `${vars.now.local.date.previous_month}.format("MMMM yyyy")` | Alias for previous calendar month | `February 2026` |
+| `${vars.now.local.date.next_month}.format("MMMM yyyy")` | Next calendar month | `April 2026` |
+| `${vars.now.local.date.last(months=1)}.format("MMMM yyyy")` | Subtract one month | `February 2026` |
+| `${vars.now.local.date.next(months=1)}.format("MMMM yyyy")` | Add one month | `April 2026` |
+| `${vars.now.local.date.add(days=7)}.format("yyyy-MM-dd")` | Add seven days | `2026-04-06` |
+| `${vars.now.local.date.previous(weeks=2)}.format("yyyy-MM-dd")` | Subtract two weeks | `2026-03-16` |
+
+Adjustment methods accept `days`, `weeks`, `months`, and `years` as integer arguments. Multiple arguments can be combined, for example `${vars.now.local.date.next(months=1, days=7)}.format("yyyy-MM-dd")`.
+
+**Local vs UTC**
+
+- Use `${vars.now.local...}` when the ticket text should follow the portal/server local timezone.
+- Use `${vars.now.utc...}` when the ticket text must be timezone-neutral or match UTC audit/reporting periods.
+- `${vars.now...}` without `local` or `utc` resolves like local time for these payload expressions.
+
+### Huntress Managed SAT learner count variables
+
+When the Huntress integration is enabled and a company has a Huntress organisation/account ID, the daily Huntress sync stores Managed Security Awareness Training learner snapshots from the Curricula JSON:API. Use these variables in invoice quantities, invoice descriptions, scheduled tickets, automations, and message templates:
+
+- `{{ huntress.sat.learners.enrolled }}` – active/enrolled learner count for the current company.
+- `{{ huntress_sat_enrolled_learners }}` – invoice-friendly alias for the same learner count.
+- `{{ huntress_sat_learner_count }}` – legacy-style alias for the same learner count.
+
+The value is read from the last successful Huntress sync snapshot, so rendering templates never makes live Curricula API calls.

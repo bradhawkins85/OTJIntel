@@ -1,0 +1,724 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_title %}Ticket{% endblock %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "All tickets", "type": "link", "href": "/tickets"}
+  ]) }}
+{% endblock %}
+
+{% block content %}
+  <div class="management management--single">
+    <section class="management__content">
+      <header class="management__header">
+        <div>
+          <h1 class="management__title">{{ ticket.subject or 'Ticket' }}</h1>
+        </div>
+        <div class="management__header-actions">
+          <a class="button button--ghost" href="/tickets">Back to tickets</a>
+        </div>
+      </header>
+      <div class="management__body management__body--columns management__body--ticket-detail management__body--ticket-detail-two-column">
+        <div class="management__column management__column--details">
+          <details class="card card--panel card-collapsible" open>
+            <summary class="card__header card__header--collapsible">
+              <h2 class="card__title">Ticket details</h2>
+              <div class="card__collapsible-meta">
+                <span class="card__toggle-icon" aria-hidden="true"></span>
+              </div>
+            </summary>
+            <div class="card-collapsible__content">
+              <div class="card__body">
+                <dl class="description-list">
+                  <div class="description-list__row">
+                    <dt>Status</dt>
+                    <dd><span class="badge {{ ticket.status_badge }}">{{ ticket.status_label }}</span></dd>
+                  </div>
+                  {% if ticket.company_name %}
+                    <div class="description-list__row">
+                      <dt>Company</dt>
+                      <dd>{{ ticket.company_name }}</dd>
+                    </div>
+                  {% endif %}
+                  {% if ticket.requester_label %}
+                    <div class="description-list__row">
+                      <dt>Requester</dt>
+                      <dd>{{ ticket.requester_label }}</dd>
+                    </div>
+                  {% endif %}
+                  {% if ticket.assigned_label %}
+                    <div class="description-list__row">
+                      <dt>Assigned to</dt>
+                      <dd>{{ ticket.assigned_label }}</dd>
+                    </div>
+                  {% endif %}
+                  <div class="description-list__row">
+                    <dt>Created</dt>
+                    <dd>
+                      {% if ticket.created_iso %}
+                        <span data-utc="{{ ticket.created_iso }}"></span>
+                      {% else %}
+                        <span class="text-muted">—</span>
+                      {% endif %}
+                    </dd>
+                  </div>
+                  <div class="description-list__row">
+                    <dt>Updated</dt>
+                    <dd>
+                      {% if ticket.updated_iso %}
+                        <span data-utc="{{ ticket.updated_iso }}"></span>
+                      {% else %}
+                        <span class="text-muted">—</span>
+                      {% endif %}
+                    </dd>
+                  </div>
+                  {% if ticket.xero_invoice_number %}
+                    <div class="description-list__row">
+                      <dt>Invoice Number</dt>
+                      <dd><strong>{{ ticket.xero_invoice_number }}</strong></dd>
+                    </div>
+                  {% endif %}
+                  {% if ticket.billed_at_iso %}
+                    <div class="description-list__row">
+                      <dt>Billed At</dt>
+                      <dd>
+                        <span data-utc="{{ ticket.billed_at_iso }}"></span>
+                      </dd>
+                    </div>
+                  {% endif %}
+                  {% if ticket_watchers %}
+                    <div class="description-list__row">
+                      <dt>Watchers</dt>
+                      <dd>
+                        <ul class="list list--inline">
+                          {% for watcher in ticket_watchers %}
+                            <li>{{ watcher.label }}</li>
+                          {% endfor %}
+                        </ul>
+                      </dd>
+                    </div>
+                  {% endif %}
+                </dl>
+              </div>
+            </div>
+          </details>
+
+          <article class="card card--panel">
+            <header class="card__header">
+              <h2 class="card__title">Attachments</h2>
+            </header>
+            <div class="card__body">
+              <div
+                class="attachments-grid"
+                data-attachments-grid
+                data-ticket-id="{{ ticket.id }}"
+              >
+                {% for attachment in ticket_attachments %}
+                  <article class="attachment-card" data-attachment-id="{{ attachment.id }}">
+                    <a
+                      class="attachment-card__preview"
+                      href="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download"
+                      title="Open {{ attachment.original_filename or attachment.filename }}"
+                      {% if attachment.mime_type and attachment.mime_type.startswith('image/') %}data-attachment-image-preview{% endif %}
+                    >
+                      {% if attachment.mime_type and attachment.mime_type.startswith('image/') %}
+                        <img
+                          src="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download?preview=true"
+                          alt="Preview of {{ attachment.original_filename or attachment.filename }}"
+                          loading="lazy"
+                        />
+                      {% elif attachment.mime_type == 'application/pdf' %}
+                        <iframe
+                          src="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download?preview=true#toolbar=0&navpanes=0"
+                          title="Preview of {{ attachment.original_filename or attachment.filename }}"
+                          loading="lazy"
+                          tabindex="-1"
+                        ></iframe>
+                        <span class="attachment-card__preview-shield" aria-hidden="true"></span>
+                      {% else %}
+                        <span class="attachment-card__file-type" aria-hidden="true">{{ (attachment.original_filename or attachment.filename).rsplit('.', 1)[-1][:5] | upper if '.' in (attachment.original_filename or attachment.filename) else 'FILE' }}</span>
+                      {% endif %}
+                    </a>
+                    <div class="attachment-card__content">
+                      <div class="attachment-card__header">
+                        <p class="attachment-card__name">
+                          <a
+                            href="/api/tickets/{{ ticket.id }}/attachments/{{ attachment.id }}/download"
+                            download
+                            title="{{ attachment.original_filename or attachment.filename }}"
+                          >
+                            {{ attachment.original_filename or attachment.filename }}
+                          </a>
+                        </p>
+                      </div>
+                      <p class="attachment-card__date">
+                        {% if attachment.uploaded_iso %}
+                          <span data-utc="{{ attachment.uploaded_iso }}"></span>
+                        {% else %}
+                          <span class="visually-hidden">Upload date unavailable</span>
+                        {% endif %}
+                      </p>
+                      <div class="attachment-card__footer">
+                        {% if has_helpdesk_access %}
+                          <div class="attachment-card__actions">
+                            <button
+                              type="button"
+                              class="button button--ghost button--small attachment-card__action"
+                              data-remove-attachment
+                              data-attachment-id="{{ attachment.id }}"
+                              aria-label="Remove attachment"
+                            >
+                              <svg class="attachment-card__remove-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-1 12H8L7 9Zm3 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z"/></svg>
+                              <span class="visually-hidden">Remove</span>
+                            </button>
+                          </div>
+                        {% endif %}
+                        <p class="attachment-card__meta">{{ attachment.file_size | filesizeformat }}</p>
+                      </div>
+                    </div>
+                  </article>
+                {% endfor %}
+              </div>
+              <p
+                class="card__empty"
+                data-attachments-empty
+                {% if ticket_attachments %}hidden{% endif %}
+              >
+                No attachments have been added yet.
+              </p>
+            </div>
+          </article>
+
+          {% if assigned_user and assigned_user.booking_link_url %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Schedule a call</h2>
+              </header>
+              <div class="card__body">
+                <p class="text-muted">Book a call with {{ ticket.assigned_label }} to discuss this ticket.</p>
+                <button 
+                  type="button" 
+                  class="button"
+                  data-cal-link="{{ assigned_user.booking_link_url }}"
+                  data-ticket-id="{{ ticket.id }}"
+                  data-ticket-subject="{{ ticket.subject | e }}"
+                  data-user-name="{{ ([user.first_name, user.last_name] | select | join(' ')) | e }}"
+                  data-user-email="{{ (user.email or '') | e }}"
+                  data-user-phone="{{ (user.mobile_phone or '') | e }}"
+                >
+                  Book a call
+                </button>
+              </div>
+            </article>
+          {% endif %}
+
+          {% if matrix_chat_enabled and (ticket_chat_room or is_requester) %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Chat</h2>
+              </header>
+              <div class="card__body">
+                {% if ticket_chat_room %}
+                  <p class="text-muted" style="margin-bottom: 1rem;">
+                    A chat room is linked to this ticket.
+                  </p>
+                  <a href="/chat/{{ ticket_chat_room.id }}" class="button button--primary">
+                    Open Chat
+                  </a>
+                {% elif is_requester %}
+                  <p class="text-muted" style="margin-bottom: 1rem;">
+                    Start a chat room for this ticket.
+                  </p>
+                  <button
+                    type="button"
+                    class="button button--primary"
+                    data-start-chat-button
+                    data-ticket-id="{{ ticket.id }}"
+                    data-ticket-subject="{{ ticket.subject | e }}"
+                  >
+                    Start Chat
+                  </button>
+                {% endif %}
+              </div>
+            </article>
+          {% endif %}
+
+          {% if ticket_assets %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Linked Assets</h2>
+              </header>
+              <div class="card__body">
+                <ul class="list">
+                  {% for asset in ticket_assets %}
+                    <li class="list__item">
+                      <strong>{{ asset.name }}</strong>
+                      {% if asset.type %}
+                        <div class="list__meta">Type: {{ asset.type }}</div>
+                      {% endif %}
+                      {% if asset.serial_number %}
+                        <div class="list__meta">Serial: {{ asset.serial_number }}</div>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </article>
+          {% endif %}
+
+          {% if relevant_services %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Associated Service Statuses</h2>
+              </header>
+              <div class="card__body">
+                <ul class="list">
+                  {% for service in relevant_services %}
+                    {% set status_meta = service_status_lookup.get(service.status) %}
+                    {% set status_variant = status_meta.variant if status_meta else 'status--neutral' %}
+                    {% set status_label = status_meta.label if status_meta else (service.status | replace('_', ' ') | title) %}
+                    <li class="list__item">
+                      <strong>{{ service.name }}</strong>
+                      {% if service.status %}
+                        <div class="list__meta">
+                          <span class="status {{ status_variant }}">{{ status_label }}</span>
+                        </div>
+                      {% endif %}
+                      {% if service.status_message %}
+                        <div class="list__meta">{{ service.status_message }}</div>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </article>
+          {% endif %}
+
+          {% if relevant_kb_articles %}
+            <article class="card card--panel">
+              <header class="card__header">
+                <h2 class="card__title">Related Knowledge Base Articles</h2>
+              </header>
+              <div class="card__body">
+                <ul class="list">
+                  {% for article in relevant_kb_articles %}
+                    <li class="list__item">
+                      <a href="/knowledge-base?slug={{ article.slug }}" target="_blank" rel="noopener noreferrer">
+                        <strong>{{ article.title }}</strong>
+                      </a>
+                      {% if article.summary %}
+                        <div class="list__meta">{{ article.summary }}</div>
+                      {% endif %}
+                      {% if article.matching_tags_count %}
+                        <div class="list__meta">
+                          <span class="badge badge--muted">{{ article.matching_tags_count }} matching tag{{ 's' if article.matching_tags_count > 1 else '' }}</span>
+                        </div>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </article>
+          {% endif %}
+        </div>
+        <div class="management__column management__column--timeline">
+          <article class="card card--panel">
+            <header class="card__header">
+              <h2 class="card__title">Description</h2>
+            </header>
+            <div class="card__body">
+              {% if ticket.description_has_content %}
+                <div class="rich-text-viewer">{{ ticket.description_html | safe }}</div>
+              {% else %}
+                <p class="card__empty">No description has been provided yet.</p>
+              {% endif %}
+            </div>
+          </article>
+
+          <article class="card card--panel">
+            <header class="card__header">
+              <div class="card__title-group">
+                <h2 class="card__title">Reply</h2>
+                <button type="button" class="button button--secondary button--small" data-ticket-reply-cache-load data-ticket-reply-cache-target="ticket-reply-form" hidden>Load Previous Reply</button>
+              </div>
+            </header>
+            <div class="card__body">
+              {% if can_reply %}
+                <form id="ticket-reply-form" action="/tickets/{{ ticket.id }}/replies" method="post" class="form" novalidate enctype="multipart/form-data" data-ticket-reply-form data-ticket-reply-cache data-ticket-reply-cache-ticket-id="{{ ticket.id }}">
+                  {% include "partials/csrf.html" %}
+                  <div class="form-field">
+                    <span class="form-label" id="ticket-reply-label">Message</span>
+                    <div
+                      class="rich-text-editor"
+                      data-rich-text-editor
+                      data-ticket-mention-users='{{ ticket_mention_staff_options | default([]) | tojson | e }}'
+                      aria-labelledby="ticket-reply-label"
+                    >
+                      <div class="rich-text-editor__toolbar" role="toolbar" aria-label="Formatting options">
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="bold"
+                          aria-label="Bold"
+                        >
+                          <span aria-hidden="true">B</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="italic"
+                          aria-label="Italic"
+                        >
+                          <span aria-hidden="true">I</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="underline"
+                          aria-label="Underline"
+                        >
+                          <span aria-hidden="true">U</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="insertUnorderedList"
+                          aria-label="Bulleted list"
+                        >
+                          <span aria-hidden="true">•</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="insertOrderedList"
+                          aria-label="Numbered list"
+                        >
+                          <span aria-hidden="true">1.</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="formatBlock"
+                          data-command-value="blockquote"
+                          aria-label="Quote"
+                        >
+                          <span aria-hidden="true">""</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="formatBlock"
+                          data-command-value="pre"
+                          aria-label="Code block"
+                        >
+                          <span aria-hidden="true">&lt;/&gt;</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="link"
+                          aria-label="Insert link"
+                        >
+                          <span aria-hidden="true">🔗</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="rich-text-editor__button"
+                          data-rich-text-button
+                          data-command="removeFormat"
+                          aria-label="Clear formatting"
+                        >
+                          <span aria-hidden="true">⨯</span>
+                        </button>
+                      </div>
+                      <div
+                        id="ticket-reply-body"
+                        class="rich-text-editor__surface"
+                        data-rich-text-content
+                        contenteditable="true"
+                        role="textbox"
+                        aria-labelledby="ticket-reply-label"
+                        aria-multiline="true"
+                        data-placeholder="Write your reply..."
+                      >{{ reply_body }}</div>
+                    </div>
+                    <input type="hidden" name="mentionedUserIds" data-ticket-mention-user-ids />
+                    <textarea
+                      id="ticket-reply-body-hidden"
+                      name="body"
+                      class="rich-text-editor__fallback"
+                      data-rich-text-value
+                      data-rich-text-fallback
+                      aria-labelledby="ticket-reply-label"
+                      placeholder="Write your reply..."
+                      required
+                    >{{ reply_body | e }}</textarea>
+                  </div>
+                  <div class="form-field">
+                    <label class="form-label" for="ticket-reply-attachments">Attachments (optional)</label>
+                    <input
+                      type="file"
+                      id="ticket-reply-attachments"
+                      name="attachments"
+                      class="form-input"
+                      multiple
+                      accept="*/*"
+                      data-ticket-attachments
+                    />
+                    <p class="form-help">You can upload multiple files. Maximum file size: 10MB per file.</p>
+                  </div>
+                  <div class="form-actions">
+                    {% if has_helpdesk_access or is_super_admin %}
+                      <div class="ticket-reply-submit" data-ticket-reply-submit>
+                        <input type="hidden" name="replyStatus" value="" data-ticket-reply-status-input />
+                        <button type="submit" class="button button--primary ticket-reply-submit__primary">Post reply</button>
+                        <details class="ticket-reply-submit__status-menu">
+                          <summary class="button button--primary ticket-reply-submit__toggle" aria-label="Post reply with a selected ticket status">
+                            <span aria-hidden="true">▾</span>
+                          </summary>
+                          <div class="ticket-reply-submit__menu" role="menu" aria-label="Post reply and set status">
+                            {% for status_definition in ticket_status_definitions %}
+                              <button type="submit" value="{{ status_definition.tech_status }}" class="ticket-reply-submit__menu-item" role="menuitem" onclick="this.form.querySelector('[data-ticket-reply-status-input]').value = this.value;">
+                                {{ status_definition.tech_label }}
+                              </button>
+                            {% endfor %}
+                          </div>
+                        </details>
+                      </div>
+                    {% else %}
+                      <button type="submit" class="button button--primary">Post reply</button>
+                    {% endif %}
+                  </div>
+                </form>
+              {% elif is_watcher %}
+                <p class="text-muted">You're watching this ticket. Reach out to the requester if you need to add further context.</p>
+              {% else %}
+                <p class="text-muted">Only the original requester can reply to this ticket.</p>
+              {% endif %}
+            </div>
+          </article>
+
+          <article class="card card--panel" id="conversation">
+            <header class="card__header">
+              <h2 class="card__title">Conversation history</h2>
+            </header>
+            <div class="card__body">
+              {% if ticket_replies %}
+                <div class="timeline timeline--conversation" data-ticket-timeline data-ticket-id="{{ ticket.id }}">
+                  {% for reply in ticket_replies %}
+                    {% if reply.type == 'call_recording' %}
+                    <article class="timeline__event timeline__event--call-recording" data-recording-id="{{ reply.id }}">
+                      <header class="timeline__header">
+                        <div class="timeline__header-main">
+                          <span class="timeline__timestamp">
+                            {% if reply.created_iso %}
+                              <span data-utc="{{ reply.created_iso }}"></span>
+                            {% else %}
+                              <span class="text-muted">—</span>
+                            {% endif %}
+                          </span>
+                          <span class="timeline__action">
+                            <strong>📞 Call Recording:</strong> {{ reply.caller_name }} → {{ reply.callee_name }}
+                          </span>
+                          {% if reply.time_summary %}
+                            <span class="timeline__meta timeline__meta-group" aria-label="Time spent details">
+                              {% if reply.minutes_spent is not none %}
+                                <span class="timeline__chip timeline__chip--time">
+                                  ⏱️ {{ reply.minutes_spent }} minute{{ 's' if reply.minutes_spent != 1 else '' }}
+                                </span>
+                              {% endif %}
+                              {% if not reply.external_reference %}
+                                <span class="timeline__chip {{ 'timeline__chip--billable' if reply.is_billable else 'timeline__chip--nonbillable' }}">
+                                  {{ 'Billable' if reply.is_billable else 'Non-billable' }}
+                                </span>
+                              {% endif %}
+                              {% if reply.labour_type_name %}
+                                <span class="timeline__chip timeline__chip--labour">{{ reply.labour_type_name }}</span>
+                              {% endif %}
+                            </span>
+                          {% endif %}
+                        </div>
+                      </header>
+                      <div class="timeline__body">
+                        <div class="timeline__message" data-timeline-message>
+                          <p><strong>File:</strong> {{ reply.file_name }}</p>
+                          {% if reply.duration_seconds %}
+                            <p><strong>Duration:</strong> {{ reply.duration_seconds }} seconds</p>
+                          {% endif %}
+                          {% if reply.transcription %}
+                            <div class="timeline__message-content" data-timeline-message-content>
+                              <p><strong>Transcription:</strong></p>
+                              <div class="rich-text-viewer">{{ reply.transcription }}</div>
+                            </div>
+                            <button
+                              type="button"
+                              class="button button--ghost button--small timeline__message-toggle"
+                              data-timeline-message-toggle
+                              data-more-label="Show transcription"
+                              data-less-label="Hide transcription"
+                              hidden
+                              aria-expanded="false"
+                            >
+                              Show transcription
+                            </button>
+                          {% else %}
+                            <p class="text-muted">No transcription available.</p>
+                          {% endif %}
+                        </div>
+                      </div>
+                    </article>
+                    {% else %}
+                    <article class="timeline__event">
+                      <header class="timeline__header">
+                        <div class="timeline__header-main">
+                          <span class="timeline__timestamp">
+                            {% if reply.created_iso %}
+                              <span data-utc="{{ reply.created_iso }}"></span>
+                            {% else %}
+                              <span class="text-muted">—</span>
+                            {% endif %}
+                          </span>
+                          <span class="timeline__action">
+                            {{ reply.author_label }}
+                            {% if reply.is_internal %}
+                              <span class="badge badge--muted">Internal</span>
+                            {% endif %}
+                            {% if reply.has_email_tracking %}
+                              {% set _reply_recipient_count = reply.recipient_count|default(0) %}
+                              {% set _is_multi_recipient = _reply_recipient_count and _reply_recipient_count > 1 %}
+                              {% if reply.is_email_opened %}
+                                {% set _badge_html %}<span class="badge badge--success" title="Email opened {{ reply.email_open_count }} time{{ 's' if reply.email_open_count > 1 else '' }}">✓ Read</span>{% endset %}
+                              {% else %}
+                                {% set _badge_html %}<span class="badge badge--muted" title="Email sent, not yet opened">📧 Sent</span>{% endset %}
+                              {% endif %}
+                              {% if _is_multi_recipient %}
+                                <button
+                                  type="button"
+                                  class="badge-trigger"
+                                  data-email-recipients-trigger
+                                  data-reply-id="{{ reply.id }}"
+                                  data-recipient-count="{{ _reply_recipient_count }}"
+                                  aria-haspopup="dialog"
+                                  aria-controls="email-recipients-modal"
+                                  title="Show per-recipient delivery status ({{ _reply_recipient_count }} recipients)"
+                                >{{ _badge_html|safe }}</button>
+                              {% else %}
+                                {{ _badge_html|safe }}
+                              {% endif %}
+                            {% endif %}
+                          </span>
+                          {% if reply.time_summary %}
+                            <span class="timeline__meta timeline__meta-group" aria-label="Time spent details">
+                              {% if reply.minutes_spent is not none %}
+                                <span class="timeline__chip timeline__chip--time">
+                                  ⏱️ {{ reply.minutes_spent }} minute{{ 's' if reply.minutes_spent != 1 else '' }}
+                                </span>
+                              {% endif %}
+                              {% if not reply.external_reference %}
+                                <span class="timeline__chip {{ 'timeline__chip--billable' if reply.is_billable else 'timeline__chip--nonbillable' }}">
+                                  {{ 'Billable' if reply.is_billable else 'Non-billable' }}
+                                </span>
+                              {% endif %}
+                              {% if reply.labour_type_name %}
+                                <span class="timeline__chip timeline__chip--labour">{{ reply.labour_type_name }}</span>
+                              {% endif %}
+                            </span>
+                          {% endif %}
+                        </div>
+                      </header>
+                      <div class="timeline__body">
+                        {% if reply.has_content %}
+                          <div class="timeline__message" data-timeline-message>
+                            <div class="rich-text-viewer timeline__message-content" data-timeline-message-content>
+                              {{ reply.body_html | safe }}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            class="button button--ghost button--small timeline__message-toggle"
+                            data-timeline-message-toggle
+                            data-more-label="Show more"
+                            data-less-label="Show less"
+                            hidden
+                            aria-expanded="false"
+                          >
+                            Show more
+                          </button>
+                        {% else %}
+                          <p class="text-muted">No content provided.</p>
+                        {% endif %}
+                      </div>
+                    </article>
+                    {% endif %}
+                  {% endfor %}
+                </div>
+              {% else %}
+                <p class="card__empty">No replies have been posted yet.</p>
+              {% endif %}
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  {% include "tickets/_email_recipients_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/purify.min.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/rich_text_editor.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_reply_cache.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/ticket_detail.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/email_recipients.js') }}" defer></script>
+  {% if matrix_chat_enabled and not ticket_chat_room and is_requester %}
+  <script>
+    document.querySelectorAll('[data-start-chat-button]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const ticketId = btn.dataset.ticketId;
+        const ticketSubject = btn.dataset.ticketSubject;
+        btn.disabled = true;
+        btn.textContent = 'Starting chat…';
+        try {
+          const createResp = await fetch('/api/chat/rooms', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': '{{ csrf_token or "" }}' },
+            body: JSON.stringify({ subject: ticketSubject, linked_ticket_id: parseInt(ticketId, 10) }),
+          });
+          if (!createResp.ok) {
+            const err = await createResp.json().catch(() => ({}));
+            throw new Error(err.detail || 'Failed to create chat room');
+          }
+          const room = await createResp.json();
+          const joinResp = await fetch('/api/chat/rooms/' + room.id + '/join', {
+            method: 'POST',
+            headers: { 'X-CSRFToken': '{{ csrf_token or "" }}' },
+          });
+          if (!joinResp.ok) {
+            const err = await joinResp.json().catch(() => ({}));
+            console.warn('Failed to join chat room:', err.detail || joinResp.status);
+          }
+          window.location.href = '/chat/' + room.id;
+        } catch (error) {
+          console.error('Error starting chat:', error);
+          alert(error.message || 'Failed to start chat. Please try again.');
+          btn.disabled = false;
+          btn.textContent = 'Start Chat';
+        }
+      });
+    });
+  </script>
+  {% endif %}
+{% endblock %}

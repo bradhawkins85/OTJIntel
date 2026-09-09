@@ -1,0 +1,141 @@
+import asyncio
+from copy import deepcopy
+
+from app.core.notifications import DEFAULT_NOTIFICATION_EVENTS
+
+from app.services import notifications
+
+
+def test_emit_notification_sends_email(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_get_preference(user_id: int, event_type: str):
+        return {"channel_in_app": True, "channel_email": True, "channel_sms": False}
+
+    async def fake_create_notification(**kwargs):
+        captured["notification"] = kwargs
+
+    async def fake_get_user_by_id(user_id: int):
+        return {"id": user_id, "email": "user@example.com"}
+
+    async def fake_send_email(**kwargs):
+        captured["email"] = kwargs
+        return True, {"id": 1, "status": "succeeded"}
+
+    monkeypatch.setattr(notifications.preferences_repo, "get_preference", fake_get_preference)
+    monkeypatch.setattr(notifications.notifications_repo, "create_notification", fake_create_notification)
+    monkeypatch.setattr(notifications.user_repo, "get_user_by_id", fake_get_user_by_id)
+    monkeypatch.setattr(notifications.email_service, "send_email", fake_send_email)
+    
+    async def fake_get_event_setting(event_type: str):
+        base = deepcopy(DEFAULT_NOTIFICATION_EVENTS.get(event_type, {}))
+        base["event_type"] = event_type
+        return base
+
+    monkeypatch.setattr(
+        notifications.notification_event_settings,
+        "get_event_setting",
+        fake_get_event_setting,
+    )
+
+    asyncio.run(
+        notifications.emit_notification(
+            event_type="system.alert",
+            message="Important update",
+            user_id=5,
+            metadata={"source": "test"},
+        )
+    )
+
+    assert captured["notification"]["event_type"] == "system.alert"
+    assert captured["notification"]["message"] == "Important update"
+    assert captured["notification"]["user_id"] == 5
+    assert captured["email"]["recipients"] == ["user@example.com"]
+    assert "Important update" in captured["email"]["html_body"]
+
+
+def test_emit_notification_sends_sms(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_get_preference(user_id: int, event_type: str):
+        return {"channel_in_app": True, "channel_email": False, "channel_sms": True}
+
+    async def fake_create_notification(**kwargs):
+        captured["notification"] = kwargs
+
+    async def fake_get_user_by_id(user_id: int):
+        return {"id": user_id, "mobile_phone": "+1234567890"}
+
+    async def fake_send_sms(**kwargs):
+        captured["sms"] = kwargs
+        return True
+
+    monkeypatch.setattr(notifications.preferences_repo, "get_preference", fake_get_preference)
+    monkeypatch.setattr(notifications.notifications_repo, "create_notification", fake_create_notification)
+    monkeypatch.setattr(notifications.user_repo, "get_user_by_id", fake_get_user_by_id)
+    monkeypatch.setattr(notifications.sms_service, "send_sms", fake_send_sms)
+
+    async def fake_get_event_setting(event_type: str):
+        base = deepcopy(DEFAULT_NOTIFICATION_EVENTS.get(event_type, {}))
+        base["event_type"] = event_type
+        return base
+
+    monkeypatch.setattr(
+        notifications.notification_event_settings,
+        "get_event_setting",
+        fake_get_event_setting,
+    )
+
+    asyncio.run(
+        notifications.emit_notification(
+            event_type="order.shipped",
+            message="Your order is on the way",
+            user_id=7,
+            metadata={"source": "test"},
+        )
+    )
+
+    assert captured["notification"]["event_type"] == "order.shipped"
+    assert captured["notification"]["user_id"] == 7
+    assert captured["sms"]["message"] == "Your order is on the way"
+    assert captured["sms"]["phone_numbers"] == ["+1234567890"]
+
+
+def test_emit_notification_skips_in_app_for_excluded_event_type(monkeypatch):
+    captured: dict[str, object] = {"created": False}
+
+    async def fake_is_notification_excluded(user_id: int, event_type: str, message: str):
+        assert user_id == 7
+        assert event_type == "order.shipped"
+        return True
+
+    async def fake_get_preference(user_id: int, event_type: str):
+        return {"channel_in_app": True, "channel_email": False, "channel_sms": False}
+
+    async def fake_create_notification(**kwargs):
+        captured["created"] = True
+
+    async def fake_get_event_setting(event_type: str):
+        base = deepcopy(DEFAULT_NOTIFICATION_EVENTS.get(event_type, {}))
+        base["event_type"] = event_type
+        return base
+
+    monkeypatch.setattr(notifications.exclusions_repo, "is_notification_excluded", fake_is_notification_excluded)
+    monkeypatch.setattr(notifications.preferences_repo, "get_preference", fake_get_preference)
+    monkeypatch.setattr(notifications.notifications_repo, "create_notification", fake_create_notification)
+    monkeypatch.setattr(
+        notifications.notification_event_settings,
+        "get_event_setting",
+        fake_get_event_setting,
+    )
+
+    asyncio.run(
+        notifications.emit_notification(
+            event_type="order.shipped",
+            message="Your order is on the way",
+            user_id=7,
+            metadata={"source": "test"},
+        )
+    )
+
+    assert captured["created"] is False

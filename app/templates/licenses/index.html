@@ -1,0 +1,689 @@
+{% extends "base.html" %}
+
+{% block header_title %}Licenses{% endblock %}
+
+{% block title %}Licenses{% endblock %}
+
+{% from "macros/header.html" import page_header_actions %}
+
+{% block header_actions %}
+  {% set lic_actions = [] %}
+  {% if has_m365_credentials %}
+    {% set _ = lic_actions.append({"label": "Sync from Microsoft 365", "type": "button",
+       "attrs": {"data-sync-licenses": ""}}) %}
+  {% endif %}
+  {% if can_manage_sku_mappings %}
+    {% set _ = lic_actions.append({"label": "Manage SKU display names", "type": "button",
+       "attrs": {"data-manage-sku-mappings": ""}}) %}
+  {% endif %}
+  {{ page_header_actions(lic_actions) }}
+{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <header class="panel__header">
+    {% if company %}
+    <div class="panel__meta">
+      <label class="visually-hidden" for="license-filter">Filter licenses</label>
+      <input type="search" id="license-filter" class="input" placeholder="Filter licenses" aria-label="Filter licenses" />
+      <span class="tag">{{ company.name }}</span>
+    </div>
+    {% else %}
+    <div class="panel__meta">
+      <label class="visually-hidden" for="license-filter">Filter licenses</label>
+      <input type="search" id="license-filter" class="input" placeholder="Filter licenses" aria-label="Filter licenses" />
+    </div>
+    {% endif %}
+  </header>
+  <div class="panel__body">
+    <div class="table-responsive">
+      <table class="table" id="licenses-table" data-table data-table-id="licenses" data-license-table>
+        <thead>
+          <tr>
+            <th scope="col" data-column-key="name" data-sort-key="display_name">Name</th>
+            <th scope="col" data-column-key="sku" data-sort-key="sku">SKU</th>
+            <th scope="col" data-column-key="total" data-sort-key="count">Total</th>
+            <th scope="col" data-column-key="allocated" data-sort-key="allocated">Allocated</th>
+            <th scope="col" data-column-key="expiry" data-sort-key="expiry_display">Expiry</th>
+            <th scope="col" data-column-key="auto_renew" data-sort-key="auto_renew">Auto-renew</th>
+            {% if can_order_licenses %}<th scope="col">Actions</th>{% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for license in licenses %}
+          <tr>
+            <td data-column="display_name" data-value="{{ license.display_name or license.name }}">
+              {{ license.display_name or license.name }}
+            </td>
+            <td data-column="sku" data-value="{{ license.platform or '' }}">{{ license.platform or '—' }}</td>
+            <td data-column="count" data-value="{{ license.count }}">{{ license.count }}</td>
+            <td data-column="allocated" data-value="{{ license.allocated }}">
+              <button type="button" class="link" data-license-allocated="{{ license.id }}" data-license-name="{{ license.display_name or license.name }}">{{ license.allocated }}</button>
+            </td>
+            <td data-column="expiry_display" data-value="{{ license.expiry_display or '' }}">{{ license.expiry_display or '—' }}</td>
+            <td data-column="auto_renew" data-value="{{ 'yes' if license.auto_renew else ('no' if license.auto_renew is not none else '') }}">
+              {%- if license.auto_renew is none -%}—
+              {%- elif license.auto_renew -%}<span class="status status--success">Yes</span>
+              {%- else -%}<span class="status status--neutral">No</span>
+              {%- endif -%}
+            </td>
+            {% if can_order_licenses %}
+            <td>
+              {% set row_menu_id = 'license-actions-menu-' ~ license.id %}
+              <div class="header-menu" data-header-menu>
+                <button type="button"
+                        class="button button--ghost button--small header-menu__button"
+                        data-header-menu-toggle
+                        aria-haspopup="menu"
+                        aria-expanded="false"
+                        aria-controls="{{ row_menu_id }}">
+                  <span>Actions</span>
+                  <svg class="header-menu__chevron" aria-hidden="true" viewBox="0 0 20 20" width="14" height="14">
+                    <path fill="currentColor" d="M5.5 7.5 10 12l4.5-4.5z" />
+                  </svg>
+                </button>
+                <div id="{{ row_menu_id }}"
+                     class="header-menu__panel"
+                     role="menu"
+                     data-header-menu-panel
+                     hidden>
+                  <button type="button" class="header-menu__item" role="menuitem" data-license-order="{{ license.id }}">Order more</button>
+                  <button type="button" class="header-menu__item" role="menuitem" data-license-remove="{{ license.id }}">Request removal</button>
+                  <button type="button" class="header-menu__item" role="menuitem" data-license-usage="{{ license.id }}" data-license-name="{{ license.display_name or license.name }}">Usage Tracking</button>
+                </div>
+              </div>
+            </td>
+            {% endif %}
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="{% if can_order_licenses %}8{% else %}7{% endif %}" class="text-center">No licenses recorded for this company yet.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<dialog id="allocated-dialog" class="dialog">
+  <form method="dialog" class="dialog__container">
+    <header class="dialog__header">
+      <h3 class="dialog__title" id="allocated-dialog-title">Assigned users</h3>
+      <button type="submit" class="dialog__close" aria-label="Close">
+        <span aria-hidden="true">&times;</span>
+      </button>
+    </header>
+    <div class="dialog__body">
+      <ul id="allocated-list" class="list"></ul>
+    </div>
+    <footer class="dialog__footer">
+      <button type="submit" class="button">Close</button>
+    </footer>
+  </form>
+</dialog>
+
+{% if can_manage_sku_mappings %}
+<dialog id="sku-mappings-dialog" class="dialog dialog--wide">
+  <form method="dialog" class="dialog__container">
+    <header class="dialog__header">
+      <h3 class="dialog__title">SKU display name mappings</h3>
+      <button type="submit" class="dialog__close" aria-label="Close">
+        <span aria-hidden="true">&times;</span>
+      </button>
+    </header>
+    <div class="dialog__body">
+      <div class="form-grid">
+        <label class="form-field">
+          <span class="form-field__label">SKU</span>
+          <input type="text" class="input" id="new-sku-key" placeholder="e.g. O365_BUSINESS_ESSENTIALS" />
+        </label>
+        <label class="form-field">
+          <span class="form-field__label">Friendly name</span>
+          <input type="text" class="input" id="new-sku-friendly-name" placeholder="e.g. Office 365 Business Essentials" />
+        </label>
+        <label class="form-field">
+          <span class="form-field__label">Hide from licenses table</span>
+          <input type="checkbox" id="new-sku-hidden" />
+        </label>
+      </div>
+      <div class="button-group" style="margin-top: 0.75rem;">
+        <button type="button" class="button button--small" data-sku-add>Save entry</button>
+      </div>
+      <hr />
+      <div class="table-responsive">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">SKU</th>
+              <th scope="col">Friendly name</th>
+              <th scope="col">Hide</th>
+              <th scope="col">Actions</th>
+            </tr>
+          </thead>
+          <tbody data-sku-mapping-table-body>
+            <tr>
+              <td colspan="4" class="text-center">Loading mappings…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <footer class="dialog__footer">
+      <button type="submit" class="button">Close</button>
+    </footer>
+  </form>
+</dialog>
+{% endif %}
+
+<div id="license-toast" class="toast" role="status" aria-live="polite"></div>
+
+<dialog id="usage-tracking-dialog" class="dialog dialog--wide">
+  <form method="dialog" class="dialog__container">
+    <header class="dialog__header">
+      <h3 class="dialog__title" id="usage-tracking-dialog-title">Usage Tracking</h3>
+      <button type="submit" class="dialog__close" aria-label="Close">
+        <span aria-hidden="true">&times;</span>
+      </button>
+    </header>
+    <div class="dialog__body">
+      <p id="usage-tracking-loading" class="form-helper">Loading usage history…</p>
+      <p id="usage-tracking-empty" class="form-helper" hidden>No usage history recorded for this license yet.</p>
+      <div id="usage-tracking-chart-wrapper" hidden>
+        <canvas id="usage-tracking-canvas" width="700" height="280" style="width:100%;height:auto;" aria-label="License usage chart" role="img"></canvas>
+        <div class="button-group" style="margin-top:0.5rem;gap:1rem;justify-content:center;font-size:0.8125rem;">
+          <span style="display:flex;align-items:center;gap:0.375rem;">
+            <span style="display:inline-block;width:2rem;height:3px;background:var(--color-primary,#2563eb);border-radius:2px;"></span> Total licenses
+          </span>
+          <span style="display:flex;align-items:center;gap:0.375rem;">
+            <span style="display:inline-block;width:2rem;height:3px;background:var(--color-success,#16a34a);border-radius:2px;"></span> Allocated
+          </span>
+        </div>
+      </div>
+    </div>
+    <footer class="dialog__footer">
+      <button type="submit" class="button">Close</button>
+    </footer>
+  </form>
+</dialog>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const csrfToken = {{ csrf_token | tojson }};
+    const filterInput = document.getElementById('license-filter');
+    const table = document.querySelector('[data-license-table]');
+    const toast = document.getElementById('license-toast');
+
+    function showToast(message, type = 'info') {
+      if (!toast) return;
+      toast.textContent = message;
+      toast.className = `toast toast--${type}`;
+      toast.setAttribute('aria-hidden', 'false');
+      setTimeout(() => {
+        toast.setAttribute('aria-hidden', 'true');
+      }, 4000);
+    }
+
+    function applyFilter() {
+      if (!filterInput || !table) return;
+      const term = filterInput.value.trim().toLowerCase();
+      const rows = table.tBodies[0].rows;
+      for (const row of rows) {
+        const text = row.textContent.toLowerCase();
+        row.style.display = term && !text.includes(term) ? 'none' : '';
+      }
+    }
+
+    function sortTable(columnKey, ascending) {
+      if (!table) return;
+      const rows = Array.from(table.tBodies[0].rows);
+      const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+      rows.sort((a, b) => {
+        const aCell = a.querySelector(`[data-column='${columnKey}']`);
+        const bCell = b.querySelector(`[data-column='${columnKey}']`);
+        const aText = aCell ? aCell.getAttribute('data-value') || aCell.textContent.trim() : '';
+        const bText = bCell ? bCell.getAttribute('data-value') || bCell.textContent.trim() : '';
+        return ascending ? collator.compare(aText, bText) : collator.compare(bText, aText);
+      });
+      const fragment = document.createDocumentFragment();
+      rows.forEach((row) => fragment.appendChild(row));
+      table.tBodies[0].appendChild(fragment);
+    }
+
+    if (filterInput) {
+      filterInput.addEventListener('input', applyFilter);
+    }
+
+    if (table) {
+      table.querySelectorAll('th[data-sort-key]').forEach((header) => {
+        let ascending = true;
+        header.addEventListener('click', () => {
+          table.querySelectorAll('th[data-sort-key]').forEach((h) => h.removeAttribute('aria-sort'));
+          header.setAttribute('aria-sort', ascending ? 'ascending' : 'descending');
+          sortTable(header.dataset.sortKey, ascending);
+          ascending = !ascending;
+        });
+      });
+    }
+
+    async function handleMutation(url, licenseId, action, quantity) {
+      try {
+        const response = await fetch(url.replace(':id', licenseId), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrfToken || '',
+          },
+          body: JSON.stringify({ quantity }),
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || 'Request failed');
+        }
+        showToast(`License ${action} submitted successfully.`, 'success');
+      } catch (err) {
+        console.error(err);
+        showToast(`Unable to ${action} licenses.`, 'error');
+      }
+    }
+
+    function closeRowMenu() {
+      if (window.MyPortalHeaderMenu && typeof window.MyPortalHeaderMenu.closeAll === 'function') {
+        window.MyPortalHeaderMenu.closeAll();
+      }
+    }
+
+    document.querySelectorAll('[data-license-order]').forEach((button) => {
+      button.addEventListener('click', () => {
+        closeRowMenu();
+        const quantity = window.prompt('How many licenses would you like to order?');
+        const value = parseInt(quantity, 10);
+        if (Number.isNaN(value) || value <= 0) return;
+        handleMutation('/licenses/:id/order', button.dataset.licenseOrder, 'order', value);
+      });
+    });
+
+    document.querySelectorAll('[data-license-remove]').forEach((button) => {
+      button.addEventListener('click', () => {
+        closeRowMenu();
+        const quantity = window.prompt('How many licenses should be removed?');
+        const value = parseInt(quantity, 10);
+        if (Number.isNaN(value) || value <= 0) return;
+        handleMutation('/licenses/:id/remove', button.dataset.licenseRemove, 'remove', value);
+      });
+    });
+
+    const allocatedDialog = document.getElementById('allocated-dialog');
+    const allocatedList = document.getElementById('allocated-list');
+    const allocatedDialogTitle = document.getElementById('allocated-dialog-title');
+
+    async function showLicenseUsers(licenseId, licenseName) {
+      try {
+        const response = await fetch(`/licenses/${licenseId}/allocated`);
+        if (!response.ok) throw new Error('Request failed');
+        const data = await response.json();
+        allocatedList.innerHTML = '';
+        if (allocatedDialogTitle) {
+          allocatedDialogTitle.textContent = licenseName || 'Assigned users';
+        }
+        if (data.length === 0) {
+          const li = document.createElement('li');
+          li.textContent = 'No staff currently allocated.';
+          allocatedList.appendChild(li);
+        } else {
+          data.forEach((member) => {
+            const li = document.createElement('li');
+            li.classList.add('license-allocation-item');
+            if (member.enabled === false) {
+              li.classList.add('license-allocation-item--disabled');
+            } else if (member.is_shared_mailbox) {
+              li.classList.add('license-allocation-item--shared');
+            }
+
+            const name = `${member.first_name || ''} ${member.last_name || ''}`.trim();
+            const email = member.email ? ` (${member.email})` : '';
+            const labels = [];
+            if (member.enabled === false) labels.push('Disabled');
+            if (member.is_shared_mailbox) labels.push('Shared mailbox');
+            const suffix = labels.length ? ` — ${labels.join(', ')}` : '';
+            li.textContent = `${name}${email}${suffix}`.trim();
+            allocatedList.appendChild(li);
+          });
+        }
+        if (typeof allocatedDialog.showModal === 'function') {
+          allocatedDialog.showModal();
+        }
+      } catch (err) {
+        console.error(err);
+        showToast('Unable to load allocation details.', 'error');
+      }
+    }
+
+    document.querySelectorAll('[data-license-allocated]').forEach((button) => {
+      button.addEventListener('click', () => {
+        showLicenseUsers(button.dataset.licenseAllocated, button.dataset.licenseName);
+      });
+    });
+
+    const syncButton = document.querySelector('[data-sync-licenses]');
+    if (syncButton) {
+      syncButton.addEventListener('click', async () => {
+        syncButton.disabled = true;
+        syncButton.textContent = 'Syncing…';
+        try {
+          const response = await fetch('/m365/sync', {
+            method: 'POST',
+            headers: {
+              'X-CSRF-Token': csrfToken || '',
+            },
+          });
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.detail || 'Sync failed');
+          }
+          showToast('Microsoft 365 license sync complete.', 'success');
+          window.setTimeout(() => window.location.reload(), 1500);
+        } catch (err) {
+          console.error(err);
+          showToast(err.message || 'Microsoft 365 sync failed.', 'error');
+        } finally {
+          syncButton.disabled = false;
+          syncButton.textContent = 'Sync from Microsoft 365';
+        }
+      });
+    }
+
+    const skuDialog = document.getElementById('sku-mappings-dialog');
+    const skuTableBody = document.querySelector('[data-sku-mapping-table-body]');
+    const manageSkuButton = document.querySelector('[data-manage-sku-mappings]');
+    const addSkuButton = document.querySelector('[data-sku-add]');
+    const newSkuInput = document.getElementById('new-sku-key');
+    const newFriendlyNameInput = document.getElementById('new-sku-friendly-name');
+    const newSkuHiddenInput = document.getElementById('new-sku-hidden');
+
+    function renderSkuRows(items) {
+      if (!skuTableBody) return;
+      skuTableBody.innerHTML = '';
+      if (!items || items.length === 0) {
+        skuTableBody.innerHTML = '<tr><td colspan="4" class="text-center">No mappings configured.</td></tr>';
+        return;
+      }
+      for (const item of items) {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td><code>${item.sku || ''}</code></td>
+          <td><input type="text" class="input" data-sku-row-name="${item.sku || ''}" value="${(item.friendly_name || '').replace(/"/g, '&quot;')}" /></td>
+          <td><input type="checkbox" data-sku-row-hidden="${item.sku || ''}" ${item.hidden ? 'checked' : ''} /></td>
+          <td>
+            <div class="button-group">
+              <button type="button" class="button button--small" data-sku-row-save="${item.sku || ''}">Save</button>
+              <button type="button" class="button button--secondary button--small" data-sku-row-delete="${item.sku || ''}">Delete</button>
+            </div>
+          </td>
+        `;
+        skuTableBody.appendChild(row);
+      }
+    }
+
+    async function loadSkuMappings() {
+      if (!skuTableBody) return;
+      skuTableBody.innerHTML = '<tr><td colspan="4" class="text-center">Loading mappings…</td></tr>';
+      const response = await fetch('/licenses/sku-mappings');
+      if (!response.ok) {
+        throw new Error('Unable to load mappings');
+      }
+      const payload = await response.json();
+      renderSkuRows(payload.items || []);
+    }
+
+    async function saveSkuMapping(sku, friendlyName, hidden) {
+      const response = await fetch('/licenses/sku-mappings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken || '',
+        },
+        body: JSON.stringify({ sku, friendly_name: friendlyName, hidden }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || 'Unable to save mapping');
+      }
+    }
+
+    async function deleteSkuMapping(sku) {
+      const response = await fetch(`/licenses/sku-mappings/${encodeURIComponent(sku)}`, {
+        method: 'DELETE',
+        headers: {
+          'X-CSRF-Token': csrfToken || '',
+        },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || 'Unable to delete mapping');
+      }
+    }
+
+    if (manageSkuButton && skuDialog) {
+      manageSkuButton.addEventListener('click', async () => {
+        try {
+          await loadSkuMappings();
+          if (typeof skuDialog.showModal === 'function') {
+            skuDialog.showModal();
+          }
+        } catch (err) {
+          console.error(err);
+          showToast('Unable to load SKU mappings.', 'error');
+        }
+      });
+    }
+
+    if (addSkuButton) {
+      addSkuButton.addEventListener('click', async () => {
+        const sku = (newSkuInput?.value || '').trim().toUpperCase();
+        const friendlyName = (newFriendlyNameInput?.value || '').trim();
+        const hidden = Boolean(newSkuHiddenInput?.checked);
+        if (!sku || !friendlyName) {
+          showToast('SKU and friendly name are required.', 'error');
+          return;
+        }
+        try {
+          await saveSkuMapping(sku, friendlyName, hidden);
+          if (newSkuInput) newSkuInput.value = '';
+          if (newFriendlyNameInput) newFriendlyNameInput.value = '';
+          if (newSkuHiddenInput) newSkuHiddenInput.checked = false;
+          await loadSkuMappings();
+          showToast('SKU mapping saved.', 'success');
+        } catch (err) {
+          console.error(err);
+          showToast('Unable to save SKU mapping.', 'error');
+        }
+      });
+    }
+
+    if (skuTableBody) {
+      skuTableBody.addEventListener('click', async (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+
+        const saveSku = target.getAttribute('data-sku-row-save');
+        if (saveSku) {
+          const input = skuTableBody.querySelector(`[data-sku-row-name="${saveSku}"]`);
+          const hiddenInput = skuTableBody.querySelector(`[data-sku-row-hidden="${saveSku}"]`);
+          const friendlyName = input instanceof HTMLInputElement ? input.value.trim() : '';
+          const hidden = hiddenInput instanceof HTMLInputElement ? hiddenInput.checked : false;
+          if (!friendlyName) {
+            showToast('Friendly name cannot be empty.', 'error');
+            return;
+          }
+          try {
+            await saveSkuMapping(saveSku, friendlyName, hidden);
+            showToast('SKU mapping updated.', 'success');
+          } catch (err) {
+            console.error(err);
+            showToast('Unable to update SKU mapping.', 'error');
+          }
+          return;
+        }
+
+        const deleteSku = target.getAttribute('data-sku-row-delete');
+        if (deleteSku) {
+          if (!window.confirm(`Delete mapping for ${deleteSku}?`)) return;
+          try {
+            await deleteSkuMapping(deleteSku);
+            await loadSkuMappings();
+            showToast('SKU mapping removed.', 'success');
+          } catch (err) {
+            console.error(err);
+            showToast('Unable to delete SKU mapping.', 'error');
+          }
+        }
+      });
+    }
+
+    // ── Usage Tracking ─────────────────────────────────────────────────────
+    const usageDialog = document.getElementById('usage-tracking-dialog');
+    const usageDialogTitle = document.getElementById('usage-tracking-dialog-title');
+    const usageLoading = document.getElementById('usage-tracking-loading');
+    const usageEmpty = document.getElementById('usage-tracking-empty');
+    const usageChartWrapper = document.getElementById('usage-tracking-chart-wrapper');
+    const usageCanvas = document.getElementById('usage-tracking-canvas');
+
+    // Cache CSS custom-property values once to avoid repeated getComputedStyle calls.
+    const _rootStyle = getComputedStyle(document.documentElement);
+    const _chartGridColor = (_rootStyle.getPropertyValue('--color-border') || '#e2e8f0').trim();
+    const _chartPrimaryColor = (_rootStyle.getPropertyValue('--color-primary') || '#2563eb').trim();
+    const _chartSuccessColor = (_rootStyle.getPropertyValue('--color-success') || '#16a34a').trim();
+
+    function drawUsageChart(history) {
+      if (!usageCanvas || !(usageCanvas instanceof HTMLCanvasElement)) return;
+      const ctx = usageCanvas.getContext('2d');
+      if (!ctx) return;
+
+      const W = usageCanvas.width;
+      const H = usageCanvas.height;
+      const PAD = { top: 24, right: 24, bottom: 48, left: 48 };
+      const chartW = W - PAD.left - PAD.right;
+      const chartH = H - PAD.top - PAD.bottom;
+
+      ctx.clearRect(0, 0, W, H);
+
+      const counts = history.map((d) => d.count);
+      const allocateds = history.map((d) => d.allocated);
+      const maxVal = Math.max(...counts, ...allocateds, 1);
+      const dates = history.map((d) => new Date(d.recorded_at));
+      const minTime = dates[0].getTime();
+      // When there is only one data point spread it across the full chart width.
+      const maxTime = dates.length > 1 ? dates[dates.length - 1].getTime() : minTime;
+      const timeRange = maxTime - minTime || chartW;
+
+      const xOf = (i) => {
+        if (dates.length === 1) return PAD.left + chartW / 2;
+        return PAD.left + ((dates[i].getTime() - minTime) / timeRange) * chartW;
+      };
+      const yOf = (val) => PAD.top + chartH - (val / maxVal) * chartH;
+
+      // Grid lines
+      ctx.strokeStyle = _chartGridColor;
+      ctx.lineWidth = 1;
+      const gridSteps = 4;
+      for (let i = 0; i <= gridSteps; i++) {
+        const y = PAD.top + (chartH / gridSteps) * i;
+        ctx.beginPath();
+        ctx.moveTo(PAD.left, y);
+        ctx.lineTo(PAD.left + chartW, y);
+        ctx.stroke();
+        const label = Math.round(maxVal - (maxVal / gridSteps) * i);
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px system-ui,sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillText(label, PAD.left - 6, y + 4);
+      }
+
+      function drawLine(values, color) {
+        if (values.length === 0) return;
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2.5;
+        ctx.lineJoin = 'round';
+        values.forEach((val, i) => {
+          const x = xOf(i);
+          const y = yOf(val);
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        // Dots
+        ctx.fillStyle = color;
+        values.forEach((val, i) => {
+          ctx.beginPath();
+          ctx.arc(xOf(i), yOf(val), 4, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+
+      drawLine(counts, _chartPrimaryColor);
+      drawLine(allocateds, _chartSuccessColor);
+
+      // X-axis date labels
+      ctx.fillStyle = '#64748b';
+      ctx.font = '11px system-ui,sans-serif';
+      ctx.textAlign = 'center';
+      if (dates.length === 1) {
+        const label = dates[0].toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        ctx.fillText(label, xOf(0), PAD.top + chartH + 18);
+      } else {
+        const labelCount = Math.min(dates.length, 6);
+        const step = Math.max(1, Math.floor(dates.length / labelCount));
+        for (let i = 0; i < dates.length; i += step) {
+          const label = dates[i].toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+          ctx.fillText(label, xOf(i), PAD.top + chartH + 18);
+        }
+        // Always label the last point if not already covered.
+        const last = dates.length - 1;
+        if (last % step !== 0) {
+          const label = dates[last].toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+          ctx.fillText(label, xOf(last), PAD.top + chartH + 18);
+        }
+      }
+    }
+
+    async function showUsageTracking(licenseId, licenseName) {
+      if (!usageDialog) return;
+      if (usageDialogTitle) usageDialogTitle.textContent = `Usage Tracking — ${licenseName || 'License'}`;
+      if (usageLoading) usageLoading.hidden = false;
+      if (usageEmpty) usageEmpty.hidden = true;
+      if (usageChartWrapper) usageChartWrapper.hidden = true;
+      if (typeof usageDialog.showModal === 'function') {
+        usageDialog.showModal();
+      }
+      try {
+        const response = await fetch(`/api/licenses/${licenseId}/usage-history`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const history = await response.json();
+        if (usageLoading) usageLoading.hidden = true;
+        if (!history || history.length === 0) {
+          if (usageEmpty) usageEmpty.hidden = false;
+          return;
+        }
+        if (usageChartWrapper) usageChartWrapper.hidden = false;
+        drawUsageChart(history);
+      } catch (err) {
+        console.error(err);
+        if (usageLoading) {
+          usageLoading.textContent = 'Unable to load usage history. Please try again.';
+          usageLoading.hidden = false;
+        }
+      }
+    }
+
+    document.querySelectorAll('[data-license-usage]').forEach((button) => {
+      button.addEventListener('click', () => {
+        closeRowMenu();
+        showUsageTracking(button.dataset.licenseUsage, button.dataset.licenseName);
+      });
+    });
+  })();
+</script>
+{% endblock %}

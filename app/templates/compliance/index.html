@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+
+{% block header_title %}Compliance{% endblock %}
+
+{% block title %}Essential 8 Compliance{% endblock %}
+
+{% block content %}
+<div class="management management--single compliance" data-layout>
+  <section class="management__content">
+    <header class="management__header compliance__header">
+      <div>
+        <h1 class="management__title">Essential 8 compliance</h1>
+        <p class="management__subtitle">Track compliance with Australian Cyber Security Centre Essential 8 framework.</p>
+      </div>
+      {% if company %}
+      <div class="management__header-actions compliance__header-actions">
+        <span class="tag tag--muted">{{ company.name }}</span>
+      </div>
+      {% endif %}
+    </header>
+
+    <div class="card card--panel compliance-summary-card">
+      <div class="compliance-summary__grid">
+        <div class="compliance-summary__item compliance-summary__item--accent">
+          <span class="compliance-summary__label">Compliance rate</span>
+          <span class="compliance-summary__value">{{ summary.compliance_percentage }}%</span>
+          <span class="compliance-summary__hint">{{ summary.compliant }} of {{ summary.total_controls }} controls</span>
+        </div>
+        <div class="compliance-summary__item">
+          <span class="compliance-summary__label">In progress</span>
+          <span class="compliance-summary__value">{{ summary.in_progress }}</span>
+        </div>
+        <div class="compliance-summary__item">
+          <span class="compliance-summary__label">Not started</span>
+          <span class="compliance-summary__value">{{ summary.not_started }}</span>
+        </div>
+        <div class="compliance-summary__item">
+          <span class="compliance-summary__label">Avg. maturity</span>
+          <span class="compliance-summary__value">ML{{ summary.average_maturity_level }}</span>
+        </div>
+      </div>
+    </div>
+    <div class="card card--panel compliance-table-card">
+      <header class="card__header">
+        <div class="card__controls">
+          <input
+            type="search"
+            id="compliance-filter"
+            class="form-input"
+            placeholder="Filter controls"
+            aria-label="Filter controls"
+          />
+        </div>
+      </header>
+      <div class="table-wrapper">
+        <table class="table compliance-table" data-compliance-table>
+          <thead>
+            <tr>
+              <th scope="col" style="width: 4%">#</th>
+              <th scope="col" style="width: 26%">Control</th>
+              <th scope="col" style="width: 16%">ML1</th>
+              <th scope="col" style="width: 16%">ML2</th>
+              <th scope="col" style="width: 16%">ML3</th>
+              <th scope="col" style="width: 10%">Last reviewed</th>
+              <th scope="col" style="width: 12%">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for record in compliance_records %}
+            <tr data-record-id="{{ record.id }}" data-status="{{ record.status }}">
+              <td>{{ record.control.control_order }}</td>
+              <td>
+                <div class="compliance-table__control">
+                  <span class="compliance-table__control-title">{{ record.control.name }}</span>
+                  {% set control_description = record.control.description or '' %}
+                  {% if control_description %}
+                  <p class="compliance-table__description">
+                    {{ control_description[:100] }}{% if control_description|length > 100 %}…{% endif %}
+                  </p>
+                  {% endif %}
+                </div>
+              </td>
+              <td>
+                <span class="badge badge--status-{{ record.ml1_status }}">
+                  {% if record.ml1_status == 'not_started' %}Not started
+                  {% elif record.ml1_status == 'in_progress' %}In progress
+                  {% elif record.ml1_status == 'compliant' %}Compliant
+                  {% elif record.ml1_status == 'non_compliant' %}Non-compliant
+                  {% else %}Not started{% endif %}
+                </span>
+              </td>
+              <td>
+                <span class="badge badge--status-{{ record.ml2_status }}">
+                  {% if record.ml2_status == 'not_started' %}Not started
+                  {% elif record.ml2_status == 'in_progress' %}In progress
+                  {% elif record.ml2_status == 'compliant' %}Compliant
+                  {% elif record.ml2_status == 'non_compliant' %}Non-compliant
+                  {% else %}Not started{% endif %}
+                </span>
+              </td>
+              <td>
+                <span class="badge badge--status-{{ record.ml3_status }}">
+                  {% if record.ml3_status == 'not_started' %}Not started
+                  {% elif record.ml3_status == 'in_progress' %}In progress
+                  {% elif record.ml3_status == 'compliant' %}Compliant
+                  {% elif record.ml3_status == 'non_compliant' %}Non-compliant
+                  {% else %}Not started{% endif %}
+                </span>
+              </td>
+              <td>{{ record.last_reviewed_date or '—' }}</td>
+              <td>
+                <div class="compliance-table__actions">
+                  <a href="/compliance/control/{{ record.control_id }}" class="button button--ghost button--small">
+                    View requirements
+                  </a>
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="7" class="table__empty">
+                No compliance records found.
+                {% if is_super_admin %}
+                <button type="button" class="button button--ghost button--small" id="initialize-compliance">Initialize controls</button>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const companyId = {{ (company.id if company else None) | tojson }};
+  const csrfToken = getCsrfToken();
+
+  // Initialise compliance controls when no records exist
+  const initBtn = document.getElementById('initialize-compliance');
+  if (initBtn && companyId) {
+    initBtn.addEventListener('click', async () => {
+      try {
+        const response = await fetch(`/api/essential8/companies/${companyId}/compliance/initialize`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrfToken
+          }
+        });
+        if (response.ok) {
+          window.location.reload();
+        } else {
+          alert('Failed to initialize compliance controls');
+        }
+      } catch (error) {
+        console.error('Error:', error);
+        alert('Failed to initialize compliance controls');
+      }
+    });
+  }
+
+  // Filter functionality
+  const filterInput = document.getElementById('compliance-filter');
+  if (filterInput) {
+    filterInput.addEventListener('input', (e) => {
+      const filterValue = e.target.value.toLowerCase();
+      const rows = document.querySelectorAll('[data-compliance-table] tbody tr');
+
+      rows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.includes(filterValue) ? '' : 'none';
+      });
+    });
+  }
+
+  function getCsrfToken() {
+    return document.cookie
+      .split('; ')
+      .find(row => row.startsWith('myportal_session_csrf='))
+      ?.split('=')[1] || '';
+  }
+});
+</script>
+{% endblock %}

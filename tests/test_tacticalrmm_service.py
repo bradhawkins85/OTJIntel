@@ -1,0 +1,667 @@
+import asyncio
+import pytest
+
+from app.services import tacticalrmm
+
+
+def test_extract_agent_details_includes_all_unique_mac_addresses():
+    agent = {
+        "hostname": "MULTI-NIC",
+        "mac_addresses": ["00-11-22-33-44-55", "00:11:22:33:44:55"],
+        "wmi_detail": {
+            "network_config": [
+                {"MACAddress": "AA:BB:CC:DD:EE:FF"},
+                {"PhysicalAddress": "112233445566"},
+                {"MACAddress": "00:00:00:00:00:00"},
+            ]
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["mac_address"] == (
+        "00:11:22:33:44:55,AA:BB:CC:DD:EE:FF,11:22:33:44:55:66"
+    )
+
+
+def test_extract_agent_page_handles_beta_results():
+    response = {
+        "count": 1,
+        "next": None,
+        "previous": None,
+        "results": [
+            {
+                "id": 20,
+                "hostname": "BJP-LAB-ACQ1",
+                "agent_id": "OEBIMTvujlppgOaNxYerEVowqDstjsGeNKCsnSSz",
+                "operating_system": "Windows 10 Pro",
+            }
+        ],
+    }
+
+    items, next_endpoint = tacticalrmm._extract_agent_page(response, "https://example.com")
+
+    assert len(items) == 1
+    assert items[0]["hostname"] == "BJP-LAB-ACQ1"
+    assert next_endpoint is None
+
+
+def test_extract_agent_details_handles_beta_agent_payload():
+    agent = {
+        "id": 20,
+        "hostname": "BJP-LAB-ACQ1",
+        "agent_id": "OEBIMTvujlppgOaNxYerEVowqDstjsGeNKCsnSSz",
+        "operating_system": "Windows 10 Pro, 64 bit v22H2 (build 19045.6456)",
+        "last_seen": "2025-11-04T02:40:20.840228Z",
+        "boot_time": "2025-11-03T08:15:00Z",
+        "plat": "windows",
+        "services": [],
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["name"] == "BJP-LAB-ACQ1"
+    assert details["os_name"] == "Windows 10 Pro, 64 bit v22H2 (build 19045.6456)"
+    assert details["tactical_asset_id"] == "OEBIMTvujlppgOaNxYerEVowqDstjsGeNKCsnSSz"
+    assert details["last_sync"] == "2025-11-04T02:40:20.840228Z"
+    assert details["boot_time"] == "2025-11-03T08:15:00Z"
+
+
+def test_extract_agent_details_joins_cpu_model_list():
+    """cpu_model from the real TacticalRMM API is a list – it should be joined."""
+    agent = {
+        "hostname": "WORKSTATION-01",
+        "agent_id": "abc123",
+        "cpu_model": ["Intel Core i7-8700, 6C/12T", "Intel Core i7-8700, 6C/12T"],
+        "operating_system": "Windows 10 Pro",
+        "monitoring_type": "workstation",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["cpu_name"] == "Intel Core i7-8700, 6C/12T, Intel Core i7-8700, 6C/12T"
+
+
+def test_extract_agent_details_single_cpu_model_string():
+    """A plain string cpu_model should be passed through unchanged."""
+    agent = {
+        "hostname": "SERVER-01",
+        "agent_id": "def456",
+        "cpu_model": "AMD EPYC 7302",
+        "operating_system": "Ubuntu 22.04",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["cpu_name"] == "AMD EPYC 7302"
+
+
+def test_extract_agent_details_uses_logged_in_username():
+    """logged_in_username is the underlying model field – it should map to last_user."""
+    agent = {
+        "hostname": "PC-ALICE",
+        "agent_id": "ghi789",
+        "logged_in_username": "alice",
+        "operating_system": "Windows 11",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["last_user"] == "alice"
+
+
+def test_extract_agent_details_uses_logged_username_computed_field():
+    """logged_username is the serialiser-computed field returned by the list endpoint."""
+    agent = {
+        "hostname": "PC-BOB",
+        "agent_id": "jkl012",
+        "logged_username": "bob",
+        "operating_system": "Windows 10",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["last_user"] == "bob"
+
+
+def test_extract_agent_details_ignores_placeholder_username():
+    """The sentinel value '-' emitted by the serialiser means no user is logged in."""
+    agent = {
+        "hostname": "PC-EMPTY",
+        "agent_id": "mno345",
+        "logged_username": "-",
+        "operating_system": "Windows 10",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["last_user"] is None
+
+
+def test_extract_agent_details_ignores_none_string_username():
+    """logged_in_username can hold the literal string 'None' in TacticalRMM."""
+    agent = {
+        "hostname": "PC-NONE",
+        "agent_id": "pqr678",
+        "logged_in_username": "None",
+        "operating_system": "Windows 10",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["last_user"] is None
+
+
+def test_extract_agent_details_joins_physical_disks():
+    """physical_disks is a list in the real TacticalRMM API – entries should be joined."""
+    agent = {
+        "hostname": "SERVER-DISK",
+        "agent_id": "stu901",
+        "physical_disks": [
+            "WDC WD10EZEX-08WN4A0 931GB SATA",
+            "Samsung SSD 860 EVO 500GB SATA",
+        ],
+        "operating_system": "Windows Server 2019",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["hdd_size"] == "WDC WD10EZEX-08WN4A0 931GB SATA | Samsung SSD 860 EVO 500GB SATA"
+
+
+def test_extract_agent_details_prefers_total_disk_over_physical_disks():
+    """total_disk should take precedence over physical_disks when both are present."""
+    agent = {
+        "hostname": "SERVER-PRIO",
+        "agent_id": "vwx234",
+        "total_disk": "2 TB",
+        "physical_disks": ["Some Disk 1TB SATA"],
+        "operating_system": "Windows Server 2022",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["hdd_size"] == "2 TB"
+
+
+def test_extract_agent_details_total_ram_field():
+    """total_ram is the real TacticalRMM model field (in MB) – it should map to ram_gb."""
+    agent = {
+        "hostname": "SERVER-RAM",
+        "agent_id": "yz0123",
+        "total_ram": 32768,  # 32 GB in MB
+        "operating_system": "Windows Server 2022",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["ram_gb"] == pytest.approx(32.0)
+
+
+def test_extract_agent_details_full_table_serialiser_payload():
+    """Simulate the full AgentTableSerializer payload from /agents/ endpoint."""
+    agent = {
+        "agent_id": "OEBIMTvujlppgOaNxYerEVowqDstjsGeNKCsnSSz",
+        "hostname": "BJP-LAB-ACQ1",
+        "monitoring_type": "workstation",
+        "operating_system": "Windows 10 Pro, 64 bit v22H2 (build 19045.6456)",
+        "serial_number": "SN-ABC-12345",
+        "cpu_model": ["Intel Core i7-8700, 6C/12T"],
+        "total_ram": 16384,
+        "physical_disks": ["WDC WD10EZEX-08WN4A0 931GB SATA"],
+        "last_seen": "2025-11-04T02:40:20.840228Z",
+        "status": "online",
+        "logged_username": "jdoe",
+        "make_model": "Dell OptiPlex 7090",
+        "public_ip": "1.2.3.4",
+        "plat": "windows",
+        "site_name": "Head Office",
+        "client_name": "Acme Corp",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["name"] == "BJP-LAB-ACQ1"
+    assert details["type"] == "workstation"
+    assert details["serial_number"] == "SN-ABC-12345"
+    assert details["os_name"] == "Windows 10 Pro, 64 bit v22H2 (build 19045.6456)"
+    assert details["cpu_name"] == "Intel Core i7-8700, 6C/12T"
+    assert details["ram_gb"] == pytest.approx(16.0)
+    assert details["hdd_size"] == "WDC WD10EZEX-08WN4A0 931GB SATA"
+    assert details["last_sync"] == "2025-11-04T02:40:20.840228Z"
+    assert details["status"] == "online"
+    assert details["last_user"] == "jdoe"
+    assert details["tactical_asset_id"] == "OEBIMTvujlppgOaNxYerEVowqDstjsGeNKCsnSSz"
+    assert details["site_name"] == "Head Office"
+    assert details["client_name"] == "Acme Corp"
+
+
+@pytest.mark.parametrize("serial_number", [None, "", "To Be Filled By O.E.M."])
+def test_extract_agent_details_falls_back_to_motherboard_serial(serial_number):
+    agent = {
+        "hostname": "OEM-PC",
+        "serial_number": serial_number,
+        "wmi_detail": {
+            "motherboard": [[{"Manufacturer": "OEM", "SerialNumber": "BOARD-123"}]]
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["serial_number"] == "BOARD-123"
+
+
+def test_extract_agent_details_keeps_valid_device_serial():
+    agent = {
+        "hostname": "SERIAL-PC",
+        "serial_number": "DEVICE-456",
+        "wmi_detail": {"motherboard_serial_number": "BOARD-123"},
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["serial_number"] == "DEVICE-456"
+
+
+def test_extract_agent_details_ignores_processor_id_and_uses_physicaldrive0():
+    agent = {
+        "hostname": "CPU-ID-PC",
+        "serial_number": "",
+        "wmi_detail": {
+            "motherboard": [[{"SerialNumber": ""}]],
+            "cpu": [[{"Name": "Intel CPU"}, {"ProcessorId": "CPU-ABC-123"}]],
+            "disks": [
+                [
+                    {"DeviceID": r"\\.\PHYSICALDRIVE0"},
+                    {"SerialNumber": "DISK-456"},
+                ]
+            ],
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["serial_number"] == "DISK-456"
+
+
+def test_extract_agent_details_falls_back_to_physicaldrive0_after_motherboard():
+    agent = {
+        "hostname": "DISK-ID-PC",
+        "serial_number": None,
+        "wmi_detail": {
+            "motherboard": [[{"SerialNumber": None}]],
+            "physical_disks": [
+                [
+                    {"DeviceID": r"\\.\PHYSICALDRIVE1"},
+                    {"SerialNumber": "WRONG-DISK"},
+                ],
+                [
+                    {"DeviceID": r"\\.\PHYSICALDRIVE0"},
+                    {"SerialNumber": "SYSTEM-DISK-789"},
+                ],
+            ],
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["serial_number"] == "SYSTEM-DISK-789"
+
+
+def test_extract_agent_details_reads_explicit_machine_type():
+    agent = {
+        "hostname": "VM-EXPLICIT",
+        "agent_id": "vm-explicit",
+        "machine_type": "Virtual Machine",
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["machine_type"] == "Virtual"
+
+
+def test_extract_agent_details_infers_virtual_machine_from_model():
+    agent = {
+        "hostname": "VM-MODEL",
+        "agent_id": "vm-model",
+        "wmi_detail": {
+            "manufacturer": "VMware, Inc.",
+            "model": "VMware Virtual Platform",
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["machine_type"] == "Virtual"
+
+
+def test_extract_agent_details_reads_physical_machine_boolean():
+    agent = {
+        "hostname": "PHYSICAL-BOOLEAN",
+        "agent_id": "physical-boolean",
+        "is_virtual": False,
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["machine_type"] == "Physical"
+
+
+# Tests for fetch_clients function
+
+def test_fetch_clients_handles_list_response(monkeypatch):
+    """Test that fetch_clients correctly parses a list response from /beta/v1/client."""
+    # Mock the _call_endpoint function to return a list of clients
+    async def fake_call_endpoint(endpoint: str):
+        return [
+            {
+                "id": 1,
+                "name": "Acme Corporation",
+                "created_time": "2025-11-06T12:10:17.155Z",
+                "modified_time": "2025-11-06T12:10:17.155Z",
+            },
+            {
+                "id": 2,
+                "name": "Beta Industries",
+                "created_time": "2025-11-05T10:00:00.000Z",
+                "modified_time": "2025-11-05T10:00:00.000Z",
+            },
+        ]
+    
+    monkeypatch.setattr(tacticalrmm, "_call_endpoint", fake_call_endpoint)
+    
+    # Need to also mock _load_settings since fetch_clients calls it
+    async def fake_load_settings():
+        return {
+            "base_url": "https://api.example.com",
+            "api_key": "test-key",
+            "verify_ssl": True,
+        }
+    
+    monkeypatch.setattr(tacticalrmm, "_load_settings", fake_load_settings)
+    
+    # Run the test
+    # asyncio imported at module level
+    clients = asyncio.run(tacticalrmm.fetch_clients())
+    
+    assert len(clients) == 2
+    assert clients[0]["id"] == 1
+    assert clients[0]["name"] == "Acme Corporation"
+    assert clients[1]["id"] == 2
+    assert clients[1]["name"] == "Beta Industries"
+
+
+def test_fetch_clients_handles_paginated_response(monkeypatch):
+    """Test that fetch_clients correctly parses a paginated response with 'results' key."""
+    # Mock the _call_endpoint function to return a paginated response
+    async def fake_call_endpoint(endpoint: str):
+        return {
+            "count": 2,
+            "next": None,
+            "previous": None,
+            "results": [
+                {
+                    "id": 10,
+                    "name": "Company One",
+                },
+                {
+                    "id": 20,
+                    "name": "Company Two",
+                },
+            ],
+        }
+    
+    monkeypatch.setattr(tacticalrmm, "_call_endpoint", fake_call_endpoint)
+    
+    # Mock _load_settings
+    async def fake_load_settings():
+        return {
+            "base_url": "https://api.example.com",
+            "api_key": "test-key",
+            "verify_ssl": True,
+        }
+    
+    monkeypatch.setattr(tacticalrmm, "_load_settings", fake_load_settings)
+    
+    # Run the test
+    # asyncio imported at module level
+    clients = asyncio.run(tacticalrmm.fetch_clients())
+    
+    assert len(clients) == 2
+    assert clients[0]["id"] == 10
+    assert clients[0]["name"] == "Company One"
+    assert clients[1]["id"] == 20
+    assert clients[1]["name"] == "Company Two"
+
+
+def test_fetch_clients_handles_single_client_response(monkeypatch):
+    """Test that fetch_clients correctly parses a single client object response."""
+    # Mock the _call_endpoint function to return a single client
+    async def fake_call_endpoint(endpoint: str):
+        return {
+            "id": 5,
+            "name": "Solo Company",
+            "created_time": "2025-11-06T12:10:17.155Z",
+        }
+    
+    monkeypatch.setattr(tacticalrmm, "_call_endpoint", fake_call_endpoint)
+    
+    # Mock _load_settings
+    async def fake_load_settings():
+        return {
+            "base_url": "https://api.example.com",
+            "api_key": "test-key",
+            "verify_ssl": True,
+        }
+    
+    monkeypatch.setattr(tacticalrmm, "_load_settings", fake_load_settings)
+    
+    # Run the test
+    # asyncio imported at module level
+    clients = asyncio.run(tacticalrmm.fetch_clients())
+    
+    assert len(clients) == 1
+    assert clients[0]["id"] == 5
+    assert clients[0]["name"] == "Solo Company"
+
+
+def test_fetch_clients_handles_api_error(monkeypatch):
+    """Test that fetch_clients returns empty list on API error."""
+    # Mock the _call_endpoint function to raise an error
+    async def fake_call_endpoint(endpoint: str):
+        raise tacticalrmm.TacticalRMMAPIError("API request failed")
+    
+    monkeypatch.setattr(tacticalrmm, "_call_endpoint", fake_call_endpoint)
+    
+    # Mock _load_settings
+    async def fake_load_settings():
+        return {
+            "base_url": "https://api.example.com",
+            "api_key": "test-key",
+            "verify_ssl": True,
+        }
+    
+    monkeypatch.setattr(tacticalrmm, "_load_settings", fake_load_settings)
+    
+    # Run the test
+    # asyncio imported at module level
+    clients = asyncio.run(tacticalrmm.fetch_clients())
+    
+    assert len(clients) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for _ram_gb_from_wmi_memory
+# ---------------------------------------------------------------------------
+
+def test_ram_gb_from_wmi_memory_two_dimms():
+    """Two 8 GB DIMMs (each 8 589 934 592 bytes) should give 16.0 GB."""
+    memory = [
+        [{"Capacity": "8589934592"}, {"SerialNumber": "AAAA"}],
+        [{"Capacity": "8589934592"}, {"SerialNumber": "BBBB"}],
+    ]
+    assert tacticalrmm._ram_gb_from_wmi_memory(memory) == pytest.approx(16.0)
+
+
+def test_ram_gb_from_wmi_memory_single_dimm():
+    """Single 16 GB DIMM."""
+    memory = [[{"Capacity": "17179869184"}]]
+    assert tacticalrmm._ram_gb_from_wmi_memory(memory) == pytest.approx(16.0)
+
+
+def test_ram_gb_from_wmi_memory_empty_list():
+    assert tacticalrmm._ram_gb_from_wmi_memory([]) is None
+
+
+def test_ram_gb_from_wmi_memory_none():
+    assert tacticalrmm._ram_gb_from_wmi_memory(None) is None
+
+
+def test_ram_gb_from_wmi_memory_missing_capacity():
+    """Modules without a Capacity key are silently skipped."""
+    memory = [[{"SerialNumber": "XXXX"}]]
+    assert tacticalrmm._ram_gb_from_wmi_memory(memory) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for _coerce_ram_gb boundary: exactly 1 GB (1024 MB)
+# ---------------------------------------------------------------------------
+
+def test_coerce_ram_gb_exactly_1024_mb():
+    """1024 MB should be treated as 1 GB (>= 1024 threshold)."""
+    assert tacticalrmm._coerce_ram_gb(1024) == pytest.approx(1.0)
+
+
+def test_coerce_ram_gb_2048_mb():
+    assert tacticalrmm._coerce_ram_gb(2048) == pytest.approx(2.0)
+
+
+def test_coerce_ram_gb_already_in_gb():
+    """Values under 1024 are treated as already in GB."""
+    assert tacticalrmm._coerce_ram_gb(16) == pytest.approx(16.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests for extract_agent_details using wmi_detail memory
+# ---------------------------------------------------------------------------
+
+def test_extract_agent_details_ram_from_wmi_detail_memory():
+    """When total_ram is absent but wmi_detail.memory is present, RAM is extracted
+    from the per-module Capacity (bytes) values."""
+    agent = {
+        "hostname": "WMI-RAM-HOST",
+        "agent_id": "wmi001",
+        "operating_system": "Windows 10 Pro",
+        "wmi_detail": {
+            "memory": [
+                [{"Capacity": "8589934592"}],
+                [{"Capacity": "8589934592"}],
+            ]
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["ram_gb"] == pytest.approx(16.0)
+
+
+def test_extract_agent_details_total_ram_preferred_over_wmi_memory():
+    """total_ram (in MB) should take precedence over wmi_detail.memory."""
+    agent = {
+        "hostname": "PREFER-TOTAL-RAM",
+        "agent_id": "prefer001",
+        "operating_system": "Windows Server 2022",
+        "total_ram": 32768,  # 32 GB in MB
+        "wmi_detail": {
+            "memory": [
+                [{"Capacity": "8589934592"}],  # only 8 GB via wmi_detail
+            ]
+        },
+    }
+
+    details = tacticalrmm.extract_agent_details(agent)
+
+    assert details["ram_gb"] == pytest.approx(32.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests for fetch_agents enrichment with per-agent detail endpoint
+# ---------------------------------------------------------------------------
+
+def test_fetch_agents_enriches_with_total_ram(monkeypatch):
+    """fetch_agents should call the per-agent detail endpoint for each agent
+    and merge total_ram into the result so that extract_agent_details can
+    produce the correct ram_gb value."""
+
+    list_response = [
+        {
+            "agent_id": "agent-001",
+            "hostname": "PC-ONE",
+            "monitoring_type": "workstation",
+            "operating_system": "Windows 10 Pro",
+            # total_ram intentionally absent – simulates real AgentTableSerializer
+        }
+    ]
+
+    detail_response = {
+        "agent_id": "agent-001",
+        "hostname": "PC-ONE",
+        "monitoring_type": "workstation",
+        "operating_system": "Windows 10 Pro",
+        "total_ram": 8192,  # 8 GB in MB – present in AgentSerializer detail
+    }
+
+    call_count = {"n": 0}
+
+    async def fake_call_endpoint(endpoint: str):
+        call_count["n"] += 1
+        if "agents/agent-001/" in endpoint:
+            return detail_response
+        return list_response
+
+    async def fake_load_settings():
+        return {"base_url": "https://rmm.example.com", "api_key": "key", "verify_ssl": True}
+
+    monkeypatch.setattr(tacticalrmm, "_call_endpoint", fake_call_endpoint)
+    monkeypatch.setattr(tacticalrmm, "_load_settings", fake_load_settings)
+
+    agents = asyncio.run(tacticalrmm.fetch_agents())
+
+    assert len(agents) == 1
+    assert agents[0].get("total_ram") == 8192
+    # Verify extract_agent_details can now produce the correct ram_gb
+    details = tacticalrmm.extract_agent_details(agents[0])
+    assert details["ram_gb"] == pytest.approx(8.0)
+    # One list call + one detail call
+    assert call_count["n"] == 2
+
+
+def test_fetch_agents_falls_back_gracefully_when_detail_fails(monkeypatch):
+    """If the per-agent detail endpoint fails, fetch_agents should still return
+    the list-endpoint data (without total_ram)."""
+
+    list_response = [
+        {
+            "agent_id": "agent-002",
+            "hostname": "PC-TWO",
+            "operating_system": "Windows 11",
+        }
+    ]
+
+    async def fake_call_endpoint(endpoint: str):
+        if "agents/agent-002/" in endpoint:
+            raise tacticalrmm.TacticalRMMAPIError("detail not found")
+        return list_response
+
+    async def fake_load_settings():
+        return {"base_url": "https://rmm.example.com", "api_key": "key", "verify_ssl": True}
+
+    monkeypatch.setattr(tacticalrmm, "_call_endpoint", fake_call_endpoint)
+    monkeypatch.setattr(tacticalrmm, "_load_settings", fake_load_settings)
+
+    agents = asyncio.run(tacticalrmm.fetch_agents())
+
+    assert len(agents) == 1
+    assert agents[0]["hostname"] == "PC-TWO"
+    # total_ram not available due to failed detail call
+    assert agents[0].get("total_ram") is None

@@ -1,0 +1,401 @@
+{% extends "base.html" %}
+
+{% block header_title %}Tickets{% endblock %}
+{% from "macros/header.html" import page_header_actions %}
+{% from "macros/counters.html" import counter_strip %}
+
+{% block header_actions %}
+  {{ page_header_actions([
+    {"label": "New ticket", "variant": "primary", "type": "button",
+     "attrs": {"data-create-ticket-modal-open": "", "aria-haspopup": "dialog", "aria-controls": "create-ticket-modal"}},
+  ]) }}
+{% endblock %}
+
+{% block content %}
+  {% if status_summary %}
+    {% set total = namespace(v=0) %}
+    {% for item in status_summary %}{% set total.v = total.v + item.count %}{% endfor %}
+    {% set variant_map = {"open": "operational", "pending": "degraded", "closed": "neutral", "on_hold": "maintenance"} %}
+    {% set strip_items = [] %}
+    {% for item in status_summary %}
+      {% set _ = strip_items.append({"label": item.label, "value": item.count,
+         "variant": variant_map.get(item.label | lower | replace(' ', '_'), 'neutral')}) %}
+    {% endfor %}
+    {{ counter_strip(strip_items, total=total.v, total_label="All tickets") }}
+  {% endif %}
+
+  <section class="card card--panel">
+    <header class="card__header">
+      <div class="card__controls tickets-toolbar">
+        <form method="get" class="tickets-toolbar__form" autocomplete="off" data-ticket-status-filter-form>
+          <div class="tickets-toolbar__field">
+            <label class="form-label" for="tickets-status-filter">Status</label>
+            <select id="tickets-status-filter" name="status" class="form-input" data-ticket-status-filter>
+              <option value="">All statuses</option>
+              {% for option in status_options %}
+                <option value="{{ option.value }}" {% if status_filter and status_filter == option.value %}selected{% endif %}>{{ option.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          {% if filters_active %}
+            <div class="tickets-toolbar__actions">
+              <a class="button button--ghost" href="{{ request.url.path }}">Clear</a>
+            </div>
+          {% endif %}
+        </form>
+        <input
+          type="search"
+          class="form-input tickets-toolbar__search"
+          placeholder="Quick filter tickets"
+          name="q"
+          value="{{ search_term or '' }}"
+          aria-label="Filter tickets"
+          data-table-filter="tickets-table" data-ticket-search-debounce
+        />
+      </div>
+    </header>
+    <div class="table-skeleton" data-ticket-table-skeleton hidden>Loading tickets…</div>
+    {% if filters_active and not tickets %}
+      <div class="alert alert--info" role="status">No tickets match the selected filters. Try adjusting the status or search keywords.</div>
+    {% endif %}
+    <div class="table-wrapper">
+      <table class="table table--stack-mobile" id="tickets-table" data-table data-table-id="tickets-history">
+        <thead>
+          <tr>
+            <th scope="col" data-column-key="id" data-sort="int">Ticket</th>
+            <th scope="col" data-column-key="subject" data-sort="string">Subject</th>
+            <th scope="col" data-column-key="status" data-sort="string">Status</th>
+            <th scope="col" data-column-key="requester" data-sort="string">Requestor</th>
+            <th scope="col" data-column-key="updated" data-sort="date">Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if tickets %}
+            {% for ticket in tickets %}
+              <tr>
+                <td data-column-key="id" data-label="Ticket">#{{ ticket.id }}</td>
+                <td data-column-key="subject" data-label="Subject">
+                  <a href="/tickets/{{ ticket.id }}">{{ ticket.subject or 'Untitled ticket' }}</a>
+                </td>
+                <td data-column-key="status" data-label="Status">
+                  <span class="badge {{ ticket.status_badge }}">{{ ticket.status_label }}</span>
+                </td>
+                <td data-column-key="requester" data-label="Requestor">{{ ticket.requester_label or '—' }}</td>
+                <td data-column-key="updated" data-label="Updated" data-value="{{ ticket.updated_iso or '' }}">
+                  {% if ticket.updated_iso %}
+                    <span data-utc="{{ ticket.updated_iso }}"></span>
+                  {% else %}
+                    <span class="text-muted">—</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr>
+              <td colspan="5" class="table__empty">No tickets available.</td>
+            </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+    <div class="tickets-toolbar__actions"><button type="button" class="button button--ghost" data-ticket-load-more hidden>Load more</button></div>
+  </section>
+
+  <!-- User ticket creation modal -->
+  <div
+    class="modal"
+    id="create-ticket-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="create-ticket-title"
+    aria-hidden="true"
+    hidden
+  >
+    <div class="modal__content" role="document">
+      <button type="button" class="modal__close" data-modal-close>
+        <span class="visually-hidden">Close create ticket form</span>
+        &times;
+      </button>
+      <h2 class="modal__title" id="create-ticket-title">Create a ticket</h2>
+      <p class="modal__subtitle">Raise a new support request and the team will follow up with updates.</p>
+      <form id="user-ticket-form" action="/tickets" method="post" class="form" enctype="multipart/form-data" novalidate data-user-ticket-form>
+        {% include "partials/csrf.html" %}
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-subject">Subject</label>
+          <input
+            id="modal-ticket-subject"
+            name="subject"
+            class="form-input"
+            maxlength="255"
+            required
+          />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-description">Description</label>
+          <div
+            class="rich-text-editor"
+            data-rich-text-editor
+            aria-labelledby="modal-ticket-description-label"
+          >
+            <div class="rich-text-editor__toolbar" role="toolbar" aria-label="Formatting options">
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="bold"
+                aria-label="Bold"
+              >
+                <span aria-hidden="true">B</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="italic"
+                aria-label="Italic"
+              >
+                <span aria-hidden="true">I</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="underline"
+                aria-label="Underline"
+              >
+                <span aria-hidden="true">U</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="insertUnorderedList"
+                aria-label="Bulleted list"
+              >
+                <span aria-hidden="true">•</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="insertOrderedList"
+                aria-label="Numbered list"
+              >
+                <span aria-hidden="true">1.</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="formatBlock"
+                data-command-value="blockquote"
+                aria-label="Quote"
+              >
+                <span aria-hidden="true">""</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="formatBlock"
+                data-command-value="pre"
+                aria-label="Code block"
+              >
+                <span aria-hidden="true">&lt;/&gt;</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="link"
+                aria-label="Insert link"
+              >
+                <span aria-hidden="true">🔗</span>
+              </button>
+              <button
+                type="button"
+                class="rich-text-editor__button"
+                data-rich-text-button
+                data-command="removeFormat"
+                aria-label="Clear formatting"
+              >
+                <span aria-hidden="true">⨯</span>
+              </button>
+            </div>
+            <div
+              id="modal-ticket-description"
+              class="rich-text-editor__surface"
+              data-rich-text-content
+              contenteditable="true"
+              role="textbox"
+              aria-labelledby="modal-ticket-description-label"
+              aria-multiline="true"
+              data-placeholder="Describe the issue, impact, and any troubleshooting already attempted..."
+            ></div>
+            <input type="hidden" id="modal-ticket-description-value" name="description" data-rich-text-value required />
+          </div>
+          <span class="visually-hidden" id="modal-ticket-description-label">Description</span>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="modal-ticket-attachments">Attachments (optional)</label>
+          <input
+            id="modal-ticket-attachments"
+            name="attachments"
+            type="file"
+            class="form-input"
+            multiple
+            accept="image/*,.pdf,.doc,.docx,.txt,.log,.zip"
+            data-ticket-attachments
+          />
+          <p class="form-help">You can upload images, PDFs, documents, and other files to help describe your issue.</p>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button button--primary">Submit ticket</button>
+          <button type="button" class="button button--ghost" data-modal-close>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ static_url('/static/js/tables.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/purify.min.js') }}" defer></script>
+  <script src="{{ static_url('/static/js/rich_text_editor.js') }}" defer></script>
+  <script>
+    // Initialize modal for ticket creation
+    (function() {
+      function bindModal({ modalId, triggerSelector }) {
+        const modal = document.getElementById(modalId);
+        const triggerButtons = triggerSelector
+          ? Array.from(document.querySelectorAll(triggerSelector))
+          : [];
+
+        if (!modal || triggerButtons.length === 0) {
+          return;
+        }
+
+        const focusableSelector =
+          'a[href], button:not([disabled]), textarea, input:not([type="hidden"]):not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+        let activeTrigger = null;
+
+        function getFocusableElements() {
+          return Array.from(modal.querySelectorAll(focusableSelector)).filter((element) => {
+            if (element.hasAttribute('disabled')) {
+              return false;
+            }
+            if (element.getAttribute('aria-hidden') === 'true') {
+              return false;
+            }
+            return element.offsetParent !== null;
+          });
+        }
+
+        function focusFirstElement() {
+          const [firstFocusable] = getFocusableElements();
+          if (firstFocusable && typeof firstFocusable.focus === 'function') {
+            firstFocusable.focus();
+          }
+        }
+
+        function handleKeydown(event) {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            closeModal();
+            return;
+          }
+          if (event.key !== 'Tab') {
+            return;
+          }
+
+          const focusable = getFocusableElements();
+          if (!focusable.length) {
+            event.preventDefault();
+            return;
+          }
+
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          const currentActive = document.activeElement;
+
+          if (event.shiftKey) {
+            if (currentActive === first) {
+              event.preventDefault();
+              last.focus();
+            }
+          } else if (currentActive === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+
+        function openModal(trigger) {
+          activeTrigger = trigger instanceof HTMLElement ? trigger : null;
+          modal.hidden = false;
+          modal.classList.add('is-visible');
+          modal.setAttribute('aria-hidden', 'false');
+          if (activeTrigger) {
+            activeTrigger.setAttribute('aria-expanded', 'true');
+          }
+          document.addEventListener('keydown', handleKeydown);
+          window.requestAnimationFrame(() => {
+            focusFirstElement();
+          });
+        }
+
+        function closeModal() {
+          modal.hidden = true;
+          modal.classList.remove('is-visible');
+          modal.setAttribute('aria-hidden', 'true');
+          if (activeTrigger) {
+            activeTrigger.setAttribute('aria-expanded', 'false');
+            activeTrigger.focus();
+          }
+          document.removeEventListener('keydown', handleKeydown);
+          activeTrigger = null;
+        }
+
+        triggerButtons.forEach((button) => {
+          button.addEventListener('click', () => {
+            openModal(button);
+          });
+        });
+
+        const closeButtons = modal.querySelectorAll('[data-modal-close]');
+        closeButtons.forEach((button) => {
+          button.addEventListener('click', () => {
+            closeModal();
+          });
+        });
+
+        modal.addEventListener('click', (event) => {
+          if (event.target === modal) {
+            closeModal();
+          }
+        });
+      }
+
+      document.addEventListener('DOMContentLoaded', () => {
+        bindModal({ 
+          modalId: 'create-ticket-modal', 
+          triggerSelector: '[data-create-ticket-modal-open]' 
+        });
+
+        const statusFilter = document.querySelector('[data-ticket-status-filter]');
+        const statusFilterForm = document.querySelector('[data-ticket-status-filter-form]');
+        if (statusFilter instanceof HTMLSelectElement && statusFilterForm instanceof HTMLFormElement) {
+          statusFilter.addEventListener('change', () => {
+            const targetUrl = new URL(statusFilterForm.action || window.location.href, window.location.href);
+            if (statusFilter.value) {
+              targetUrl.searchParams.set(statusFilter.name, statusFilter.value);
+            } else {
+              targetUrl.searchParams.delete(statusFilter.name);
+            }
+            window.location.assign(targetUrl.toString());
+          });
+        }
+      });
+    })();
+  </script>
+{% endblock %}

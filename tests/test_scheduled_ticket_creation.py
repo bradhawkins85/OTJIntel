@@ -1,0 +1,244 @@
+"""Test scheduled ticket creation command."""
+import json
+from datetime import datetime, timezone
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.mark.asyncio
+async def test_create_scheduled_ticket_handler():
+    """Test that create_scheduled_ticket command processes JSON payload correctly."""
+    
+    # Mock the task data
+    task = {
+        "id": 1,
+        "command": "create_scheduled_ticket",
+        "company_id": 10,
+        "description": json.dumps({
+            "subject": "Test Ticket",
+            "description": "Test description",
+            "priority": "high",
+            "status": "open"
+        })
+    }
+    
+    # Mock the tickets_service.create_ticket function
+    mock_ticket = {
+        "id": 100,
+        "number": "T-1234",
+        "subject": "Test Ticket"
+    }
+    
+    with patch('app.services.scheduler.tickets_service.create_ticket', new_callable=AsyncMock) as mock_create:
+        mock_create.return_value = mock_ticket
+        
+        # Import the scheduler service (after patching)
+        from app.services.scheduler import SchedulerService
+        
+        scheduler = SchedulerService()
+        
+        # Mock the database operations
+        with patch('app.services.scheduler.scheduled_tasks_repo.record_task_run', new_callable=AsyncMock):
+            with patch('app.services.scheduler.db.acquire_lock') as mock_lock:
+                # Configure the lock to return True (acquired)
+                mock_lock.return_value.__aenter__.return_value = True
+                
+                # Run the task
+                await scheduler._run_task(task)
+                
+                # Verify create_ticket was called with correct arguments
+                mock_create.assert_called_once()
+                call_kwargs = mock_create.call_args.kwargs
+                
+                assert call_kwargs['subject'] == "Test Ticket"
+                assert call_kwargs['description'] == "Test description"
+                assert call_kwargs['priority'] == "high"
+                assert call_kwargs['status'] == "open"
+                assert call_kwargs['company_id'] == 10
+                assert call_kwargs['trigger_automations'] is False
+
+
+@pytest.mark.asyncio
+async def test_create_scheduled_ticket_invalid_json():
+    """Test that invalid JSON in description is handled gracefully."""
+    
+    task = {
+        "id": 2,
+        "command": "create_scheduled_ticket",
+        "description": "not valid json"
+    }
+    
+    from app.services.scheduler import SchedulerService
+    
+    scheduler = SchedulerService()
+    
+    # Mock the database operations
+    with patch('app.services.scheduler.scheduled_tasks_repo.record_task_run', new_callable=AsyncMock) as mock_record:
+        with patch('app.services.scheduler.db.acquire_lock') as mock_lock:
+            mock_lock.return_value.__aenter__.return_value = True
+            
+            # Run the task
+            await scheduler._run_task(task)
+            
+            # Verify that the run was recorded with failed status
+            mock_record.assert_called_once()
+            call_args = mock_record.call_args
+            assert call_args.kwargs['status'] == 'failed'
+            assert 'Invalid JSON' in call_args.kwargs['details']
+
+
+@pytest.mark.asyncio
+async def test_create_scheduled_ticket_missing_subject():
+    """Test that missing subject field is handled gracefully."""
+    
+    task = {
+        "id": 3,
+        "command": "create_scheduled_ticket",
+        "description": json.dumps({
+            "description": "Test description without subject"
+        })
+    }
+    
+    from app.services.scheduler import SchedulerService
+    
+    scheduler = SchedulerService()
+    
+    # Mock the database operations
+    with patch('app.services.scheduler.scheduled_tasks_repo.record_task_run', new_callable=AsyncMock) as mock_record:
+        with patch('app.services.scheduler.db.acquire_lock') as mock_lock:
+            mock_lock.return_value.__aenter__.return_value = True
+            
+            # Run the task
+            await scheduler._run_task(task)
+            
+            # Verify that the run was recorded with failed status
+            mock_record.assert_called_once()
+            call_args = mock_record.call_args
+            assert call_args.kwargs['status'] == 'failed'
+            assert 'Missing required field: subject' in call_args.kwargs['details']
+
+
+@pytest.mark.asyncio
+async def test_create_scheduled_ticket_interpolates_variables():
+    """Test that template variables like {{ NOW_UTC }} are interpolated correctly."""
+    
+    task = {
+        "id": 4,
+        "command": "create_scheduled_ticket",
+        "company_id": 20,
+        "description": json.dumps({
+            "subject": "Scheduled Task {{ NOW_UTC }}",
+            "description": "Created at {{ SYSTEM_TIME_UTC }} on {{ APP_NAME }}",
+            "priority": "normal",
+            "status": "open"
+        })
+    }
+    
+    # Mock the tickets_service.create_ticket function
+    mock_ticket = {
+        "id": 200,
+        "number": "T-5678",
+        "subject": "Scheduled Task with timestamp"
+    }
+    
+    with patch('app.services.scheduler.tickets_service.create_ticket', new_callable=AsyncMock) as mock_create:
+        mock_create.return_value = mock_ticket
+        
+        # Import the scheduler service (after patching)
+        from app.services.scheduler import SchedulerService
+        
+        scheduler = SchedulerService()
+        
+        # Mock the database operations
+        with patch('app.services.scheduler.scheduled_tasks_repo.record_task_run', new_callable=AsyncMock):
+            with patch('app.services.scheduler.db.acquire_lock') as mock_lock:
+                # Configure the lock to return True (acquired)
+                mock_lock.return_value.__aenter__.return_value = True
+                
+                # Run the task
+                await scheduler._run_task(task)
+                
+                # Verify create_ticket was called
+                mock_create.assert_called_once()
+                call_kwargs = mock_create.call_args.kwargs
+                
+                # Verify that template variables were replaced
+                subject = call_kwargs['subject']
+                description = call_kwargs['description']
+                
+                # The subject should NOT contain the literal "{{ NOW_UTC }}"
+                assert "{{ NOW_UTC }}" not in subject
+                assert "{{ SYSTEM_TIME_UTC }}" not in description
+                assert "{{ APP_NAME }}" not in description
+                
+                # The subject should contain a valid timestamp
+                # It should match the pattern of ISO 8601 datetime
+                assert "Scheduled Task" in subject
+                # Check if subject contains an ISO timestamp (basic check)
+                assert any(char.isdigit() for char in subject), "Subject should contain interpolated timestamp"
+                
+                # The description should contain interpolated values
+                assert "Created at" in description
+                # Verify it contains some interpolated content
+                assert len(description) > len("Created at  on "), "Description should have interpolated values"
+
+
+@pytest.mark.anyio
+async def test_create_scheduled_ticket_renders_report_variables_with_company_context(monkeypatch):
+    """Report variables in scheduled ticket payloads use the task company context."""
+
+    async def fake_get_query_by_slug(slug):
+        assert slug == "online-workstations-last-30-days"
+        return {
+            "slug": slug,
+            "sql_query": "SELECT name FROM assets WHERE company_id = {{current.company}}",
+        }
+
+    async def fake_run_query_with_context(sql_query, *, company_id=None):
+        assert sql_query == "SELECT name FROM assets WHERE company_id = {{current.company}}"
+        assert company_id == 20
+        return {"columns": ["name"], "rows": [{"name": "WS-01"}]}
+
+    monkeypatch.setattr(
+        "app.services.dynamic_variables.reporting_repo.get_query_by_slug",
+        fake_get_query_by_slug,
+    )
+    monkeypatch.setattr(
+        "app.services.dynamic_variables.reporting_service.run_query_with_context",
+        fake_run_query_with_context,
+    )
+
+    task = {
+        "id": 5,
+        "name": "Daily workstation report",
+        "command": "create_scheduled_ticket",
+        "company_id": 20,
+        "description": json.dumps(
+            {
+                "subject": "Online workstation report",
+                "description": "{{ report.online-workstations-last-30-days.list }}",
+                "priority": "normal",
+                "status": "open",
+            }
+        ),
+    }
+
+    with patch("app.services.scheduler.tickets_service.create_ticket", new_callable=AsyncMock) as mock_create:
+        mock_create.return_value = {"id": 201, "number": "T-5679"}
+
+        from app.services.scheduler import SchedulerService
+
+        scheduler = SchedulerService()
+        with patch("app.services.scheduler.scheduled_tasks_repo.record_task_run", new_callable=AsyncMock):
+            with patch("app.services.scheduler.db.acquire_lock") as mock_lock:
+                mock_lock.return_value.__aenter__.return_value = True
+
+                await scheduler._run_task(task)
+
+    mock_create.assert_called_once()
+    assert mock_create.call_args.kwargs["description"] == "name\r\nWS-01"

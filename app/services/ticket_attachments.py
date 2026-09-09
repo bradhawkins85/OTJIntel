@@ -1,0 +1,531 @@
+"""Service for handling ticket attachment file operations."""
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import os
+import re
+import secrets
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import importlib
+from fastapi import UploadFile
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from PIL import Image, UnidentifiedImageError
+
+from app.core.config import get_settings
+from app.core.logging import log_debug, log_error, log_info
+from app.repositories import ticket_attachments as attachments_repo
+from app.repositories import attachment_blocklist as blocklist_repo
+
+
+# Maximum file size: 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+# Allowed MIME types for attachments.
+# SVG, HTML, and XML types are intentionally excluded: SVGs can contain embedded
+# <script> tags and HTML/XML documents can trigger XSS when rendered inline.
+ALLOWED_MIME_TYPES = {
+    # Documents
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/plain",
+    "text/csv",
+    # Images (raster only — SVG excluded due to script-injection risk)
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    # Archives
+    "application/zip",
+    "application/x-7z-compressed",
+    "application/x-tar",
+    "application/gzip",
+    # Audio (safe binary media used by voicemail/transcription workflows)
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/vnd.wave",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/ogg",
+    "audio/flac",
+    "audio/x-flac",
+    "audio/webm",
+    "audio/mp4",
+    "audio/x-m4a",
+    # Video (safe binary media)
+    "video/mp4",
+    "video/mpeg",
+    "video/ogg",
+    "video/webm",
+    "video/quicktime",
+    # Other
+    "application/json",
+}
+
+# Number of bytes to read from the start of a file for MIME sniffing.
+_MAGIC_HEADER_BYTES = 2048
+_INLINE_IMAGE_DATA_URI_PATTERN = re.compile(
+    r'(<img\b[^>]*?\bsrc=["\\\'])data:(image/[a-zA-Z0-9.+-]+);base64,([^"\\\']+)(["\\\'][^>]*>)',
+    re.IGNORECASE,
+)
+_INLINE_IMAGE_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+_BLOCKLIST_THUMBNAIL_SIZE = (256, 256)
+
+
+def create_blocklist_thumbnail(contents: bytes, mime_type: str | None) -> tuple[bytes | None, str | None]:
+    """Create a small, inert JPEG preview for blocklisted raster images."""
+    if not mime_type or not mime_type.lower().startswith("image/"):
+        return None, None
+    try:
+        with Image.open(BytesIO(contents)) as image:
+            image.thumbnail(_BLOCKLIST_THUMBNAIL_SIZE)
+            # Flatten transparency onto white so every Pillow-supported raster
+            # mode can be represented consistently as a compact RGB JPEG.
+            rgba = image.convert("RGBA")
+            flattened = Image.new("RGB", rgba.size, "white")
+            flattened.paste(rgba, mask=rgba.getchannel("A"))
+            output = BytesIO()
+            flattened.save(output, format="JPEG", quality=80, optimize=True)
+            return output.getvalue(), "image/jpeg"
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None, None
+
+
+def content_hash(contents: bytes) -> str:
+    """Return the stable, non-reversible identifier used by the blocklist."""
+    return hashlib.sha256(contents).hexdigest()
+
+
+async def ensure_not_blocked(contents: bytes) -> str:
+    """Reject content already flagged by a technician, regardless of its name."""
+    digest = content_hash(contents)
+    if await blocklist_repo.is_blocked(digest):
+        raise ValueError("This attachment is on the attachment blocklist and was discarded")
+    return digest
+
+
+def _get_upload_directory() -> Path:
+    """Get the base upload directory for ticket attachments.
+
+    Files are stored under ``private_uploads/tickets/`` (outside the public
+    ``/static`` tree) so that access-control checks in the download endpoint
+    cannot be bypassed by guessing a direct URL.
+    """
+    base_dir = Path(__file__).resolve().parents[2] / "private_uploads" / "tickets"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+
+def _generate_secure_filename(original_filename: str) -> str:
+    """Generate a secure filename using UUID."""
+    # Extract extension from original filename
+    extension = ""
+    if "." in original_filename:
+        extension = original_filename.rsplit(".", 1)[1].lower()
+        # Limit extension length and sanitize
+        extension = extension[:10]
+        extension = "".join(c for c in extension if c.isalnum())
+    
+    # Generate random filename
+    random_name = secrets.token_urlsafe(32)
+    
+    if extension:
+        return f"{random_name}.{extension}"
+    return random_name
+
+
+def _sniff_mime_type(header_bytes: bytes) -> str | None:
+    """Return the MIME type detected from the first bytes of a file.
+
+    Uses ``python-magic`` (libmagic) to inspect the file *content* rather than
+    trusting the client-supplied ``Content-Type`` header, which is trivially
+    spoofable.
+    """
+    try:
+        magic_module = importlib.import_module("magic")
+        return magic_module.from_buffer(header_bytes, mime=True)
+    except Exception as exc:
+        log_error(f"MIME sniffing failed: {exc}")
+        return None
+
+
+def validate_file_upload(file: UploadFile, max_size: int = MAX_FILE_SIZE) -> tuple[bool, str | None]:
+    """
+    Validate an uploaded file.
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not file.filename:
+        return False, "No filename provided"
+    
+    # Check file size (if available)
+    if file.size and file.size > max_size:
+        max_mb = max_size / (1024 * 1024)
+        return False, f"File size exceeds maximum allowed size of {max_mb}MB"
+    
+    # Check MIME type against the client-supplied header as a quick pre-filter.
+    # The actual bytes-based check is performed in save_uploaded_file after the
+    # file has been read.
+    if file.content_type and file.content_type.split(";")[0].strip() not in ALLOWED_MIME_TYPES:
+        return False, f"File type '{file.content_type}' is not allowed"
+    
+    return True, None
+
+
+async def save_uploaded_file(
+    ticket_id: int,
+    file: UploadFile,
+    access_level: str,
+    uploaded_by_user_id: int | None,
+) -> dict[str, Any]:
+    """
+    Save an uploaded file and create database record.
+    
+    Args:
+        ticket_id: The ticket ID to attach the file to
+        file: The uploaded file
+        access_level: Access level (open, closed, restricted)
+        uploaded_by_user_id: User ID of uploader
+    
+    Returns:
+        The created attachment record
+    
+    Raises:
+        ValueError: If validation fails
+        IOError: If file save fails
+    """
+    # Validate file
+    is_valid, error = validate_file_upload(file)
+    if not is_valid:
+        raise ValueError(error or "Invalid file upload")
+    
+    # Generate secure filename
+    secure_filename = _generate_secure_filename(file.filename or "upload")
+    
+    # Get upload directory
+    upload_dir = _get_upload_directory()
+    file_path = upload_dir / secure_filename
+    
+    # Save file
+    try:
+        contents = await file.read()
+        file_size = len(contents)
+        
+        # Double check size after reading
+        if file_size > MAX_FILE_SIZE:
+            raise ValueError(f"File size {file_size} exceeds maximum")
+
+        await ensure_not_blocked(contents)
+
+        # Validate MIME type from actual file bytes (defeats spoofed Content-Type).
+        actual_mime = _sniff_mime_type(contents[:_MAGIC_HEADER_BYTES])
+        if actual_mime and actual_mime not in ALLOWED_MIME_TYPES:
+            raise ValueError(f"File content type '{actual_mime}' is not allowed")
+        
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        
+        log_info(f"Saved file {secure_filename} ({file_size} bytes) for ticket {ticket_id}")
+    except ValueError:
+        raise
+    except Exception as e:
+        log_error(f"Failed to save file: {e}")
+        # Clean up partial file if it exists
+        if file_path.exists():
+            file_path.unlink()
+        raise IOError(f"Failed to save file: {e}") from e
+    
+    # Use the sniffed MIME type (more trustworthy than client-supplied header).
+    resolved_mime = actual_mime or file.content_type
+
+    # Create database record
+    try:
+        attachment = await attachments_repo.create_attachment(
+            ticket_id=ticket_id,
+            filename=secure_filename,
+            original_filename=file.filename or "upload",
+            file_size=file_size,
+            mime_type=resolved_mime,
+            access_level=access_level,
+            uploaded_by_user_id=uploaded_by_user_id,
+        )
+        return attachment
+    except Exception as e:
+        log_error(f"Failed to create attachment record: {e}")
+        # Clean up file if database insert fails
+        if file_path.exists():
+            file_path.unlink()
+        raise
+
+
+async def save_file_bytes(
+    ticket_id: int,
+    *,
+    contents: bytes,
+    original_filename: str,
+    mime_type: str | None,
+    access_level: str,
+    uploaded_by_user_id: int | None,
+) -> dict[str, Any]:
+    """Save raw file bytes and create a ticket attachment record."""
+    upload_name = original_filename or "upload"
+    pseudo_file = type(
+        "AttachmentUpload",
+        (),
+        {"filename": upload_name, "content_type": mime_type, "size": len(contents)},
+    )()
+    is_valid, error = validate_file_upload(pseudo_file)
+    if not is_valid:
+        raise ValueError(error or "Invalid file upload")
+    file_size = len(contents)
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError(f"File size {file_size} exceeds maximum")
+
+    await ensure_not_blocked(contents)
+
+    # Validate MIME type from actual file bytes.
+    actual_mime = _sniff_mime_type(contents[:_MAGIC_HEADER_BYTES])
+    if actual_mime and actual_mime not in ALLOWED_MIME_TYPES:
+        raise ValueError(f"File content type '{actual_mime}' is not allowed")
+
+    resolved_mime = actual_mime or mime_type
+
+    secure_filename = _generate_secure_filename(upload_name)
+    upload_dir = _get_upload_directory()
+    file_path = upload_dir / secure_filename
+    try:
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        log_info(f"Saved file {secure_filename} ({file_size} bytes) for ticket {ticket_id}")
+    except Exception as e:
+        log_error(f"Failed to save file: {e}")
+        if file_path.exists():
+            file_path.unlink()
+        raise IOError(f"Failed to save file: {e}") from e
+
+    try:
+        return await attachments_repo.create_attachment(
+            ticket_id=ticket_id,
+            filename=secure_filename,
+            original_filename=upload_name,
+            file_size=file_size,
+            mime_type=resolved_mime,
+            access_level=access_level,
+            uploaded_by_user_id=uploaded_by_user_id,
+        )
+    except Exception as e:
+        log_error(f"Failed to create attachment record: {e}")
+        if file_path.exists():
+            file_path.unlink()
+        raise
+
+
+async def persist_inline_images_for_ticket_body(
+    ticket_id: int,
+    body: str,
+    *,
+    access_level: str,
+    uploaded_by_user_id: int | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Persist base64 inline ``<img>`` data URIs and rewrite them to downloads.
+
+    Rich-text editors commonly paste screenshots as ``data:image/...;base64``
+    URLs. Storing those data URIs directly in ``ticket_replies.body`` can exceed
+    MySQL ``TEXT`` limits or packet limits, causing reply saves to fail. This
+    helper turns supported raster images into regular ticket attachments and
+    replaces the image ``src`` with the authenticated attachment download URL.
+    """
+
+    if not body or "data:image/" not in body.lower():
+        return body, []
+
+    created_attachments: list[dict[str, Any]] = []
+
+    async def _save_match(match: re.Match[str]) -> str:
+        prefix, mime_type_raw, encoded_raw, suffix = match.groups()
+        mime_type = mime_type_raw.lower()
+        extension = _INLINE_IMAGE_EXTENSIONS.get(mime_type)
+        if not extension:
+            # Leave unsupported image data URIs for the sanitizer/validator path.
+            return match.group(0)
+
+        encoded = re.sub(r"\s+", "", encoded_raw)
+        try:
+            contents = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return match.group(0)
+
+        attachment = await save_file_bytes(
+            ticket_id=ticket_id,
+            contents=contents,
+            original_filename=f"inline-image.{extension}",
+            mime_type=mime_type,
+            access_level=access_level,
+            uploaded_by_user_id=uploaded_by_user_id,
+        )
+        created_attachments.append(attachment)
+        attachment_id = attachment.get("id")
+        return f'{prefix}/api/tickets/{ticket_id}/attachments/{attachment_id}/download{suffix}'
+
+    rewritten_parts: list[str] = []
+    last_index = 0
+    for match in _INLINE_IMAGE_DATA_URI_PATTERN.finditer(body):
+        rewritten_parts.append(body[last_index:match.start()])
+        rewritten_parts.append(await _save_match(match))
+        last_index = match.end()
+    rewritten_parts.append(body[last_index:])
+    return "".join(rewritten_parts), created_attachments
+
+
+async def delete_attachment_file(attachment: dict[str, Any]) -> None:
+    """Delete an attachment file and database record."""
+    filename = attachment.get("filename")
+    attachment_id = attachment.get("id")
+    
+    if not filename or not attachment_id:
+        log_error("Invalid attachment data for deletion")
+        return
+    
+    # Delete database record first
+    try:
+        await attachments_repo.delete_attachment(attachment_id)
+    except Exception as e:
+        log_error(f"Failed to delete attachment record {attachment_id}: {e}")
+        raise
+    
+    # Delete file
+    upload_dir = _get_upload_directory()
+    file_path = upload_dir / filename
+    
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            log_info(f"Deleted file {filename}")
+        except Exception as e:
+            log_error(f"Failed to delete file {filename}: {e}")
+            # Don't raise - file might already be gone, record is deleted
+
+
+def attachment_path(attachment: dict[str, Any]) -> Path:
+    """Locate an attachment in current or legacy private storage."""
+    path = get_attachment_file_path(str(attachment.get("filename") or ""))
+    if not path.exists():
+        legacy = get_legacy_attachment_file_path(str(attachment.get("filename") or ""))
+        if legacy.exists():
+            return legacy
+    return path
+
+
+async def block_attachment(
+    attachment: dict[str, Any], *, created_by_user_id: int | None, remove_existing: bool
+) -> tuple[dict[str, Any], int]:
+    """Block an attachment's bytes and optionally purge every historical match."""
+    path = attachment_path(attachment)
+    if not path.exists():
+        raise FileNotFoundError("Attachment file not found")
+    contents = path.read_bytes()
+    digest = content_hash(contents)
+    thumbnail_data, thumbnail_mime_type = create_blocklist_thumbnail(
+        contents, attachment.get("mime_type")
+    )
+    entry = await blocklist_repo.add(
+        digest,
+        original_filename=attachment.get("original_filename"),
+        file_size=int(attachment.get("file_size") or path.stat().st_size),
+        mime_type=attachment.get("mime_type"),
+        created_by_user_id=created_by_user_id,
+        thumbnail_data=thumbnail_data,
+        thumbnail_mime_type=thumbnail_mime_type,
+    )
+    removed = 0
+    targets = await attachments_repo.list_all_attachments() if remove_existing else [attachment]
+    for candidate in targets:
+        candidate_path = attachment_path(candidate)
+        if candidate_path.exists() and content_hash(candidate_path.read_bytes()) == digest:
+            await delete_attachment_file(candidate)
+            removed += 1
+    return entry, removed
+
+
+def _safe_attachment_path(base_dir: Path, filename: str) -> Path:
+    """Resolve an attachment path under *base_dir* without allowing traversal."""
+    if not filename:
+        return base_dir / "__invalid_attachment_filename__"
+    candidate = (base_dir / filename).resolve()
+    try:
+        candidate.relative_to(base_dir.resolve())
+    except ValueError:
+        return base_dir / "__invalid_attachment_filename__"
+    return candidate
+
+
+def get_attachment_file_path(filename: str) -> Path:
+    """Get the full path to an attachment file in private storage."""
+    upload_dir = _get_upload_directory()
+    return _safe_attachment_path(upload_dir, filename)
+
+
+def get_legacy_attachment_file_path(filename: str) -> Path:
+    """Get the pre-private-storage path used by older email attachment saves."""
+    legacy_dir = Path(__file__).resolve().parents[1] / "static" / "uploads" / "tickets"
+    return _safe_attachment_path(legacy_dir, filename)
+
+
+def generate_open_access_token(attachment_id: int, expires_in_seconds: int = 86400) -> str:
+    """
+    Generate a signed token for open access to an attachment.
+    
+    Args:
+        attachment_id: The attachment ID
+        expires_in_seconds: Token expiry time (default 24 hours)
+    
+    Returns:
+        Signed token string
+    """
+    # Use the secret key from settings
+    config = get_settings()
+    secret_key = getattr(config, "secret_key", "change-me-in-production")
+    serializer = URLSafeTimedSerializer(secret_key, salt="ticket-attachment")
+    
+    token = serializer.dumps({"attachment_id": attachment_id})
+    return token
+
+
+def verify_open_access_token(token: str, max_age: int = 86400) -> int | None:
+    """
+    Verify an open access token and return the attachment ID.
+    
+    Args:
+        token: The signed token
+        max_age: Maximum age in seconds (default 24 hours)
+    
+    Returns:
+        Attachment ID if valid, None otherwise
+    """
+    config = get_settings()
+    secret_key = getattr(config, "secret_key", "change-me-in-production")
+    serializer = URLSafeTimedSerializer(secret_key, salt="ticket-attachment")
+    
+    try:
+        data = serializer.loads(token, max_age=max_age)
+        return data.get("attachment_id")
+    except (BadSignature, SignatureExpired) as e:
+        log_debug(f"Invalid or expired token: {e}")
+        return None

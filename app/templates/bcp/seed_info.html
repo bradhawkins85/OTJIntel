@@ -1,0 +1,201 @@
+{% extends "bcp/layout.html" %}
+
+
+{% block header_title %}BCP — Seed Info{% endblock %}
+{% block bcp_content %}
+<div class="bcp-page page-container">
+  <section class="card">
+    <div class="card-header">
+      <h2 class="card-title">BCP Seed Data & Defaults</h2>
+      <div class="button-group">
+        {% if can_edit %}
+        <button type="button" class="btn btn-primary" onclick="showReseedModal()">
+          <i class="fas fa-sync"></i> Re-seed Defaults
+        </button>
+        {% endif %}
+        <a href="/bcp" class="btn btn-secondary">Back to Overview</a>
+      </div>
+    </div>
+    
+    <div class="card-body">
+      <!-- Description -->
+      <div class="alert alert-info mb-4">
+        <i class="fas fa-info-circle"></i>
+        <strong>{{ seed_docs.description }}</strong>
+        <br>
+        <small class="text-muted">{{ seed_docs.idempotency }}</small>
+      </div>
+
+      <!-- Categories -->
+      <h3 class="section-title">Default Content Categories</h3>
+      <div class="seed-categories">
+        {% for category in seed_docs.categories %}
+        <div class="seed-category">
+          <div class="category-header">
+            <h4 class="category-title">{{ category.title }}</h4>
+            <span class="badge badge-primary">{{ category.count }} items</span>
+          </div>
+          <p class="category-description">{{ category.description }}</p>
+          <div class="category-meta">
+            <div class="meta-item">
+              <i class="fas fa-edit"></i>
+              <span>Edit at: <strong>{{ category.edit_location }}</strong></span>
+            </div>
+            {% if category.can_reseed %}
+            <div class="meta-item text-success">
+              <i class="fas fa-check-circle"></i>
+              <span>Can be re-seeded if deleted</span>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+
+      <!-- Risk Scales Legend -->
+      <h3 class="section-title mt-5">Risk Assessment Scales</h3>
+      
+      <div class="risk-scales">
+        <!-- Likelihood Scale -->
+        <div class="scale-section">
+          <h4 class="scale-title">Likelihood Scale</h4>
+          <table class="scale-table">
+            <thead>
+              <tr>
+                <th>Value</th>
+                <th>Label</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in seed_docs.risk_scales.likelihood %}
+              <tr>
+                <td class="text-center"><strong>{{ item.value }}</strong></td>
+                <td>{{ item.label }}</td>
+                <td class="text-muted">{{ item.description }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Impact Scale -->
+        <div class="scale-section">
+          <h4 class="scale-title">Impact Scale</h4>
+          <table class="scale-table">
+            <thead>
+              <tr>
+                <th>Value</th>
+                <th>Label</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in seed_docs.risk_scales.impact %}
+              <tr>
+                <td class="text-center"><strong>{{ item.value }}</strong></td>
+                <td>{{ item.label }}</td>
+                <td class="text-muted">{{ item.description }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Severity Bands -->
+        <div class="scale-section full-width">
+          <h4 class="scale-title">Severity Bands (Rating = Likelihood × Impact)</h4>
+          <table class="scale-table">
+            <thead>
+              <tr>
+                <th>Rating Range</th>
+                <th>Severity</th>
+                <th>Action Required</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for band in seed_docs.risk_scales.severity_bands %}
+              <tr>
+                <td class="text-center"><strong>{{ band.range }}</strong></td>
+                <td>
+                  <span class="severity-badge severity-{{ band.color }}">{{ band.label }}</span>
+                </td>
+                <td>{{ band.action }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Modification Guidance -->
+      <div class="alert alert-warning mt-4">
+        <i class="fas fa-lightbulb"></i>
+        <strong>Modification Guidance:</strong> {{ seed_docs.modification_guidance }}
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- Re-seed Modal -->
+{% if can_edit %}
+<div id="reseedModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>Re-seed BCP Defaults</h3>
+      <button type="button" class="close" onclick="closeReseedModal()">&times;</button>
+    </div>
+    <form method="POST" action="/bcp/admin/reseed">
+      <div class="modal-body">
+        <p class="mb-3">Select which categories to re-seed. Only missing items will be added (no duplication).</p>
+        
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" name="categories" value="objectives" checked>
+            <span>Objectives (5 items)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="categories" value="immediate_checklist" checked>
+            <span>Immediate Response Checklist (18 items)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="categories" value="crisis_recovery_checklist" checked>
+            <span>Crisis & Recovery Checklist (23 items)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="categories" value="emergency_kit" checked>
+            <span>Emergency Kit Items (24 items)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="categories" value="example_risks" checked>
+            <span>Example Risks (2 items)</span>
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" onclick="closeReseedModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary">
+          <i class="fas fa-sync"></i> Re-seed Selected
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
+<script>
+function showReseedModal() {
+  document.getElementById('reseedModal').classList.add('show');
+}
+
+function closeReseedModal() {
+  document.getElementById('reseedModal').classList.remove('show');
+}
+
+// Close modal when clicking outside
+document.getElementById('reseedModal')?.addEventListener('click', function(e) {
+  if (e.target === this) {
+    closeReseedModal();
+  }
+});
+</script>
+{% endblock %}

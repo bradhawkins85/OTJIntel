@@ -1,0 +1,930 @@
+from __future__ import annotations
+
+import asyncio
+import re
+from time import monotonic
+from collections.abc import Mapping
+from typing import Any, Sequence
+from urllib.parse import urlparse
+
+from app.core.logging import log_error, log_info
+from app.services import modules as modules_service
+
+
+class TacticalRMMConfigurationError(RuntimeError):
+    """Raised when the Tactical RMM module is missing or misconfigured."""
+
+
+class TacticalRMMAPIError(RuntimeError):
+    """Raised when Tactical RMM responds with an error payload."""
+
+
+_MODULE_SETTINGS_CACHE: dict[str, Any] | None = None
+_MODULE_SETTINGS_EXPIRY: float = 0.0
+_MODULE_SETTINGS_LOCK = asyncio.Lock()
+
+
+def _clean_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, (int, float)):
+        text = str(value)
+        return text.strip() or None
+    return None
+
+
+async def _load_settings() -> dict[str, Any]:
+    global _MODULE_SETTINGS_CACHE, _MODULE_SETTINGS_EXPIRY
+    now = monotonic()
+    if _MODULE_SETTINGS_CACHE and now < _MODULE_SETTINGS_EXPIRY:
+        return _MODULE_SETTINGS_CACHE
+    async with _MODULE_SETTINGS_LOCK:
+        now = monotonic()
+        if _MODULE_SETTINGS_CACHE and now < _MODULE_SETTINGS_EXPIRY:
+            return _MODULE_SETTINGS_CACHE
+        module = await modules_service.get_module("tacticalrmm", redact=False)
+        if not module:
+            raise TacticalRMMConfigurationError("Tactical RMM module is not configured")
+        settings = module.get("settings") or {}
+        base_url = _clean_text(settings.get("base_url"))
+        api_key = _clean_text(settings.get("api_key"))
+        if not base_url:
+            raise TacticalRMMConfigurationError(
+                "Tactical RMM base URL is not configured"
+            )
+        if not api_key:
+            raise TacticalRMMConfigurationError(
+                "Tactical RMM API key is not configured"
+            )
+        verify_ssl = bool(settings.get("verify_ssl", True))
+        cached = {
+            "base_url": base_url.rstrip("/"),
+            "api_key": api_key,
+            "verify_ssl": verify_ssl,
+        }
+        _MODULE_SETTINGS_CACHE = cached
+        _MODULE_SETTINGS_EXPIRY = now + 30.0
+        return cached
+
+
+async def _call_endpoint(
+    endpoint: str, *, method: str = "GET", body: Any = None
+) -> Any:
+    payload = {"endpoint": endpoint, "method": method.upper()}
+    if body is not None:
+        payload["body"] = body
+    try:
+        result = await modules_service.trigger_module(
+            "tacticalrmm", payload, background=False
+        )
+    except ValueError as exc:
+        raise TacticalRMMConfigurationError(str(exc)) from exc
+    status = str(result.get("status") or "").lower()
+    if status == "skipped":
+        reason = result.get("reason") or "Tactical RMM module is disabled"
+        raise TacticalRMMConfigurationError(str(reason))
+    if status not in {"succeeded", "ok"}:
+        error_message = (
+            result.get("error")
+            or result.get("last_error")
+            or result.get("reason")
+            or "Tactical RMM request failed"
+        )
+        raise TacticalRMMAPIError(str(error_message))
+    return result.get("response")
+
+
+def _normalise_next_url(next_value: Any, base_url: str) -> str | None:
+    if not next_value:
+        return None
+    if isinstance(next_value, Mapping):
+        for key in ("url", "next", "next_url", "href"):
+            candidate = next_value.get(key)
+            if candidate:
+                next_value = candidate
+                break
+    if isinstance(next_value, Sequence) and not isinstance(
+        next_value, (str, bytes, bytearray)
+    ):
+        for candidate in next_value:
+            resolved = _normalise_next_url(candidate, base_url)
+            if resolved:
+                return resolved
+        return None
+    if not isinstance(next_value, str):
+        next_value = str(next_value)
+    if not next_value:
+        return None
+    if next_value.startswith("http://") or next_value.startswith("https://"):
+        parsed = urlparse(next_value)
+        path = parsed.path.lstrip("/")
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{path}{query}" if path or query else None
+    return next_value.lstrip("/")
+
+
+def _extract_agent_page(
+    response: Any, base_url: str
+) -> tuple[list[Mapping[str, Any]], str | None]:
+    if isinstance(response, list):
+        return [item for item in response if isinstance(item, Mapping)], None
+    if isinstance(response, Mapping):
+        for key in ("results", "agents", "items", "data"):
+            value = response.get(key)
+            if isinstance(value, list):
+                next_link = (
+                    response.get("next")
+                    or response.get("next_url")
+                    or response.get("nextLink")
+                )
+                if not next_link:
+                    pagination = response.get("links") or response.get("pagination")
+                    if isinstance(pagination, Mapping):
+                        next_link = pagination.get("next") or pagination.get("next_url")
+                next_endpoint = _normalise_next_url(next_link, base_url)
+                return [
+                    item for item in value if isinstance(item, Mapping)
+                ], next_endpoint
+        # Some endpoints may return a single agent
+        if all(key in response for key in ("id", "hostname", "client")):
+            return [response], None
+    return [], None
+
+
+def _coerce_ram_gb(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric >= 1024:
+            numeric = numeric / 1024.0
+        return round(numeric, 2)
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    lowered = text.lower()
+    if "mb" in lowered and "gb" not in lowered:
+        number = number / 1024.0
+    return round(number, 2)
+
+
+def _ram_gb_from_wmi_memory(memory: Any) -> float | None:
+    """Compute total RAM in GB by summing Capacity (bytes) from wmi_detail memory modules.
+
+    TacticalRMM stores per-module memory data as a list of lists of dicts, e.g.:
+    ``[[{"Capacity": "8589934592"}, ...], [{"Capacity": "8589934592"}, ...]]``
+    Each ``Capacity`` value is in bytes.
+
+    Returns the total installed RAM in GB rounded to 2 decimal places, or
+    ``None`` if the structure is absent, empty, or contains no valid Capacity
+    values.
+    """
+    if not isinstance(memory, list):
+        return None
+    total_bytes = 0
+    for module in memory:
+        if not isinstance(module, list):
+            continue
+        for entry in module:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("Capacity")
+            if raw is None:
+                continue
+            try:
+                total_bytes += int(raw)
+            except (TypeError, ValueError):
+                continue
+    if total_bytes <= 0:
+        return None
+    return round(total_bytes / (1024**3), 2)
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
+
+def _join_list(value: Any, separator: str = ", ") -> str | None:
+    """Convert a list to a delimited string; pass through non-list values unchanged."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        parts = [
+            str(item).strip()
+            for item in value
+            if item is not None and str(item).strip()
+        ]
+        return separator.join(parts) if parts else None
+    if isinstance(value, str):
+        return value.strip() or None
+    return str(value).strip() or None
+
+
+def _extract_motherboard_serial(hardware: Mapping[str, Any]) -> str | None:
+    """Extract the baseboard serial from Tactical RMM's WMI hardware details."""
+    for key, value in hardware.items():
+        normalised_key = re.sub(r"[^a-z]", "", str(key).lower())
+        if normalised_key in {"motherboardserialnumber", "baseboardserialnumber"}:
+            serial = _clean_text(value)
+            if serial:
+                return serial
+
+        board_keys = {"motherboard", "motherboards", "baseboard", "baseboards"}
+        if normalised_key not in board_keys:
+            continue
+
+        boards = value if isinstance(value, (list, tuple)) else (value,)
+        for board in boards:
+            # Some WMI values are wrapped in an additional list.
+            entries = board if isinstance(board, (list, tuple)) else (board,)
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                for entry_key, entry_value in entry.items():
+                    normalised_entry_key = re.sub(
+                        r"[^a-z]", "", str(entry_key).lower()
+                    )
+                    if normalised_entry_key in {"serial", "serialnumber"}:
+                        serial = _clean_text(entry_value)
+                        if serial:
+                            return serial
+    return None
+
+
+def _extract_physicaldrive0_serial(hardware: Mapping[str, Any]) -> str | None:
+    """Extract the disk serial associated with Windows PHYSICALDRIVE0."""
+    disk_keys = {"disk", "disks", "drive", "drives", "physicaldisk", "physicaldisks"}
+
+    def properties(value: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        entries = value if isinstance(value, (list, tuple)) else (value,)
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            for entry_key, entry_value in entry.items():
+                result[re.sub(r"[^a-z]", "", str(entry_key).lower())] = entry_value
+        return result
+
+    for key, value in hardware.items():
+        if re.sub(r"[^a-z]", "", str(key).lower()) not in disk_keys:
+            continue
+        disks = value if isinstance(value, (list, tuple)) else (value,)
+        for disk in disks:
+            disk_properties = properties(disk)
+            device_id = _clean_text(
+                disk_properties.get("deviceid")
+                or disk_properties.get("device")
+                or disk_properties.get("name")
+            )
+            if not device_id or "physicaldrive0" not in re.sub(
+                r"[^a-z0-9]", "", device_id.lower()
+            ):
+                continue
+            serial = _clean_text(
+                disk_properties.get("serialnumber") or disk_properties.get("serial")
+            )
+            if serial:
+                return serial
+    return None
+
+
+def _device_serial(primary_serial: Any, hardware: Mapping[str, Any]) -> str | None:
+    serial = _clean_text(primary_serial)
+    if serial is None or serial.casefold() == "to be filled by o.e.m.":
+        return (
+            _extract_motherboard_serial(hardware)
+            or _extract_physicaldrive0_serial(hardware)
+        )
+    return serial
+
+
+def _extract_mac_addresses(*sources: Any) -> str | None:
+    """Return every unique hardware MAC address in TRMM's agent payload."""
+    addresses: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                normalised_key = re.sub(r"[^a-z]", "", str(key).lower())
+                if normalised_key in {
+                    "mac",
+                    "macaddress",
+                    "macaddresses",
+                    "physicaladdress",
+                }:
+                    add(nested)
+                elif isinstance(nested, (Mapping, list, tuple)):
+                    add(nested)
+            return
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                add(nested)
+            return
+        if value is None:
+            return
+        for candidate in re.findall(
+            r"(?i)(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|[0-9a-f]{12}", str(value)
+        ):
+            compact = re.sub(r"[^0-9A-Fa-f]", "", candidate).upper()
+            if len(compact) != 12 or compact == "000000000000":
+                continue
+            mac = ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+            if mac not in seen:
+                seen.add(mac)
+                addresses.append(mac)
+
+    for source in sources:
+        add(source)
+    return ",".join(addresses) or None
+
+
+def _normalise_machine_type(value: Any) -> str | None:
+    """Return ``Physical`` or ``Virtual`` when a source value clearly identifies it."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return "Virtual" if value else "Physical"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"virtual", "vm", "virtual machine", "guest", "true", "1", "yes"}:
+        return "Virtual"
+    if text in {"physical", "bare metal", "bare-metal", "host", "false", "0", "no"}:
+        return "Physical"
+    virtual_markers = (
+        "virtual",
+        "vmware",
+        "virtualbox",
+        "kvm",
+        "qemu",
+        "hyper-v",
+        "hyperv",
+        "xen",
+        "parallels",
+        "bochs",
+        "bhyve",
+        "openstack",
+        "cloudstack",
+    )
+    if any(marker in text for marker in virtual_markers):
+        return "Virtual"
+    physical_markers = ("physical", "bare metal", "bare-metal")
+    if any(marker in text for marker in physical_markers):
+        return "Physical"
+    return None
+
+
+def _machine_type_from_sources(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, Mapping):
+            nested = _machine_type_from_sources(*value.values())
+            if nested:
+                return nested
+            continue
+        if isinstance(value, list):
+            nested = _machine_type_from_sources(*value)
+            if nested:
+                return nested
+            continue
+        machine_type = _normalise_machine_type(value)
+        if machine_type:
+            return machine_type
+    return None
+
+
+def extract_agent_details(agent: Mapping[str, Any]) -> dict[str, Any]:
+    # Support the TacticalRMM native ``wmi_detail`` sub-object as well as a
+    # generic ``hardware`` sub-object that third-party proxies may expose.
+    wmi_detail: Mapping[str, Any] = (
+        agent.get("wmi_detail") if isinstance(agent.get("wmi_detail"), Mapping) else {}
+    )
+    generic_hw: Mapping[str, Any] = (
+        agent.get("hardware") if isinstance(agent.get("hardware"), Mapping) else {}
+    )
+    hardware: Mapping[str, Any] = wmi_detail if wmi_detail else generic_hw
+
+    def _lookup(source: Mapping[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in source and source[key] not in (None, ""):
+                return source[key]
+        return None
+
+    name = _clean_text(
+        _lookup(
+            agent,
+            "agent_name",
+            "hostname",
+            "name",
+            "computername",
+        )
+    )
+    client_info = (
+        agent.get("client") if isinstance(agent.get("client"), Mapping) else {}
+    )
+    site_info = agent.get("site") if isinstance(agent.get("site"), Mapping) else {}
+
+    # ``logged_username`` is the computed field name in AgentTableSerializer;
+    # ``logged_in_username`` is the underlying model field.  Either may carry
+    # the sentinel value "-" or the string "None" when no user is active.
+    raw_last_user = _lookup(
+        agent,
+        "logged_in_username",
+        "logged_username",
+        "logged_in_user",
+        "last_logged_in_user",
+        "current_user",
+    )
+    if raw_last_user in ("-", "None", "N/A"):
+        raw_last_user = None
+
+    details = {
+        "name": name or "Agent",
+        "type": _clean_text(_lookup(agent, "monitoring_type", "agent_type", "type")),
+        "machine_type": _machine_type_from_sources(
+            _lookup(
+                agent, "machine_type", "device_machine_type", "virtualization_type"
+            ),
+            _lookup(
+                agent, "is_virtual", "is_vm", "virtual_machine", "hypervisor_present"
+            ),
+            _lookup(hardware, "machine_type", "virtualization_type"),
+            _lookup(
+                hardware, "is_virtual", "is_vm", "virtual_machine", "hypervisor_present"
+            ),
+            _lookup(agent, "make_model", "model", "manufacturer"),
+            _lookup(
+                hardware, "model", "manufacturer", "system_model", "system_manufacturer"
+            ),
+        ),
+        "serial_number": _device_serial(
+            _lookup(agent, "serial_number", "serial", "bios_serial")
+            or _lookup(hardware, "serial", "serial_number"),
+            hardware,
+        ),
+        "status": _clean_text(
+            _lookup(agent, "status", "agent_status", "monitoring_status")
+        ),
+        "os_name": _clean_text(
+            _lookup(agent, "os", "operating_system", "os_name", "os_version")
+        ),
+        # cpu_model is a list in the real TacticalRMM API – join multiple CPUs
+        "cpu_name": _clean_text(
+            _join_list(_lookup(agent, "cpu_model", "processor"))
+            or _join_list(_lookup(hardware, "cpu_model", "cpu", "processor"))
+        ),
+        "ram_gb": (
+            _coerce_ram_gb(
+                _lookup(agent, "ram_gb", "total_ram", "ram")
+                or _lookup(hardware, "ram", "total_ram")
+            )
+            or _ram_gb_from_wmi_memory(_lookup(hardware, "memory"))
+        ),
+        # physical_disks is a list in the real TacticalRMM API – join entries
+        "hdd_size": _clean_text(
+            _lookup(agent, "total_disk", "hdd_size")
+            or _join_list(_lookup(agent, "physical_disks", "disks"), separator=" | ")
+            or _lookup(hardware, "total_disk", "storage_total", "disk")
+        ),
+        "last_sync": _lookup(
+            agent,
+            "last_seen",
+            "last_checkin",
+            "checkin_time",
+            "last_sync",
+            "last_agent_checkin",
+        ),
+        "boot_time": _lookup(
+            agent,
+            "boot_time",
+            "last_boot_time",
+            "booted_at",
+        ),
+        "motherboard_manufacturer": _clean_text(
+            _lookup(hardware, "motherboard_manufacturer", "board_manufacturer")
+        ),
+        "form_factor": _clean_text(
+            _lookup(agent, "chassis", "form_factor")
+            or _lookup(hardware, "chassis_type", "form_factor")
+        ),
+        "last_user": _clean_text(raw_last_user),
+        "approx_age": _coerce_float(
+            _lookup(hardware, "system_age_years", "age_years")
+            or _lookup(agent, "system_age", "device_age")
+        ),
+        "performance_score": _coerce_float(
+            _lookup(agent, "performance_score")
+            or _lookup(hardware, "performance_score")
+        ),
+        "warranty_status": _clean_text(_lookup(agent, "warranty_status")),
+        "warranty_end_date": _lookup(
+            agent, "warranty_expires", "warranty_end", "warranty_expiration"
+        ),
+        "mac_address": _extract_mac_addresses(
+            _lookup(
+                agent,
+                "mac_address",
+                "mac_addresses",
+                "network_interfaces",
+                "network_adapters",
+            ),
+            _lookup(
+                wmi_detail,
+                "network_config",
+                "network_adapters",
+                "network_interfaces",
+                "nics",
+            ),
+            _lookup(
+                generic_hw,
+                "network_config",
+                "network_adapters",
+                "network_interfaces",
+                "nics",
+            ),
+        ),
+        "tactical_asset_id": _clean_text(_lookup(agent, "agent_id", "id", "pk")),
+        "client_id": _clean_text(
+            _lookup(client_info, "id", "pk", "client_id")
+            or _lookup(agent, "client_id", "client")
+        ),
+        "client_name": _clean_text(
+            _lookup(client_info, "name", "client")
+            or _lookup(agent, "client_name", "client")
+        ),
+        "site_name": _clean_text(
+            _lookup(site_info, "name", "site") or _lookup(agent, "site", "site_name")
+        ),
+    }
+    if (
+        not details["tactical_asset_id"]
+        and details.get("client_id")
+        and details.get("name")
+    ):
+        details["tactical_asset_id"] = f"{details['client_id']}::{details['name']}"
+    return details
+
+
+async def _fetch_agent_detail(agent_id: str) -> Mapping[str, Any] | None:
+    """Fetch full agent details from the per-agent endpoint.
+
+    The list endpoint (``/agents/``) uses ``AgentTableSerializer`` which omits
+    ``total_ram``.  The detail endpoint (``/agents/{agent_id}/``) uses
+    ``AgentSerializer`` with ``exclude = ["id"]``, so it includes ``total_ram``
+    (stored in MB) and ``wmi_detail`` which ``extract_agent_details`` can use.
+    """
+    try:
+        result = await _call_endpoint(f"agents/{agent_id}/")
+        if isinstance(result, Mapping):
+            return result
+    except (TacticalRMMAPIError, TacticalRMMConfigurationError) as exc:
+        log_error(
+            "Failed to fetch Tactical RMM agent detail",
+            agent_id=agent_id,
+            error=str(exc),
+        )
+    return None
+
+
+async def fetch_agent(agent_id: str) -> Mapping[str, Any]:
+    """Fetch one agent for an on-demand integration sync."""
+
+    clean_agent_id = str(agent_id).strip()
+    if not clean_agent_id:
+        raise ValueError("Tactical RMM agent ID is required")
+    result = await _call_endpoint(f"agents/{clean_agent_id}/")
+    if not isinstance(result, Mapping):
+        raise TacticalRMMAPIError("Tactical RMM returned an invalid agent response")
+    # AgentSerializer can omit its database ID, so retain the authoritative ID
+    # supplied by the script for asset matching.
+    agent = dict(result)
+    agent["agent_id"] = clean_agent_id
+    return agent
+
+
+async def fetch_agents(client_id: str | None = None) -> list[Mapping[str, Any]]:
+    settings = await _load_settings()
+    base_url = settings["base_url"]
+    endpoints: list[str]
+    if client_id:
+        endpoints = [
+            f"agents/?client={client_id}",
+        ]
+    else:
+        endpoints = ["agents/"]
+
+    collected: list[Mapping[str, Any]] = []
+    log_info("Fetching Tactical RMM agents", client_id=client_id)
+    for endpoint in endpoints:
+        try:
+            response = await _call_endpoint(endpoint)
+        except TacticalRMMAPIError as exc:
+            log_error(
+                "Failed to fetch Tactical RMM agents", endpoint=endpoint, error=str(exc)
+            )
+            continue
+        page_items, next_endpoint = _extract_agent_page(response, base_url)
+        if page_items:
+            collected.extend(page_items)
+        seen_endpoints: set[str] = set()
+        while next_endpoint and next_endpoint not in seen_endpoints:
+            seen_endpoints.add(next_endpoint)
+            try:
+                response = await _call_endpoint(next_endpoint)
+            except TacticalRMMAPIError as exc:
+                log_error(
+                    "Failed to fetch Tactical RMM agents page",
+                    endpoint=next_endpoint,
+                    error=str(exc),
+                )
+                break
+            page_items, next_endpoint = _extract_agent_page(response, base_url)
+            if page_items:
+                collected.extend(page_items)
+        if collected:
+            break
+
+    # The list endpoint (AgentTableSerializer) omits ``total_ram`` and
+    # ``wmi_detail``.  Enrich each agent with its full detail record so that
+    # RAM data is available for extract_agent_details().
+    if collected:
+        agent_ids = [
+            str(a.get("agent_id") or a.get("id") or "").strip() for a in collected
+        ]
+        details: list[Mapping[str, Any] | None] = list(
+            await asyncio.gather(
+                *[_fetch_agent_detail(aid) for aid in agent_ids if aid],
+                return_exceptions=True,
+            )
+        )
+        detail_map: dict[str, Mapping[str, Any]] = {}
+        for detail in details:
+            if not isinstance(detail, Mapping):
+                continue
+            did = str(detail.get("agent_id") or detail.get("id") or "").strip()
+            if did:
+                detail_map[did] = detail
+
+        enriched: list[Mapping[str, Any]] = []
+        for agent in collected:
+            aid = str(agent.get("agent_id") or agent.get("id") or "").strip()
+            if aid and aid in detail_map:
+                merged: dict[str, Any] = dict(agent)
+                merged.update(detail_map[aid])
+                enriched.append(merged)
+            else:
+                enriched.append(agent)
+        return enriched
+
+    return collected
+
+
+def extract_trmm_custom_fields(agent: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Parse custom fields from a TRMM agent response into a name-keyed dict.
+
+    Each entry in the returned dict has:
+    - ``type``: the TRMM field type (e.g. "checkbox", "text", "number")
+    - ``value``: the resolved value (bool for checkbox, str for others)
+    """
+    raw = agent.get("custom_fields")
+    if not isinstance(raw, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for field in raw:
+        if not isinstance(field, Mapping):
+            continue
+        name = _clean_text(field.get("name"))
+        if not name:
+            continue
+        field_type = _clean_text(field.get("type")) or "text"
+        if field_type == "checkbox":
+            value: Any = field.get("bool_value")
+            if value is None:
+                raw_bool = field.get("value")
+                if isinstance(raw_bool, bool):
+                    value = raw_bool
+                elif raw_bool is not None:
+                    value = str(raw_bool).lower() in ("true", "1", "yes")
+        else:
+            value = field.get("string_value")
+            if value is None:
+                value = field.get("value")
+        result[name] = {"type": field_type, "value": value}
+    return result
+
+
+def _extract_items(response: Any, *keys: str) -> list[Mapping[str, Any]]:
+    if isinstance(response, list):
+        return [item for item in response if isinstance(item, Mapping)]
+    if isinstance(response, Mapping):
+        for key in keys or ("results", "items", "data"):
+            value = response.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, Mapping)]
+        if response.get("id") is not None:
+            return [response]
+    return []
+
+
+def _script_label(script: Mapping[str, Any]) -> str:
+    for key in ("name", "filename", "script_name", "title"):
+        label = _clean_text(script.get(key))
+        if label:
+            return label
+    script_id = script.get("id") or script.get("pk")
+    return f"Script #{script_id}" if script_id is not None else "Unnamed script"
+
+
+def _script_id(script: Mapping[str, Any]) -> int | None:
+    for key in ("id", "pk", "script", "script_id"):
+        raw = script.get(key)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+async def fetch_scripts() -> list[dict[str, Any]]:
+    """Return scripts from Tactical RMM's script library for tray menu design."""
+
+    await _load_settings()
+    try:
+        response = await _call_endpoint("scripts/")
+    except (TacticalRMMAPIError, TacticalRMMConfigurationError) as exc:
+        log_error("Failed to fetch Tactical RMM scripts", error=str(exc))
+        raise
+
+    scripts: list[dict[str, Any]] = []
+    for item in _extract_items(response, "results", "scripts", "items", "data"):
+        sid = _script_id(item)
+        if sid is None:
+            continue
+        scripts.append(
+            {
+                "id": sid,
+                "name": _script_label(item),
+                "description": _clean_text(item.get("description")),
+                "category": _clean_text(item.get("category")),
+                "script_type": (
+                    _clean_text(item.get("shell"))
+                    or _clean_text(item.get("script_type"))
+                    or _clean_text(item.get("type"))
+                ),
+                "raw": dict(item),
+            }
+        )
+    scripts.sort(
+        key=lambda s: (str(s.get("name") or "").lower(), int(s.get("id") or 0))
+    )
+    return scripts
+
+
+def _script_default_body(
+    script_id: int, script: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    script = script or {}
+    timeout_raw = script.get("timeout") or script.get("default_timeout") or 90
+    try:
+        timeout = int(timeout_raw)
+    except (TypeError, ValueError):
+        timeout = 90
+    timeout = max(1, min(timeout, 86400))
+    return {
+        "output": script.get("output") or "forget",
+        "emails": script.get("emails")
+        if isinstance(script.get("emails"), list)
+        else [],
+        "emailMode": script.get("emailMode") or script.get("email_mode") or "default",
+        "custom_field": script.get("custom_field"),
+        "save_all_output": bool(script.get("save_all_output", False)),
+        "script": script_id,
+        "args": script.get("args") if isinstance(script.get("args"), list) else [],
+        "env_vars": script.get("env_vars")
+        if isinstance(script.get("env_vars"), list)
+        else [],
+        "run_as_user": bool(script.get("run_as_user", False)),
+        "timeout": timeout,
+    }
+
+
+async def run_script_on_agent(agent_id: str, script_id: int) -> dict[str, Any]:
+    """Ask Tactical RMM to run ``script_id`` on ``agent_id`` using default options."""
+
+    clean_agent_id = _clean_text(agent_id)
+    if not clean_agent_id:
+        raise TacticalRMMConfigurationError(
+            "Tactical RMM agent ID is not available for this device"
+        )
+    if int(script_id) <= 0:
+        raise TacticalRMMConfigurationError("Tactical RMM script ID is required")
+
+    script_record: Mapping[str, Any] | None = None
+    try:
+        detail = await _call_endpoint(f"scripts/{int(script_id)}/")
+        if isinstance(detail, Mapping):
+            script_record = detail
+    except TacticalRMMAPIError:
+        script_record = None
+
+    body = _script_default_body(int(script_id), script_record)
+    response = await _call_endpoint(
+        f"agents/{clean_agent_id}/runscript/",
+        method="POST",
+        body=body,
+    )
+    return {"response": response, "request": body}
+
+
+async def fetch_agent_installed_software(agent_id: str) -> list[str]:
+    """Return a list of installed software names for a TRMM agent.
+
+    Calls the ``software/{agent_id}/`` endpoint.  Returns an empty list on
+    error so that callers can degrade gracefully.
+    """
+    try:
+        result = await _call_endpoint(f"software/{agent_id}/")
+    except (TacticalRMMAPIError, TacticalRMMConfigurationError) as exc:
+        log_error(
+            "Failed to fetch installed software from Tactical RMM",
+            agent_id=agent_id,
+            error=str(exc),
+        )
+        return []
+    names: list[str] = []
+    items: list[Any] = []
+    if isinstance(result, list):
+        items = result
+    elif isinstance(result, Mapping):
+        for key in ("results", "software", "items", "data"):
+            candidate = result.get(key)
+            if isinstance(candidate, list):
+                items = candidate
+                break
+    for item in items:
+        if isinstance(item, Mapping):
+            name = _clean_text(item.get("name"))
+            if name:
+                names.append(name)
+    return names
+
+
+async def fetch_clients() -> list[Mapping[str, Any]]:
+    """
+    Fetch all Tactical RMM clients from the /beta/v1/client/ endpoint.
+
+    Returns:
+        List of client dictionaries with 'id' and 'name' fields
+    """
+    await _load_settings()
+    endpoint = "beta/v1/client/"
+
+    collected: list[Mapping[str, Any]] = []
+    log_info("Fetching Tactical RMM clients")
+
+    try:
+        response = await _call_endpoint(endpoint)
+    except TacticalRMMAPIError as exc:
+        log_error(
+            "Failed to fetch Tactical RMM clients", endpoint=endpoint, error=str(exc)
+        )
+        return collected
+
+    # The endpoint returns a list of client objects
+    if isinstance(response, list):
+        for item in response:
+            if isinstance(item, Mapping):
+                collected.append(item)
+    elif isinstance(response, Mapping):
+        # Handle paginated response with 'results' key
+        results = response.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, Mapping):
+                    collected.append(item)
+        # Handle case where response is a single client
+        elif "id" in response and "name" in response:
+            collected.append(response)
+
+    return collected

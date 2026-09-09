@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block styles %}
+  {{ super() }}
+  <link rel="stylesheet" href="{{ static_url('/static/css/bcp.css') }}">
+{% endblock %}
+
+{% block content %}
+  <div class="bcp-theme">
+    {% block bcp_content %}{% endblock %}
+  </div>
+{% endblock %}

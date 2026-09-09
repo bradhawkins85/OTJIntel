@@ -1,0 +1,1243 @@
+import asyncio
+import json
+
+import httpx
+import pytest
+
+from app.services import modules
+
+
+async def _noop(*args, **kwargs):
+    return None
+
+
+class _AsyncClientFactory:
+    def __init__(self, response):
+        self._response = response
+        self.captured_kwargs: dict[str, object] = {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, json=None, data=None, headers=None):
+        self.captured_kwargs = {
+            "url": url,
+            "json": json,
+            "data": data,
+            "headers": headers,
+        }
+        return self._response
+
+    async def request(self, method, url, json=None, headers=None):
+        self.captured_kwargs = {
+            "method": method,
+            "url": url,
+            "json": json,
+            "headers": headers,
+        }
+        return self._response
+
+
+def test_invoke_ollama_records_event_success(monkeypatch):
+    captured_event: dict[str, object] = {}
+
+    async def fake_enqueue_event(**kwargs):
+        captured_event.update(kwargs)
+        return {"id": 1, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 1,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+    attempts: list[dict[str, object]] = []
+
+    async def fake_record_attempt(**kwargs):
+        attempts.append(kwargs)
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "succeeded",
+                "attempt_count": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self._text = json.dumps({"result": "ok"})
+            self.request = httpx.Request("POST", "http://example.com")
+
+        @property
+        def text(self):
+            return self._text
+
+        def json(self):
+            return json.loads(self._text)
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(
+        modules._invoke_ollama({"base_url": "http://127.0.0.1:11434"}, {"prompt": "Hi"})
+    )
+
+    assert result["event_id"] == 1
+    assert result["status"] == "succeeded"
+    assert result["response"] == {"result": "ok"}
+    assert captured_event.get("max_attempts") == 1
+    assert "attempt_immediately" not in captured_event
+    # Request data should be recorded in the attempt
+    assert len(attempts) == 1
+    assert attempts[0]["request_headers"] == {"Content-Type": "application/json"}
+    assert attempts[0]["request_body"]["prompt"] == "Hi"
+
+
+def test_invoke_ollama_forwards_format_parameter(monkeypatch):
+    """When payload includes 'format', it should be forwarded in the Ollama request body."""
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 2, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {"id": 2, "status": "pending", "attempt_count": 0}
+
+    async def fake_record_attempt(**kwargs):
+        pass
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {"status": "succeeded", "attempt_count": attempt_number, "response_status": response_status, "response_body": response_body}
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self._text = json.dumps({"response": '{"status": "ok"}'})
+            self.request = httpx.Request("POST", "http://example.com")
+
+        @property
+        def text(self):
+            return self._text
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    asyncio.run(
+        modules._invoke_ollama(
+            {"base_url": "http://127.0.0.1:11434"},
+            {"prompt": "Analyse status", "format": "json"},
+        )
+    )
+
+    sent_body = client_factory.captured_kwargs["json"]
+    assert sent_body["format"] == "json"
+    assert sent_body["prompt"] == "Analyse status"
+
+
+def test_invoke_ollama_omits_format_when_not_provided(monkeypatch):
+    """When payload does not include 'format', it should not appear in the request body."""
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 3, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {"id": 3, "status": "pending", "attempt_count": 0}
+
+    async def fake_record_attempt(**kwargs):
+        pass
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {"status": "succeeded", "attempt_count": attempt_number, "response_status": response_status, "response_body": response_body}
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self._text = json.dumps({"response": "ok"})
+            self.request = httpx.Request("POST", "http://example.com")
+
+        @property
+        def text(self):
+            return self._text
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    asyncio.run(
+        modules._invoke_ollama(
+            {"base_url": "http://127.0.0.1:11434"},
+            {"prompt": "Hello"},
+        )
+    )
+
+    sent_body = client_factory.captured_kwargs["json"]
+    assert "format" not in sent_body
+
+
+def test_invoke_ollama_records_request_data_on_failure(monkeypatch):
+    """Request headers and body should be recorded even when the Ollama call fails."""
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 5, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {"id": 5, "status": "pending", "attempt_count": 0}
+    attempts: list[dict[str, object]] = []
+
+    async def fake_record_attempt(**kwargs):
+        attempts.append(kwargs)
+
+    async def fake_mark_event_failed(event_id, *, attempt_number, error_message, response_status, response_body):
+        fake_event_state.update(
+            {"status": "failed", "attempt_count": attempt_number, "last_error": error_message}
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    request = httpx.Request("POST", "http://example.com")
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 500
+            self.text = "error"
+            self.request = request
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError("boom", request=request, response=self)
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", fake_mark_event_failed)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(modules._invoke_ollama({"base_url": "http://localhost"}, {"prompt": "Hi"}))
+
+    assert result["status"] == "failed"
+    assert len(attempts) == 1
+    assert attempts[0]["request_headers"] == {"Content-Type": "application/json"}
+    assert attempts[0]["request_body"]["prompt"] == "Hi"
+
+
+def test_update_module_preserves_tacticalrmm_api_key_when_blank(monkeypatch):
+    stored = {
+        "slug": "tacticalrmm",
+        "enabled": True,
+        "settings": {"base_url": "https://rmm.example.com", "api_key": "secret-key", "verify_ssl": True},
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_get_module(slug: str):
+        assert slug == "tacticalrmm"
+        return stored
+
+    async def fake_update_module(slug: str, *, enabled=None, settings=None):
+        assert slug == "tacticalrmm"
+        captured.update(settings or {})
+        if settings:
+            stored["settings"].update(settings)
+        if enabled is not None:
+            stored["enabled"] = enabled
+        return {"slug": slug, "enabled": stored["enabled"], "settings": dict(stored["settings"])}
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+    monkeypatch.setattr(modules.module_repo, "update_module", fake_update_module)
+
+    result = asyncio.run(
+        modules.update_module(
+            "tacticalrmm",
+            enabled=True,
+            settings={"base_url": "https://rmm.example.com", "api_key": "", "verify_ssl": "true"},
+        )
+    )
+
+    assert captured["api_key"] == "secret-key"
+    assert result["settings"]["api_key"] == "********"
+    assert captured["verify_ssl"] is True
+
+
+def test_update_module_preserves_ntfy_auth_token_when_blank(monkeypatch):
+    stored = {
+        "slug": "ntfy",
+        "enabled": True,
+        "settings": {"base_url": "https://ntfy.sh", "topic": "alerts", "auth_token": "existing-token"},
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_get_module(slug: str):
+        assert slug == "ntfy"
+        return stored
+
+    async def fake_update_module(slug: str, *, enabled=None, settings=None):
+        assert slug == "ntfy"
+        captured.update(settings or {})
+        if settings:
+            stored["settings"].update(settings)
+        if enabled is not None:
+            stored["enabled"] = enabled
+        return {"slug": slug, "enabled": stored["enabled"], "settings": dict(stored["settings"])}
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+    monkeypatch.setattr(modules.module_repo, "update_module", fake_update_module)
+
+    result = asyncio.run(
+        modules.update_module(
+            "ntfy",
+            enabled=False,
+            settings={"base_url": " https://ntfy.example.com/ ", "topic": "critical", "auth_token": ""},
+        )
+    )
+
+    assert captured["auth_token"] == "existing-token"
+    assert captured["base_url"] == "https://ntfy.example.com"
+    assert result["settings"]["auth_token"] == "********"
+
+
+def test_list_modules_redacts_tacticalrmm_and_ntfy(monkeypatch):
+    async def fake_list_modules():
+        return [
+            {
+                "slug": "tacticalrmm",
+                "enabled": True,
+                "settings": {"base_url": "https://rmm.example.com", "api_key": "secret-key"},
+            },
+            {
+                "slug": "ntfy",
+                "enabled": True,
+                "settings": {"base_url": "https://ntfy.example.com", "topic": "alerts", "auth_token": "existing-token"},
+            },
+        ]
+
+    monkeypatch.setattr(modules.module_repo, "list_modules", fake_list_modules)
+
+    module_list = asyncio.run(modules.list_modules())
+
+    assert module_list[0]["settings"]["api_key"] == "********"
+    assert module_list[1]["settings"]["auth_token"] == "********"
+
+
+def test_invoke_ollama_uses_default_model_when_blank(monkeypatch):
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 12, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 12,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state["attempt_count"] = kwargs["attempt_number"]
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "succeeded",
+                "attempt_count": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self._text = json.dumps({"result": "ok"})
+            self.request = httpx.Request("POST", "http://example.com")
+
+        @property
+        def text(self):
+            return self._text
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(
+        modules._invoke_ollama(
+            {"base_url": "  http://127.0.0.1:11434/  ", "model": "   "},
+            {"prompt": "Hi"},
+        )
+    )
+
+    assert result["status"] == "succeeded"
+    assert client_factory.captured_kwargs["json"]["model"] == modules._DEFAULT_OLLAMA_MODEL
+    assert client_factory.captured_kwargs["url"] == f"{modules._DEFAULT_OLLAMA_BASE_URL}/api/generate"
+
+
+def test_invoke_ollama_supports_openai_chat_completions(monkeypatch):
+    async def fake_enqueue_event(**kwargs):
+        assert kwargs["name"] == "module.ollama.openai.generate"
+        assert kwargs["headers"]["Authorization"] == "********"
+        return {"id": 22, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {"id": 22, "status": "pending", "attempt_count": 0}
+    attempts: list[dict[str, object]] = []
+
+    async def fake_record_attempt(**kwargs):
+        attempts.append(kwargs)
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update({"status": "succeeded", "attempt_count": attempt_number, "response_status": response_status, "response_body": response_body})
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        status_code = 200
+        text = json.dumps({"choices": [{"message": {"content": "ok"}}]})
+        request = httpx.Request("POST", "http://example.com")
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(modules._invoke_ollama({"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"}, {"prompt": "Hi", "format": "json"}))
+
+    assert result["provider"] == "openai"
+    assert client_factory.captured_kwargs["url"] == "https://api.openai.com/v1/chat/completions"
+    assert client_factory.captured_kwargs["headers"]["Authorization"] == "Bearer sk-test"
+    assert client_factory.captured_kwargs["json"]["messages"] == [{"role": "user", "content": "Hi"}]
+    assert client_factory.captured_kwargs["json"]["response_format"] == {"type": "json_object"}
+    assert attempts[0]["request_headers"]["Authorization"] == "********"
+
+
+def test_invoke_ollama_supports_llamacpp_openai_compatible_endpoint(monkeypatch):
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 23, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {"id": 23, "status": "pending", "attempt_count": 0}
+
+    async def fake_record_attempt(**kwargs):
+        pass
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update({"status": "succeeded", "attempt_count": attempt_number, "response_status": response_status, "response_body": response_body})
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        status_code = 200
+        text = json.dumps({"choices": [{"message": {"content": "ok"}}]})
+        request = httpx.Request("POST", "http://example.com")
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(modules._invoke_ollama({"provider": "llamacpp", "base_url": "http://llama.local:8080", "model": "local-model"}, {"prompt": "Hi"}))
+
+    assert result["provider"] == "llamacpp"
+    assert result["response"]["response"] == "ok"
+    assert result["response"]["message"] == "ok"
+    assert result["response"]["text"] == "ok"
+    assert result["response"]["choices"] == [{"message": {"content": "ok"}}]
+    assert client_factory.captured_kwargs["url"] == "http://llama.local:8080/v1/chat/completions"
+    assert "Authorization" not in client_factory.captured_kwargs["headers"]
+
+def test_invoke_ollama_records_event_failure(monkeypatch):
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 4, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 4,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state["attempt_count"] = kwargs["attempt_number"]
+        fake_event_state["response_status"] = kwargs["response_status"]
+        fake_event_state["response_body"] = kwargs["response_body"]
+        fake_event_state["last_error"] = kwargs["error_message"]
+
+    async def fake_mark_event_failed(event_id, *, attempt_number, error_message, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "failed",
+                "attempt_count": attempt_number,
+                "last_error": error_message,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    request = httpx.Request("POST", "http://example.com")
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 500
+            self.text = "error"
+            self.request = request
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError("boom", request=request, response=self)
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", fake_mark_event_failed)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(modules._invoke_ollama({"base_url": "http://localhost"}, {"prompt": "Hi"}))
+
+    assert result["event_id"] == 4
+    assert result["status"] == "failed"
+    assert result["last_error"].startswith("HTTP 500")
+
+
+def test_invoke_smtp_records_success(monkeypatch):
+    captured_event: dict[str, object] = {}
+
+    async def fake_enqueue_event(**kwargs):
+        captured_event.update(kwargs)
+        return {"id": 7, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 7,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state.update(
+            {
+                "attempt_count": kwargs["attempt_number"],
+                "response_status": kwargs["response_status"],
+                "response_body": kwargs["response_body"],
+            }
+        )
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "succeeded",
+                "attempt_count": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    async def fake_send_email(**kwargs):
+        captured_event["email_kwargs"] = kwargs
+        return True, {"id": 70, "status": "succeeded"}
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.email_service, "send_email", fake_send_email)
+
+    result = asyncio.run(
+        modules._invoke_smtp(
+            {"from_address": "alerts@example.com"},
+            {"recipients": ["user@example.com"], "subject": "Test"},
+        )
+    )
+
+    assert result["event_id"] == 7
+    assert result["status"] == "succeeded"
+    assert result["recipients"] == ["user@example.com"]
+    assert captured_event.get("max_attempts") == 1
+    assert "attempt_immediately" not in captured_event
+    assert result["email_event_id"] == 70
+    assert "email_kwargs" in captured_event
+
+
+def test_invoke_smtp_records_failure(monkeypatch):
+    async def fake_enqueue_event(**kwargs):
+        return {"id": 9, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 9,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state.update(
+            {
+                "attempt_count": kwargs["attempt_number"],
+                "response_status": kwargs["response_status"],
+                "response_body": kwargs["response_body"],
+                "last_error": kwargs["error_message"],
+            }
+        )
+
+    async def fake_mark_event_failed(event_id, *, attempt_number, error_message, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "failed",
+                "attempt_count": attempt_number,
+                "last_error": error_message,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    async def fake_send_email(**kwargs):
+        return False, None
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", fake_mark_event_failed)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.email_service, "send_email", fake_send_email)
+
+    result = asyncio.run(
+        modules._invoke_smtp(
+            {"from_address": "alerts@example.com"},
+            {"recipients": ["user@example.com"], "subject": "Test"},
+        )
+    )
+
+    assert result["event_id"] == 9
+    assert result["status"] == "failed"
+    assert "last_error" in result
+    assert result.get("email_event_id") is None
+
+
+def test_tacticalrmm_calls_per_second_defaults_to_one(monkeypatch):
+    monkeypatch.delenv("TACTICALRMM_CALLS_PER_SECOND", raising=False)
+    assert modules._get_tacticalrmm_calls_per_second() == 1.0
+
+
+@pytest.mark.parametrize("raw_value", ["", "0", "-1", "not-a-number"])
+def test_tacticalrmm_calls_per_second_rejects_invalid_values(monkeypatch, raw_value):
+    monkeypatch.setenv("TACTICALRMM_CALLS_PER_SECOND", raw_value)
+    assert modules._get_tacticalrmm_calls_per_second() == 1.0
+
+
+def test_tacticalrmm_calls_per_second_uses_env_value(monkeypatch):
+    monkeypatch.setenv("TACTICALRMM_CALLS_PER_SECOND", "2.5")
+    assert modules._get_tacticalrmm_calls_per_second() == 2.5
+
+
+def test_tacticalrmm_throttle_waits_between_calls(monkeypatch):
+    sleep_calls: list[float] = []
+    current_time = 100.0
+
+    class FakeLoop:
+        def time(self):
+            return current_time
+
+    async def fake_sleep(delay):
+        nonlocal current_time
+        sleep_calls.append(delay)
+        current_time += delay
+
+    monkeypatch.setenv("TACTICALRMM_CALLS_PER_SECOND", "2")
+    monkeypatch.setattr(modules.asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(modules.asyncio, "sleep", fake_sleep)
+    modules._TACTICALRMM_LAST_REQUEST_AT = None
+
+    async def run_throttle_twice():
+        await modules._throttle_tacticalrmm_request()
+        await modules._throttle_tacticalrmm_request()
+
+    try:
+        asyncio.run(run_throttle_twice())
+    finally:
+        modules._TACTICALRMM_LAST_REQUEST_AT = None
+
+    assert sleep_calls == [0.5]
+
+def test_invoke_tacticalrmm_records_success(monkeypatch):
+    captured_event: dict[str, object] = {}
+
+    async def fake_enqueue_event(**kwargs):
+        captured_event.update(kwargs)
+        return {"id": 11, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 11,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state.update(
+            {
+                "attempt_count": kwargs["attempt_number"],
+                "response_status": kwargs["response_status"],
+                "response_body": kwargs["response_body"],
+            }
+        )
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "succeeded",
+                "attempt_count": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 201
+            self._text = json.dumps({"ok": True})
+            self.request = httpx.Request("POST", "http://example.com")
+
+        @property
+        def text(self):
+            return self._text
+
+        def json(self):
+            return json.loads(self._text)
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(
+        modules._invoke_tacticalrmm(
+            {"base_url": "https://rmm.example.com", "api_key": "abc", "verify_ssl": False},
+            {"endpoint": "/api/run", "body": {"id": 1}},
+        )
+    )
+
+    assert result["event_id"] == 11
+    assert result["status"] == "succeeded"
+    assert result["status_code"] == 201
+    assert client_factory.captured_kwargs["headers"].get("X-API-KEY") == "abc"
+    assert captured_event.get("max_attempts") == 1
+    assert "attempt_immediately" not in captured_event
+
+
+def test_push_companies_to_tacticalrmm_requires_module(monkeypatch):
+    async def fake_get_module(slug):
+        return None
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+
+    with pytest.raises(ValueError):
+        asyncio.run(modules.push_companies_to_tacticalrmm())
+
+
+def test_push_companies_to_tacticalrmm_validates_configuration(monkeypatch):
+    async def fake_get_module(slug):
+        return {"slug": slug, "settings": {"base_url": "", "api_key": ""}}
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+
+    with pytest.raises(ValueError):
+        asyncio.run(modules.push_companies_to_tacticalrmm())
+
+
+def test_push_companies_to_tacticalrmm_creates_clients_and_sites(monkeypatch):
+    module_record = {
+        "slug": "tacticalrmm",
+        "settings": {"base_url": "https://rmm.example.com", "api_key": "token", "verify_ssl": True},
+    }
+
+    async def fake_get_module(slug):
+        return module_record
+
+    async def fake_list_companies():
+        return [
+            {"id": 1, "name": "Alpha"},
+            {"id": 2, "name": "Beta"},
+        ]
+
+    call_payloads: list[dict[str, object]] = []
+    responses = [
+        {"status": "succeeded", "response": [{"id": 21, "name": "Beta", "sites": [{"id": 5, "name": "North"}]}]},
+        {"status": "succeeded", "event_id": 101},
+        {"status": "succeeded", "event_id": 102},
+    ]
+
+    async def fake_invoke(settings, payload, event_future=None):
+        call_payloads.append(payload)
+        if responses:
+            return responses.pop(0)
+        raise AssertionError("Unexpected TacticalRMM invocation")
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+    monkeypatch.setattr(modules.company_repo, "list_companies", fake_list_companies)
+    monkeypatch.setattr(modules, "_invoke_tacticalrmm", fake_invoke)
+
+    summary = asyncio.run(modules.push_companies_to_tacticalrmm())
+
+    assert summary["created_clients"] == ["Alpha"]
+    assert summary["existing_clients"] == ["Beta"]
+    assert not summary["errors"]
+
+    created_sites = summary["created_sites"]
+    assert any(
+        entry["company"] == "Alpha" and entry["action"] == "created_with_client"
+        for entry in created_sites
+    )
+    assert any(
+        entry["company"] == "Beta" and entry["action"] == "created_for_existing_client"
+        for entry in created_sites
+    )
+
+    assert call_payloads[0] == {"endpoint": "/clients/", "method": "GET"}
+    assert call_payloads[1]["endpoint"] == "/clients/"
+    assert call_payloads[1]["method"] == "POST"
+    assert call_payloads[2]["endpoint"] == "/clients/sites/"
+    assert call_payloads[2]["method"] == "POST"
+    assert len(call_payloads) == 3
+def test_invoke_ntfy_records_success(monkeypatch):
+    captured_event: dict[str, object] = {}
+
+    async def fake_enqueue_event(**kwargs):
+        captured_event.update(kwargs)
+        return {"id": 15, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 15,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state.update(
+            {
+                "attempt_count": kwargs["attempt_number"],
+                "response_status": kwargs["response_status"],
+                "response_body": kwargs["response_body"],
+            }
+        )
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "succeeded",
+                "attempt_count": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.text = "ok"
+            self.request = httpx.Request("POST", "http://example.com")
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    result = asyncio.run(
+        modules._invoke_ntfy(
+            {"base_url": "https://ntfy.sh", "topic": "alerts"},
+            {"message": "hello", "priority": "high"},
+        )
+    )
+
+    request_kwargs = client_factory.captured_kwargs
+
+    assert result["event_id"] == 15
+    assert result["status"] == "succeeded"
+    assert result["topic"] == "alerts"
+    assert result["priority"] == "high"
+    assert result["title"] == "Automation event"
+    assert captured_event.get("max_attempts") == 1
+    assert "attempt_immediately" not in captured_event
+    assert captured_event.get("payload") == {
+        "topic": "alerts",
+        "message": "hello",
+        "priority": "high",
+        "title": "Automation event",
+        "headers": {
+            "Title": "Automation event",
+            "Priority": "high",
+        },
+    }
+    assert request_kwargs["url"] == "https://ntfy.sh/alerts"
+    assert request_kwargs["data"] == b"hello"
+    assert request_kwargs["headers"]["Title"] == "Automation event"
+    assert request_kwargs["headers"]["Priority"] == "high"
+
+
+def test_invoke_ntfy_payload_overrides_defaults(monkeypatch):
+    captured_event: dict[str, object] = {}
+
+    async def fake_enqueue_event(**kwargs):
+        captured_event.update(kwargs)
+        return {"id": 18, "status": "pending", "attempt_count": 0}
+
+    fake_event_state = {
+        "id": 18,
+        "status": "pending",
+        "attempt_count": 0,
+    }
+
+    async def fake_record_attempt(**kwargs):
+        fake_event_state.update(
+            {
+                "attempt_count": kwargs["attempt_number"],
+                "response_status": kwargs["response_status"],
+                "response_body": kwargs["response_body"],
+            }
+        )
+
+    async def fake_mark_event_completed(event_id, *, attempt_number, response_status, response_body):
+        fake_event_state.update(
+            {
+                "status": "succeeded",
+                "attempt_count": attempt_number,
+                "response_status": response_status,
+                "response_body": response_body,
+            }
+        )
+
+    async def fake_get_event(event_id):
+        return dict(fake_event_state)
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.text = "ok"
+            self.request = httpx.Request("POST", "http://example.com")
+
+        def raise_for_status(self):
+            return None
+
+    client_factory = _AsyncClientFactory(FakeResponse())
+
+    monkeypatch.setattr(modules.webhook_monitor, "create_manual_event", fake_enqueue_event)
+    monkeypatch.setattr(modules.webhook_repo, "record_attempt", fake_record_attempt)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_completed", fake_mark_event_completed)
+    monkeypatch.setattr(modules.webhook_repo, "mark_event_failed", _noop)
+    monkeypatch.setattr(modules.webhook_repo, "get_event", fake_get_event)
+    monkeypatch.setattr(modules.httpx, "AsyncClient", lambda *a, **kw: client_factory)
+
+    payload = {
+        "base_url": "https://alerts.example.com",
+        "topic": "custom-topic",
+        "auth_token": "payload-token",
+        "title": "Ticket created",
+        "message": {"text": "Ticket #1"},
+        "priority": 5,
+        "tags": ["tickets", "created"],
+        "click": "https://portal.example.com/tickets/1",
+        "headers": {"Custom-Header": "value"},
+    }
+
+    result = asyncio.run(
+        modules._invoke_ntfy(
+            {"base_url": "https://ntfy.sh", "topic": "alerts", "auth_token": "settings-token"},
+            payload,
+        )
+    )
+
+    request_kwargs = client_factory.captured_kwargs
+    expected_message = json.dumps({"text": "Ticket #1"}).encode("utf-8")
+
+    assert request_kwargs["url"] == "https://alerts.example.com/custom-topic"
+    assert request_kwargs["data"] == expected_message
+    assert request_kwargs["headers"]["Title"] == "Ticket created"
+    assert request_kwargs["headers"]["Priority"] == "5"
+    assert request_kwargs["headers"]["Tags"] == "tickets,created"
+    assert request_kwargs["headers"]["Click"] == "https://portal.example.com/tickets/1"
+    assert request_kwargs["headers"]["Authorization"] == "Bearer payload-token"
+    assert request_kwargs["headers"]["Custom-Header"] == "value"
+
+    assert captured_event.get("payload") == {
+        "topic": "custom-topic",
+        "message": json.dumps({"text": "Ticket #1"}),
+        "priority": "5",
+        "title": "Ticket created",
+        "headers": {
+            "Title": "Ticket created",
+            "Priority": "5",
+            "Tags": "tickets,created",
+            "Click": "https://portal.example.com/tickets/1",
+            "Authorization": "Bearer payload-token",
+            "Custom-Header": "value",
+        },
+    }
+
+    assert result["status"] == "succeeded"
+    assert result["topic"] == "custom-topic"
+    assert result["priority"] == "5"
+    assert result["title"] == "Ticket created"
+    assert captured_event.get("max_attempts") == 1
+    assert "attempt_immediately" not in captured_event
+
+
+def test_validate_xero_reports_credentials_presence():
+    settings_with_all = {
+        "client_id": "test-client-id",
+        "client_secret": "test-secret",
+        "refresh_token": "test-token",
+        "tenant_id": "test-tenant",
+    }
+    
+    result = asyncio.run(modules._validate_xero(settings_with_all, {}))
+    
+    assert result["status"] == "ok"
+    assert result["has_client_id"] is True
+    assert result["has_client_secret"] is True
+    assert result["has_refresh_token"] is True
+    assert result["has_tenant_id"] is True
+
+
+def test_validate_xero_reports_missing_credentials():
+    settings_partial = {
+        "client_id": "test-client-id",
+        "client_secret": "",
+        "refresh_token": "test-token",
+        "tenant_id": "",
+    }
+
+    result = asyncio.run(modules._validate_xero(settings_partial, {}))
+
+    assert result["status"] == "ok"
+    assert result["has_client_id"] is True
+    assert result["has_client_secret"] is False
+    assert result["has_refresh_token"] is True
+    assert result["has_tenant_id"] is False
+
+
+def test_validate_plausible_uses_env_pepper(monkeypatch):
+    monkeypatch.setenv("PLAUSIBLE_PEPPER", "env-pepper")
+
+    result = asyncio.run(
+        modules._validate_plausible(
+        {
+            "base_url": "https://plausible.io",
+            "site_domain": "example.com",
+            "track_pageviews": True,
+            "send_to_plausible": True,
+            "pepper": "",
+        },
+        {},
+        )
+    )
+
+    assert result["has_pepper"] is True
+
+
+def test_update_module_preserves_uptimekuma_secret_when_blank(monkeypatch):
+    """Saving UptimeKuma settings with a blank secret field must not clear an existing hash."""
+    import hashlib
+
+    existing_hash = hashlib.sha256("my-secret".encode()).hexdigest()
+    stored = {
+        "slug": "uptimekuma",
+        "enabled": True,
+        "settings": {"shared_secret_hash": existing_hash, "sync_service_status": True},
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_get_module(slug: str):
+        assert slug == "uptimekuma"
+        return stored
+
+    async def fake_update_module(slug: str, *, enabled=None, settings=None):
+        assert slug == "uptimekuma"
+        captured.update(settings or {})
+        return {"slug": slug, "enabled": stored["enabled"], "settings": dict(settings or {})}
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+    monkeypatch.setattr(modules.module_repo, "update_module", fake_update_module)
+
+    asyncio.run(
+        modules.update_module(
+            "uptimekuma",
+            enabled=True,
+            settings={"shared_secret": "", "sync_service_status": "true"},
+        )
+    )
+
+    assert captured["shared_secret_hash"] == existing_hash
+
+
+def test_update_module_preserves_chatgpt_mcp_secret_when_blank(monkeypatch):
+    """Saving chatgpt-mcp settings with a blank secret field must not clear an existing hash."""
+    import hashlib
+
+    existing_hash = hashlib.sha256("chatgpt-secret".encode()).hexdigest()
+    stored = {
+        "slug": "chatgpt-mcp",
+        "enabled": True,
+        "settings": {"shared_secret_hash": existing_hash, "allowed_actions": [], "max_results": 50,
+                     "allow_ticket_updates": False, "allowed_statuses": [], "system_user_id": None},
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_get_module(slug: str):
+        return stored
+
+    async def fake_update_module(slug: str, *, enabled=None, settings=None):
+        captured.update(settings or {})
+        return {"slug": slug, "enabled": stored["enabled"], "settings": dict(settings or {})}
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+    monkeypatch.setattr(modules.module_repo, "update_module", fake_update_module)
+
+    asyncio.run(
+        modules.update_module(
+            "chatgpt-mcp",
+            enabled=True,
+            settings={"shared_secret": ""},
+        )
+    )
+
+    assert captured["shared_secret_hash"] == existing_hash
+
+
+def test_update_module_preserves_ollama_mcp_secret_when_blank(monkeypatch):
+    """Saving ollama-mcp settings with a blank secret field must not clear an existing hash."""
+    import hashlib
+
+    existing_hash = hashlib.sha256("ollama-secret".encode()).hexdigest()
+    stored = {
+        "slug": "ollama-mcp",
+        "enabled": True,
+        "settings": {"shared_secret_hash": existing_hash, "allowed_actions": [], "max_results": 25,
+                     "allow_ticket_replies": False, "allow_ticket_updates": False,
+                     "allowed_statuses": [], "system_user_id": None,
+                     "include_internal_replies": False, "server_name": "MyPortal Ollama MCP",
+                     "server_version": "1.0.0"},
+    }
+    captured: dict[str, object] = {}
+
+    async def fake_get_module(slug: str):
+        return stored
+
+    async def fake_update_module(slug: str, *, enabled=None, settings=None):
+        captured.update(settings or {})
+        return {"slug": slug, "enabled": stored["enabled"], "settings": dict(settings or {})}
+
+    monkeypatch.setattr(modules.module_repo, "get_module", fake_get_module)
+    monkeypatch.setattr(modules.module_repo, "update_module", fake_update_module)
+
+    asyncio.run(
+        modules.update_module(
+            "ollama-mcp",
+            enabled=True,
+            settings={"shared_secret": ""},
+        )
+    )
+
+    assert captured["shared_secret_hash"] == existing_hash
+
+
+def test_huntress_default_module_is_registered():
+    """Huntress must be present in DEFAULT_MODULES with no settings UI."""
+    from app.services import modules
+
+    huntress = next(
+        (module for module in modules.DEFAULT_MODULES if module["slug"] == "huntress"),
+        None,
+    )
+    assert huntress is not None, "Huntress is not registered in DEFAULT_MODULES"
+    assert huntress["name"] == "Huntress"
+    # No UI settings — credentials live in environment variables.
+    assert huntress["settings"] == {}
+
+
+def test_huntress_module_is_non_triggerable():
+    """Huntress is a report ingester, not an action module."""
+    from app.services import modules
+
+    assert "huntress" in modules._NON_TRIGGERABLE_MODULE_SLUGS
