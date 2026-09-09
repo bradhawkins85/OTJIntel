@@ -1,1 +1,0 @@
-ALTER TABLE marketing_pages ADD COLUMN is_published TINYINT(1) NOT NULL DEFAULT 1;

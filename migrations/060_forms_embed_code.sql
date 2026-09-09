@@ -1,2 +1,0 @@
-ALTER TABLE forms
-  ADD COLUMN embed_code TEXT NULL AFTER url;

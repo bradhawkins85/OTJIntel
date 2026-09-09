@@ -61,20 +61,15 @@ from app.api.routes import (
     audit_logs,
     auth,
     automations as automations_api,
-    backup_jobs as backup_jobs_api,
     bc5,
     bc11,
     bcp,
     business_continuity_plans as bc_plans_api,
-    call_recordings as call_recordings_api,
-    click_to_call as click_to_call_api,
     companies,
     dashboard as dashboard_api,
     essential8 as essential8_api,
     compliance_checks as compliance_checks_api,
     email_blocklist as email_blocklist_api,
-    forms as forms_api,
-    invoices as invoices_api,
     issues as issues_api,
     knowledge_base as knowledge_base_api,
     licenses as licenses_api,
@@ -83,24 +78,17 @@ from app.api.routes import (
     message_templates as message_templates_api,
     modules as modules_api,
     notifications,
-    orders as orders_api,
     ports,
     plugins as plugins_api,
-    quotes as quotes_api,
     scheduler as scheduler_api,
     roles,
     service_status as service_status_api,
     staff as staff_api,
-    subscriptions as subscriptions_api,
     tag_exclusions,
     tickets as tickets_api,
-    tray as tray_api,
     users,
     system,
-    xero,
-    chat as chat_api,
     features as features_api,
-    defender as defender_api,
 )
 from uuid import uuid4
 
@@ -115,28 +103,18 @@ from app.repositories import audit_logs as audit_repo
 from app.repositories import api_keys as api_key_repo
 from app.repositories import auth as auth_repo
 from app.repositories import assets as assets_repo
-from app.repositories import billing_contacts as billing_contacts_repo
 from app.repositories import companies as company_repo
 from app.repositories import company_memberships as membership_repo
-from app.repositories import company_recurring_invoice_items as recurring_items_repo
 from app.repositories import change_log as change_log_repo
 from app.repositories import assets as asset_repo
 from app.repositories import licenses as license_repo
 from app.repositories import license_sku_friendly_names as sku_friendly_repo
-from app.repositories import forms as forms_repo
 from app.repositories import knowledge_base as knowledge_base_repo
 from app.repositories import m365 as m365_repo
 from app.repositories import notifications as notifications_repo
-from app.repositories import chat as chat_repo
-from app.repositories import defender as defender_repo
 from app.repositories import reporting as reporting_repo
 from app.repositories import roles as role_repo
-from app.repositories import shop as shop_repo
-from app.repositories import stock_feed as stock_feed_repo
-from app.repositories import cart as cart_repo
 from app.repositories import scheduled_tasks as scheduled_tasks_repo
-from app.repositories import subscription_categories as subscription_categories_repo
-from app.repositories import subscriptions as subscriptions_repo
 from app.repositories import staff as staff_repo
 from app.repositories import staff_onboarding_workflows as staff_workflow_repo
 from app.repositories import staff_requests as staff_requests_repo
@@ -187,46 +165,29 @@ from app.services import company_domains
 from app.services import company_access
 from app.services import dashboard as dashboard_service
 from app.services import email as email_service
-from app.services import m365_mail as m365_mail_service
-from app.services import user_m365_contacts as user_m365_contacts_service
 from app.services import rag_relationships as rag_relationship_service
 from app.services import m365 as m365_service
-from app.services import cis_benchmark as cis_benchmark_service
-from app.services import m365_best_practices as m365_best_practices_service
 from app.services import modules as modules_service
 from app.services import notification_event_settings as event_settings_service
 from app.services import message_templates as message_templates_service
-from app.services import products as products_service
-from app.services import shop as shop_service
-from app.services import shop_packages as shop_packages_service
 from app.services import staff_access as staff_access_service
 from app.services import staff_field_config as staff_field_config_service
 from app.services import staff_onboarding_workflows as staff_onboarding_workflow_service
 from app.services import labour_types as labour_types_service
-from app.services import subscription_shop_integration
 from app.services import tickets as tickets_service
 from app.services import rag_index as rag_index_service
 from app.services import ticket_attachments as attachments_service
 from app.services import template_variables
 from app.services import webhook_monitor
-from app.services import xero as xero_service
 from app.services import issues as issues_service
 from app.services import reports as reports_service
 from app.services import reporting as reporting_service
 from app.services import service_status as service_status_service
 from app.services import system_state as system_state_service
-from app.services import backup_jobs as backup_jobs_service
 from app.services import impersonation as impersonation_service
 from app.services.realtime import refresh_notifier
 from app.services.redis import close_redis_client, get_redis_client
 from app.services.sanitization import sanitize_rich_text
-from app.services.opnform import (
-    OpnformValidationError,
-    extract_allowed_host,
-    normalize_opnform_embed_code,
-    normalize_opnform_form_url,
-)
-from app.services.file_storage import delete_stored_file, store_product_image, store_report_cover_image
 
 configure_logging()
 settings = get_settings()
@@ -234,7 +195,6 @@ templates_config = get_templates_config()
 oauth_state_serializer = URLSafeSerializer(settings.secret_key, salt="m365-oauth")
 PWA_THEME_COLOR = "#0f172a"
 PWA_BACKGROUND_COLOR = "#0f172a"
-SHOP_LOW_STOCK_THRESHOLD = 5
 _TICKET_DASHBOARD_REFERENCE_TTL_SECONDS = 60
 _ticket_dashboard_reference_cache: dict[str, Any] = {
     "expires_at": None,
@@ -335,11 +295,6 @@ _PWA_ICON_SOURCES = [
         "purpose": "any maskable",
     },
 ]
-OPNFORM_ALLOWED_HOST = extract_allowed_host(
-    str(settings.opnform_base_url) if settings.opnform_base_url else None
-)
-
-
 def _random_daily_cron() -> str:
     """Return a randomised daily cron expression (``MM HH * * *``)."""
     minute = random.randint(0, 59)
@@ -347,21 +302,6 @@ def _random_daily_cron() -> str:
     return f"{minute} {hour} * * *"
 
 
-def _opnform_base_url() -> str | None:
-    if settings.opnform_base_url:
-        base = str(settings.opnform_base_url)
-        return base if base.endswith("/") else f"{base}/"
-    return "/myforms/"
-
-
-def _build_xero_redirect_uri() -> str:
-    """Build Xero OAuth redirect URI using PORTAL_URL setting.
-
-    Delegates to the xero routes module so the logic is defined in one place.
-    """
-    from app.api.routes.xero import _build_xero_redirect_uri as _xero_uri
-
-    return _xero_uri()
 
 
 async def _store_pkce_verifier(code_verifier: str) -> str:
@@ -495,20 +435,9 @@ TASK_COMMAND_LABELS: dict[str, str] = {
     "sync_m365_data": "Sync Microsoft 365 data (legacy)",
     "sync_m365_licenses": "Sync Microsoft 365 licenses",
     "sync_m365_contacts": "Sync Microsoft 365 contacts",
-    "sync_m365_mailboxes": "Sync Microsoft 365 mailboxes",
     "refresh_m365_consent_status": "Refresh Microsoft 365 consent status",
-    "sync_to_xero": "Sync to Xero",
-    "sync_to_xero_auto_send": "Sync to Xero (Auto Send)",
-    "generate_invoice": "Generate Invoice",
     "unbill_time_entries": "Un-Bill Time Entries",
-    "send_price_change_notifications": "Send Price Change Notification",
     "create_scheduled_ticket": "Create scheduled ticket",
-    "sync_recordings": "Sync call recordings",
-    "sync_unifi_talk_recordings": "Sync Unifi Talk recordings",
-    "queue_transcriptions": "Queue transcriptions",
-    "process_transcription": "Process transcription",
-    "sync_huntress": "Sync Huntress data",
-    "update_tray_icon_installer": "Update Tray Icon Installer",
     "rag_index_start": "RAG start indexing",
     "rag_index_stop": "RAG stop indexing",
     "rag_matching_pause": "RAG pause matching",
@@ -516,8 +445,6 @@ TASK_COMMAND_LABELS: dict[str, str] = {
     "rag_cleanup_stale_matches": "RAG cleanup stale matches",
     "sync_tactical_assets": "Sync Tactical RMM assets",
     "system_update": "Update MyPortal system",
-    "update_products": "Update Shop Products",
-    "update_stock_feed": "Update Shop Stock Feed",
 }
 
 
@@ -525,9 +452,6 @@ def _scheduled_task_command_label(command: str) -> str:
     """Return a friendly display label for a scheduled task command."""
     if command in TASK_COMMAND_LABELS:
         return TASK_COMMAND_LABELS[command]
-    if command.startswith("m365_mail_sync:"):
-        account_id = command.partition(":")[2]
-        return f"Sync Microsoft 365 mailbox {account_id}"
     return command.replace("_", " ").replace(":", " ").strip().title()
 
 app = FastAPI(
@@ -579,23 +503,8 @@ async def _get_extra_csp_script_sources() -> list[str]:
     sources = []
     
     try:
-        # Check for Plausible analytics module
         module_list = await modules_service.list_modules()
         module_lookup = {module.get("slug"): module for module in module_list if module.get("slug")}
-        
-        plausible_module = module_lookup.get("plausible")
-        if plausible_module and plausible_module.get("enabled"):
-            plausible_settings = plausible_module.get("settings") or {}
-            base_url = (plausible_settings.get("base_url") or "")
-            if isinstance(base_url, str):
-                base_url = base_url.strip().rstrip("/")
-            else:
-                base_url = ""
-            
-            # Validate base_url - must be HTTPS with actual content after the protocol
-            if base_url.startswith("https://") and len(base_url) > 8:  # len("https://") = 8
-                # Add the base URL as a script source (this allows loading /js/script.js from it)
-                sources.append(base_url)
     except Exception:
         # If we fail to get module config, return empty list
         # The CSP will still work with default sources
@@ -663,7 +572,6 @@ if settings.ip_whitelist_enabled and settings.ip_whitelist:
         "/api/auth/login",
         "/api/auth/register",
         "/api/webhooks",  # Webhooks use signature verification instead
-        "/api/integration-modules/xero/webhook",
         "/manifest.webmanifest",
         "/service-worker.js",
     ]
@@ -745,7 +653,6 @@ def _user_upload_key(request: Request) -> str:
 # Apply to common upload endpoints
 upload_paths = [
     "/api/tickets/attachments",
-    "/api/shop/products/image",
     "/api/business-continuity/attachments",
 ]
 for path in upload_paths:
@@ -801,13 +708,7 @@ app.add_middleware(
     CSRFMiddleware,
     exempt_paths=(
         "/api/webhooks/smtp2go",
-        "/api/integration-modules/uptimekuma/alerts",
         "/api/integration-modules/trello/webhook",
-        "/api/integration-modules/xero/webhook",
-        "/api/backup-status",
-        "/api/tray/enrol",
-        "/api/tray/popup-chat",
-        "/api/tray/ticket-form",
         # Public Wait For Webhook callbacks authenticate with an unguessable
         # webhook URL plus the per-step post key in the JSON payload, not a
         # browser session. Requiring CSRF here blocks legitimate automation.
@@ -815,32 +716,6 @@ app.add_middleware(
     ),
 )
 
-# Add Plausible tracking middleware for authenticated pageviews
-# This middleware sends custom events to Plausible Analytics when users access pages
-# It includes privacy protections (hashed user IDs) and only tracks authenticated users
-from app.security.plausible_tracking import PlausibleTrackingMiddleware
-
-def _get_plausible_module_settings() -> dict[str, Any]:
-    """Synchronous function to get Plausible module settings for middleware."""
-    # We use a cached module lookup to avoid async issues in middleware
-    # This is populated in _build_base_context
-    return getattr(_get_plausible_module_settings, '_cached_module', {})
-
-app.add_middleware(
-    PlausibleTrackingMiddleware,
-    exempt_paths=(
-        "/static",
-        "/api",
-        "/health",
-        "/healthz",
-        "/readyz",
-        "/manifest.webmanifest",
-        "/service-worker.js",
-        "/ws",
-        "/mcp",
-    ),
-    get_module_settings=_get_plausible_module_settings,
-)
 
 templates = Jinja2Templates(directory=str(templates_config.template_path))
 
@@ -1119,13 +994,10 @@ app.include_router(auth.router)
 app.include_router(dashboard_api.router)
 app.include_router(agent.router)
 app.include_router(users.router)
-app.include_router(click_to_call_api.router)
-app.include_router(call_recordings_api.router)
 app.include_router(companies.router)
 app.include_router(essential8_api.router)
 app.include_router(compliance_checks_api.router)
 app.include_router(licenses_api.router)
-app.include_router(forms_api.router)
 app.include_router(knowledge_base_api.router)
 app.include_router(bc_plans_api.router)
 app.include_router(bc5.router)
@@ -1137,12 +1009,8 @@ app.include_router(m365_api.router)
 app.include_router(message_templates_api.router)
 app.include_router(ports.router)
 app.include_router(notifications.router)
-app.include_router(orders_api.router)
-app.include_router(quotes_api.router)
 app.include_router(staff_api.router)
-app.include_router(invoices_api.router)
 app.include_router(issues_api.router)
-app.include_router(subscriptions_api.router)
 app.include_router(audit_logs.router)
 app.include_router(api_keys.router)
 app.include_router(scheduler_api.router)
@@ -1152,12 +1020,8 @@ app.include_router(automations_api.router)
 app.include_router(modules_api.router)
 app.include_router(system.router)
 app.include_router(service_status_api.router)
-app.include_router(backup_jobs_api.router)
 app.include_router(asset_custom_fields.router)
 app.include_router(tag_exclusions.router)
-app.include_router(chat_api.router)
-app.include_router(tray_api.router)
-app.include_router(defender_api.router)
 app.include_router(features_api.router)
 app.include_router(plugins_api.router)
 
@@ -2169,63 +2033,6 @@ async def _build_base_context(
         module_lookup = {module.get("slug"): module for module in module_list if module.get("slug")}
         request.state.module_lookup = module_lookup
     
-    # Cache Plausible module for middleware use
-    plausible_module = (module_lookup or {}).get("plausible")
-    if plausible_module:
-        # Store in function attribute for middleware to access
-        _get_plausible_module_settings._cached_module = plausible_module
-
-    # Get Plausible analytics configuration for app-wide tracking
-    plausible_config = {"enabled": False}
-    if plausible_module and plausible_module.get("enabled"):
-        plausible_settings = plausible_module.get("settings") or {}
-        base_url = str(plausible_settings.get("base_url") or "").strip().rstrip("/")
-        site_domain = str(plausible_settings.get("site_domain") or "").strip()
-        track_pageviews = bool(plausible_settings.get("track_pageviews"))
-        pepper = str(plausible_settings.get("pepper") or "").strip()
-        send_pii = bool(plausible_settings.get("send_pii"))
-        
-        # Validate base_url and site_domain to prevent injection attacks
-        # base_url must be a valid HTTPS URL
-        # site_domain must be a valid domain name (alphanumeric, dots, hyphens)
-        valid_base_url = False
-        valid_site_domain = False
-        
-        if base_url:
-            try:
-                from urllib.parse import urlparse
-                parsed = urlparse(base_url)
-                # Must be https or http, have a netloc, and no suspicious characters
-                if parsed.scheme in ("https", "http") and parsed.netloc and not any(c in base_url for c in ["<", ">", '"', "'"]):
-                    valid_base_url = True
-            except Exception:
-                pass
-        
-        if site_domain:
-            # Domain must only contain alphanumeric, dots, hyphens, underscores and optional port
-            # No spaces, quotes, or HTML-like characters
-            if re.match(r"^[A-Za-z0-9._-]+(?::\d+)?$", site_domain) and not any(
-                c in site_domain for c in ["<", ">", '"', "'"]
-            ):
-                valid_site_domain = True
-        
-        if valid_base_url and valid_site_domain:
-            plausible_config = {
-                "enabled": True,
-                "base_url": base_url,
-                "site_domain": site_domain,
-                "track_pageviews": track_pageviews,
-            }
-            
-            # Add hashed user ID for client-side tracking if pageview tracking enabled
-            if track_pageviews and user and user.get("id"):
-                from app.security.plausible_tracking import hash_user_id_for_plausible
-                
-                user_id = user.get("id")
-                # Hash user ID for privacy using shared utility
-                hashed_user_id = hash_user_id_for_plausible(user_id, pepper, send_pii)
-                
-                plausible_config["hashed_user_id"] = hashed_user_id
 
     context: dict[str, Any] = {
         "request": request,
@@ -2255,28 +2062,18 @@ async def _build_base_context(
             for slug, module in (module_lookup or {}).items()
             if bool(module.get("enabled"))
         ),
-        "syncro_module_enabled": bool((module_lookup or {}).get("syncro", {}).get("enabled")),
         "enable_auto_refresh": bool(settings.enable_auto_refresh),
-        "matrix_chat_enabled": settings.matrix_enabled,
         "is_impersonating": is_impersonating,
         "impersonator_user": impersonator_user,
         "impersonation_started_at": impersonation_started_at,
         "has_issue_tracker_access": has_issue_tracker_access,
         "can_access_tickets": _menu_can(menu_access, "menu.tickets"),
         "can_access_all_tickets": _menu_can(menu_access, "menu.tickets", write=True),
-        "plausible_config": plausible_config,
     }
     context.update(permission_flags)
     if extra:
         context.update(extra)
 
-    cart_summary = {"item_count": 0, "total_quantity": 0, "subtotal": Decimal("0")}
-    if session:
-        try:
-            cart_summary = await cart_repo.summarise_cart(session.id)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log_error("Failed to summarise cart", error=str(exc))
-    context["cart_summary"] = cart_summary
     if "notification_unread_count" not in context:
         unread_count = 0
         user_id = user.get("id")
@@ -2289,36 +2086,6 @@ async def _build_base_context(
             except Exception as exc:  # pragma: no cover - defensive logging
                 log_error("Failed to count unread notifications", error=str(exc))
         context["notification_unread_count"] = unread_count
-    if "chat_open_count" not in context:
-        open_chat_count = 0
-        user_id = user.get("id")
-        can_view_chat = (
-            is_super_admin
-            or is_helpdesk_technician
-            or permission_flags["can_access_chat"]
-        )
-        if settings.matrix_enabled and can_view_chat and user_id is not None:
-            try:
-                if is_super_admin or is_helpdesk_technician:
-                    open_chat_count = await chat_repo.count_rooms(status="open")
-                else:
-                    company_id = user.get("company_id") or active_company_id
-                    open_chat_count = await chat_repo.count_rooms(
-                        user_id=int(user_id),
-                        company_id=int(company_id) if company_id is not None else None,
-                        status="open",
-                    )
-            except Exception as exc:  # pragma: no cover - defensive logging
-                log_error("Failed to count open chats", error=str(exc))
-        context["chat_open_count"] = open_chat_count
-    if "defender_detection_count" not in context:
-        detection_count = 0
-        if active_company_id is not None and (is_super_admin or _menu_can(menu_access, "menu.defender")):
-            try:
-                detection_count = await defender_repo.active_detection_count(int(active_company_id))
-            except Exception as exc:  # pragma: no cover - defensive fallback
-                log_error("Failed to count active Defender detections", error=str(exc))
-        context["defender_detection_count"] = detection_count
     return context
 
 
@@ -2359,13 +2126,8 @@ async def _build_public_context(
         "can_view_m365_shared_mailboxes": False,
         "can_access_chat": False,
         "can_access_marketing": False,
-        "plausible_config": {"enabled": False},
-        "cart_summary": {"item_count": 0, "total_quantity": 0, "subtotal": Decimal("0")},
         "notification_unread_count": 0,
-        "chat_open_count": 0,
-        "defender_detection_count": 0,
         "enable_auto_refresh": bool(settings.enable_auto_refresh),
-        "matrix_chat_enabled": settings.matrix_enabled,
         "integration_modules": {},
         "module_enabled": {},
         "enabled_module_slugs": frozenset(),
@@ -2767,11 +2529,9 @@ async def on_startup() -> None:
         await bootstrap_default_template()
 
     async def _migrate_sync_m365_data_tasks() -> None:
-        """For companies that only have legacy sync_m365_data tasks, create the three
-        split tasks (sync_m365_licenses, sync_m365_contacts, sync_m365_mailboxes) at
-        staggered times and deactivate the old task to avoid gateway timeouts."""
+        """Split legacy M365 sync tasks into the current license/contact tasks."""
         legacy_commands = {"sync_m365_data", "sync_o365"}
-        new_commands = {"sync_m365_licenses", "sync_m365_contacts", "sync_m365_mailboxes"}
+        new_commands = {"sync_m365_licenses", "sync_m365_contacts"}
         all_tasks = await scheduled_tasks_repo.list_tasks(include_inactive=False)
         # Group tasks by company_id
         from collections import defaultdict
@@ -2801,7 +2561,6 @@ async def on_startup() -> None:
             for command, label_suffix in (
                 ("sync_m365_licenses", "Sync Microsoft 365 licenses"),
                 ("sync_m365_contacts", "Sync Microsoft 365 contacts"),
-                ("sync_m365_mailboxes", "Sync Microsoft 365 mailboxes"),
             ):
                 if command not in commands_for_company:
                     label = (
@@ -2901,7 +2660,6 @@ async def on_startup() -> None:
         raise RuntimeError("Invalid module capability registry: " + "; ".join(capability_errors))
 
     await scheduler_service.start()
-    modules_service.start_xero_token_keepalive()
 
     if pack_slugs:
         await feature_registry.load_many(pack_slugs)
@@ -2943,7 +2701,6 @@ async def on_shutdown() -> None:
     if _feature_pack_watcher is not None:
         await _feature_pack_watcher.stop()
     await feature_registry.unload_all()
-    await modules_service.stop_xero_token_keepalive()
     await scheduler_service.stop()
     await db.disconnect()
     log_info("Application shutdown")
@@ -3411,54 +3168,12 @@ async def m365_page(request: Request):
     return await _render_template("m365/index.html", request, user, extra=extra)
 
 
-@app.get("/m365/benchmarks", response_class=RedirectResponse)
-async def m365_benchmarks_redirect(request: Request):
-    """Redirect the old CIS Benchmarks page to the merged Best Practices page."""
-    return RedirectResponse(url="/m365/best-practices", status_code=status.HTTP_301_MOVED_PERMANENTLY)
 
 
-@app.post("/m365/benchmarks/run", response_class=RedirectResponse)
-async def run_m365_benchmarks(request: Request):
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    try:
-        await cis_benchmark_service.run_benchmarks(company_id)
-        log_info("CIS benchmarks run", company_id=company_id, user_id=user.get("id"))
-    except m365_service.M365Error as exc:
-        return flash_redirect("/m365/best-practices", str(exc), "error")
-    return flash_redirect("/m365/best-practices", "Benchmarks completed", "success")
 
 
-@app.post("/m365/benchmarks/exclude", response_class=RedirectResponse)
-async def exclude_benchmark_check(
-    request: Request,
-    check_id: str = Form(..., alias="checkId"),
-    reason: str = Form("", alias="reason"),
-):
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    await cis_benchmark_service.add_exclusion(company_id, check_id, reason)
-    return flash_redirect("/m365/best-practices", "Check excluded", "success")
 
 
-@app.post("/m365/benchmarks/exclude/remove", response_class=RedirectResponse)
-async def remove_benchmark_exclusion(
-    request: Request,
-    check_id: str = Form(..., alias="checkId"),
-):
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    await cis_benchmark_service.remove_exclusion(company_id, check_id)
-    return flash_redirect("/m365/best-practices", "Exclusion removed", "success")
 
 
 # ---------------------------------------------------------------------------
@@ -3466,749 +3181,48 @@ async def remove_benchmark_exclusion(
 # ---------------------------------------------------------------------------
 
 
-async def _load_m365_best_practices_context(request: Request, *, super_admin_only: bool = False):
-    """Load context for the M365 Best Practices pages.
-
-    A user may view the page if they are a super admin or if their company
-    membership grants ``can_view_m365_best_practices``.  Pass
-    ``super_admin_only=True`` for endpoints that mutate global settings or
-    trigger evaluations.
-    """
-    user, redirect = await _require_authenticated_user(request)
-    if redirect:
-        return user, None, None, None, redirect
-    is_super_admin = bool(user.get("is_super_admin"))
-    company_id_raw = user.get("company_id")
-    if company_id_raw is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No company associated with the current user",
-        )
-    try:
-        company_id = int(company_id_raw)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company identifier") from exc
-    membership = await user_company_repo.get_user_company(user["id"], company_id)
-    can_view = bool(membership and membership.get("can_view_m365_best_practices"))
-    if super_admin_only:
-        if not is_super_admin:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    elif not (is_super_admin or can_view):
-        return (
-            user,
-            membership,
-            None,
-            company_id,
-            RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER),
-        )
-    company = await company_repo.get_company_by_id(company_id)
-    return user, membership, company, company_id, None
-
-
-@app.get("/m365/best-practices", response_class=HTMLResponse)
-async def m365_best_practices_page(request: Request):
-    user, membership, company, company_id, redirect = await _load_m365_best_practices_context(request)
-    if redirect:
-        return redirect
-    credentials = await m365_service.get_credentials(company_id)
-    results = await m365_best_practices_service.get_last_results(company_id)
-    catalog = m365_best_practices_service.list_best_practices()
-    enabled_ids = await m365_best_practices_service.get_enabled_check_ids()
-    enabled_catalog = [bp for bp in catalog if bp["id"] in enabled_ids]
-    extra = {
-        "title": "M365 Best Practices",
-        "company": company,
-        "results": results,
-        "catalog": enabled_catalog,
-        "has_credentials": bool(credentials),
-        "is_super_admin": bool(user.get("is_super_admin")),
-    }
-    return await _render_template("m365/best_practices.html", request, user, extra=extra)
-
-
-@app.post("/m365/best-practices/run", response_class=RedirectResponse)
-async def run_m365_best_practices(request: Request):
-    user, membership, _, company_id, redirect = await _load_m365_best_practices_context(
-        request, super_admin_only=True,
-    )
-    if redirect:
-        return redirect
-
-    user_id = user.get("id")
-    reset_count = await m365_best_practices_service.reset_enabled_results_to_unknown(company_id)
-
-    def _on_complete(_results: list[dict]) -> None:
-        log_info(
-            "M365 best practices run completed",
-            company_id=company_id,
-            user_id=user_id,
-            check_count=len(_results),
-        )
-
-    def _on_error(exc: Exception) -> None:
-        log_error(
-            "M365 best practices run failed",
-            company_id=company_id,
-            user_id=user_id,
-            error=str(exc),
-        )
-
-    background_tasks.queue_background_task(
-        lambda: m365_best_practices_service.run_best_practices(company_id),
-        description="m365-best-practices-run",
-        on_complete=_on_complete,
-        on_error=_on_error,
-    )
-    log_info(
-        "M365 best practices run queued",
-        company_id=company_id,
-        user_id=user_id,
-        reset_to_unknown_count=reset_count,
-    )
-    return flash_redirect(
-        "/m365/best-practices",
-        "Best practice evaluation started in the background",
-        "success",
-    )
-
-
-@app.post("/m365/best-practices/check/{check_id}", response_class=RedirectResponse)
-async def run_single_m365_best_practice_check(request: Request, check_id: str):
-    """Run a single best-practice check for the current company."""
-    user, membership, _, company_id, redirect = await _load_m365_best_practices_context(
-        request, super_admin_only=True,
-    )
-    if redirect:
-        return redirect
-    known_ids = {bp["id"] for bp in m365_best_practices_service.list_best_practices()}
-    if check_id not in known_ids:
-        return flash_redirect("/m365/best-practices", "Unknown best-practice check ID", "error")
-    try:
-        await m365_best_practices_service.run_single_check(
-            company_id=company_id,
-            check_id=check_id,
-        )
-        log_info(
-            "M365 single best practice check run",
-            company_id=company_id,
-            check_id=check_id,
-            user_id=user.get("id"),
-        )
-    except ValueError as exc:
-        return flash_redirect("/m365/best-practices", str(exc), "error")
-    except m365_service.M365Error as exc:
-        return flash_redirect("/m365/best-practices", str(exc), "error")
-    return flash_redirect("/m365/best-practices", "Check evaluated", "success")
-
-
-@app.post("/m365/best-practices/remediate/{check_id}", response_class=RedirectResponse)
-async def remediate_m365_best_practice(request: Request, check_id: str):
-    """Run automated remediation for a single best-practice check."""
-    user, membership, _, company_id, redirect = await _load_m365_best_practices_context(
-        request, super_admin_only=True,
-    )
-    if redirect:
-        return redirect
-    # Validate that the check_id is a known best practice to prevent unintended operations
-    known_ids = {bp["id"] for bp in m365_best_practices_service.list_best_practices()}
-    if check_id not in known_ids:
-        return flash_redirect("/m365/best-practices", "Unknown best-practice check ID", "error")
-    result = await m365_best_practices_service.remediate_check(
-        company_id=company_id,
-        check_id=check_id,
-    )
-    log_info(
-        "M365 best practice remediation triggered",
-        company_id=company_id,
-        check_id=check_id,
-        user_id=user.get("id"),
-        success=result.get("success"),
-    )
-    message = result.get("message", "Remediation attempted")
-    if result.get("success"):
-        return flash_redirect("/m365/best-practices", message, "success")
-    return flash_redirect("/m365/best-practices", message, "error")
-
-
-@app.get("/m365/best-practices/settings", response_class=HTMLResponse)
-async def m365_best_practices_settings_page(
-    request: Request,
-):
-    user, membership, company, company_id, redirect = await _load_m365_best_practices_context(
-        request, super_admin_only=True,
-    )
-    if redirect:
-        return redirect
-    catalog_with_settings = await m365_best_practices_service.list_settings_with_catalog(company_id)
-    extra = {
-        "title": "M365 Best Practices Settings",
-        "company": company,
-        "catalog": catalog_with_settings,
-        "is_super_admin": True,
-    }
-    return await _render_template(
-        "m365/best_practices_settings.html",
-        request,
-        user,
-        extra=extra,
-    )
-
-
-@app.post("/m365/best-practices/settings", response_class=RedirectResponse)
-async def save_m365_best_practices_settings(request: Request):
-    user, membership, _, company_id, redirect = await _load_m365_best_practices_context(
-        request, super_admin_only=True,
-    )
-    if redirect:
-        return redirect
-    form = await request.form()
-    enabled_ids = {value for value in form.getlist("enabled")}
-    auto_remediate_ids = {value for value in form.getlist("auto_remediate")}
-    excluded_ids = {value for value in form.getlist("excluded")}
-    await m365_best_practices_service.set_enabled_checks(enabled_ids, auto_remediate_ids)
-    await m365_best_practices_service.save_company_exclusions(company_id, excluded_ids)
-    log_info(
-        "M365 best practice settings updated",
-        user_id=user.get("id"),
-        enabled_count=len(enabled_ids),
-        auto_remediate_count=len(auto_remediate_ids),
-        excluded_count=len(excluded_ids),
-    )
-    return flash_redirect("/m365/best-practices/settings", "Settings saved", "success")
-
-
-async def _load_m365_mailbox_context(request: Request, *, mailbox_permission: str):
-    """Load context for M365 mailbox pages.
-
-    A user may access the page if they are a super admin, have
-    ``can_manage_licenses``, or have the specific ``mailbox_permission`` flag
-    (e.g. ``can_view_m365_user_mailboxes`` or ``can_view_m365_shared_mailboxes``).
-    """
-    user, redirect = await _require_authenticated_user(request)
-    if redirect:
-        return user, None, None, None, redirect
-    is_super_admin = bool(user.get("is_super_admin"))
-    company_id_raw = user.get("company_id")
-    if company_id_raw is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No company associated with the current user",
-        )
-    try:
-        company_id = int(company_id_raw)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company identifier") from exc
-    membership = await user_company_repo.get_user_company(user["id"], company_id)
-    mailbox_menu_key = "menu.m365.user_mailboxes" if mailbox_permission == "can_view_m365_user_mailboxes" else "menu.m365.shared_mailboxes"
-    can_access = bool(
-        is_super_admin
-        or (membership and membership.get("can_manage_licenses"))
-        or (membership and membership.get(mailbox_permission))
-        or _membership_menu_can(user, membership, mailbox_menu_key)
-    )
-    if not can_access:
-        return (
-            user,
-            membership,
-            None,
-            company_id,
-            RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER),
-        )
-    company = await company_repo.get_company_by_id(company_id)
-    return user, membership, company, company_id, None
-
-
-@app.get("/m365/mailboxes/users", response_class=HTMLResponse)
-async def m365_user_mailboxes_page(request: Request):
-    user, membership, company, company_id, redirect = await _load_m365_mailbox_context(
-        request, mailbox_permission="can_view_m365_user_mailboxes"
-    )
-    if redirect:
-        return redirect
-    credentials = await m365_service.get_credentials(company_id)
-    mailboxes = await m365_service.get_user_mailboxes(company_id)
-    synced_at = await m365_repo.get_mailbox_synced_at(company_id)
-    active_staff = await staff_repo.list_active_staff_for_offboarding(company_id)
-    extra = {
-        "title": "User Mailboxes",
-        "company": company,
-        "mailboxes": mailboxes,
-        "synced_at": synced_at,
-        "has_credentials": bool(credentials),
-        "active_staff": active_staff,
-    }
-    return await _render_template("m365/user_mailboxes.html", request, user, extra=extra)
-
-
-@app.get("/m365/mailboxes/shared", response_class=HTMLResponse)
-async def m365_shared_mailboxes_page(request: Request):
-    user, membership, company, company_id, redirect = await _load_m365_mailbox_context(
-        request, mailbox_permission="can_view_m365_shared_mailboxes"
-    )
-    if redirect:
-        return redirect
-    credentials = await m365_service.get_credentials(company_id)
-    mailboxes = await m365_service.get_shared_mailboxes(company_id)
-    synced_at = await m365_repo.get_mailbox_synced_at(company_id)
-    active_staff = await staff_repo.list_active_staff_for_offboarding(company_id)
-    extra = {
-        "title": "Shared Mailboxes",
-        "company": company,
-        "mailboxes": mailboxes,
-        "synced_at": synced_at,
-        "has_credentials": bool(credentials),
-        "active_staff": active_staff,
-    }
-    return await _render_template("m365/shared_mailboxes.html", request, user, extra=extra)
-
-
-@app.post("/m365/mailboxes/sync", response_class=JSONResponse, tags=["Microsoft 365"])
-async def sync_m365_mailboxes(request: Request):
-    """Queue the sync_m365_data scheduled task for this company in the background.
-
-    Returns 202 Accepted immediately so the browser never waits for the long-running
-    sync and never hits a gateway timeout.
-    """
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    task = await scheduled_tasks_repo.get_first_task_for_company_by_commands(
-        company_id, ["sync_m365_mailboxes", "sync_m365_data", "sync_o365"]
-    )
-    if task is not None:
-        asyncio.create_task(scheduler_service.run_now(task["id"]))
-    else:
-        asyncio.create_task(m365_service.sync_mailboxes(company_id))
-    log_info("M365 mailbox sync queued", company_id=company_id, user_id=user.get("id"))
-    return JSONResponse({"queued": True}, status_code=202)
-
-
-@app.post("/m365/mailboxes/enable-archive", response_class=JSONResponse, tags=["Microsoft 365"])
-async def enable_m365_user_archive(request: Request):
-    """Enable in-place and auto-expanding archive for a user via Exchange Online PowerShell.
-
-    Issues ``Enable-Mailbox -Identity <upn> -Archive`` followed by
-    ``Enable-Mailbox -Identity <upn> -AutoExpandingArchive`` for the supplied
-    UPN. The UPN must belong to a known user mailbox in this company; otherwise
-    a 404 is returned. Requires mailbox write privileges.
-    """
-    user, membership, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    if not (
-        user.get("is_super_admin")
-        or _membership_menu_can(user, membership, "menu.m365.user_mailboxes", write=True)
-        or _membership_menu_can(user, membership, "menu.m365.shared_mailboxes", write=True)
-    ):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mailbox read/write permission required")
-
-    try:
-        body = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        body = {}
-    upn = str((body or {}).get("upn") or "").strip()
-    if not upn:
-        return JSONResponse({"error": "A user principal name is required"}, status_code=400)
-
-    user_mbs = await m365_service.get_user_mailboxes(company_id)
-    matching = next((mb for mb in user_mbs if mb.get("user_principal_name") == upn), None)
-    if matching is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox not found")
-    if matching.get("has_archive"):
-        return JSONResponse({"enabled": True, "already_enabled": True})
-
-    try:
-        await m365_service.enable_user_archive(company_id, upn)
-    except m365_service.M365Error as exc:
-        logger.exception("Failed to enable in-place archive for UPN %s", upn)
-        return JSONResponse(
-            {"error": "Unable to enable in-place and auto-expanding archive at this time."},
-            status_code=503,
-        )
-    log_info("M365 in-place and auto-expanding archive enable requested", company_id=company_id, user_id=user.get("id"), upn=upn)
-    return JSONResponse({"enabled": True})
-
-
-@app.get("/m365/mailboxes/rules", response_class=JSONResponse, tags=["Microsoft 365"])
-async def get_m365_mailbox_rules(request: Request, upn: str):
-    """Return inbox rules for a known mailbox. Super admins only."""
-    user, membership, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    if not user.get("is_super_admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super admin privileges required",
-        )
-
-    user_mbs = await m365_service.get_user_mailboxes(company_id)
-    shared_mbs = await m365_service.get_shared_mailboxes(company_id)
-    known_upns = {
-        str(mb.get("user_principal_name") or "").strip().lower()
-        for mb in user_mbs + shared_mbs
-    }
-    if str(upn or "").strip().lower() not in known_upns:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox not found"
-        )
-
-    try:
-        rules = await m365_service.get_mailbox_rules(company_id, upn)
-        return JSONResponse({"rules": rules})
-    except m365_service.M365Error:
-        logger.exception("Failed to get inbox rules for UPN %s", upn)
-        return JSONResponse(
-            {"error": "Unable to retrieve mailbox rules at this time."},
-            status_code=503,
-        )
-
-
-@app.post("/m365/mailboxes/start-managed-folder-assistant", response_class=JSONResponse, tags=["Microsoft 365"])
-async def start_m365_managed_folder_assistant(request: Request):
-    """Start Managed Folder Assistant for a specific mailbox."""
-    user, membership, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-
-    try:
-        body = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        body = {}
-    upn = str((body or {}).get("upn") or "").strip()
-    if not upn:
-        return JSONResponse({"error": "A user principal name is required"}, status_code=400)
-
-    user_mbs = await m365_service.get_user_mailboxes(company_id)
-    shared_mbs = await m365_service.get_shared_mailboxes(company_id)
-    known_upns = {str(mb.get("user_principal_name") or "").strip().lower() for mb in user_mbs + shared_mbs}
-    if upn.lower() not in known_upns:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox not found")
-
-    try:
-        await m365_service.start_managed_folder_assistant(company_id, upn)
-    except m365_service.M365Error:
-        logger.exception("Failed to start Managed Folder Assistant for UPN %s", upn)
-        return JSONResponse(
-            {"error": "Unable to start Managed Folder Assistant at this time."},
-            status_code=503,
-        )
-    log_info("M365 managed folder assistant requested", company_id=company_id, user_id=user.get("id"), upn=upn)
-    return JSONResponse({"started": True})
-
-
-@app.post("/m365/mailboxes/start-managed-folder-assistant/all", response_class=JSONResponse, tags=["Microsoft 365"])
-async def start_m365_managed_folder_assistant_all(request: Request):
-    """Start Managed Folder Assistant for all mailboxes in the tenant."""
-    user, membership, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-
-    try:
-        result = await m365_service.start_managed_folder_assistant_all_mailboxes(company_id)
-    except m365_service.M365Error:
-        logger.exception("Failed to start Managed Folder Assistant for all mailboxes")
-        return JSONResponse(
-            {"error": "Unable to start Managed Folder Assistant for all mailboxes at this time."},
-            status_code=503,
-        )
-    log_info(
-        "M365 managed folder assistant all-mailbox run requested",
-        company_id=company_id,
-        user_id=user.get("id"),
-        started=result.get("started", 0),
-        failed=result.get("failed", 0),
-    )
-    return JSONResponse({
-        "started": int(result.get("started") or 0),
-        "failed": int(result.get("failed") or 0),
-    })
-
-
-@app.get("/m365/mailboxes/permissions", response_class=JSONResponse, tags=["Microsoft 365"])
-async def get_m365_mailbox_permissions(request: Request, upn: str):
-    """Return mailbox permission details for a given mailbox UPN.
-
-    Returns a JSON object with ``can_access`` (mailboxes this identity can access
-    via M365 group membership) and ``accessible_by`` (members of the M365 group
-    backing this mailbox).
-    """
-    user, membership, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-
-    # Validate the UPN belongs to a known mailbox for this company to prevent
-    # arbitrary Graph API queries with user-supplied input.
-    user_mbs = await m365_service.get_user_mailboxes(company_id)
-    shared_mbs = await m365_service.get_shared_mailboxes(company_id)
-    known_upns = {mb["user_principal_name"] for mb in user_mbs + shared_mbs}
-    if upn not in known_upns:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox not found")
-
-    try:
-        permissions = await m365_service.get_mailbox_permissions(company_id, upn)
-        return JSONResponse(permissions)
-    except m365_service.M365Error as exc:
-        logger.exception("Failed to get mailbox permissions for UPN %s", upn)
-        return JSONResponse(
-            {"error": "Unable to retrieve mailbox permissions at this time."},
-            status_code=503,
-        )
-
-
-@app.post("/m365/mailboxes/permissions/request", response_class=JSONResponse, tags=["Microsoft 365"])
-async def request_m365_mailbox_permission_changes(request: Request):
-    """Create a ticket requesting mailbox permission additions/removals."""
-    user, membership, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
-    if not (
-        user.get("is_super_admin")
-        or _membership_menu_can(user, membership, "menu.m365.user_mailboxes", write=True)
-        or _membership_menu_can(user, membership, "menu.m365.shared_mailboxes", write=True)
-        or _membership_menu_can(user, membership, "menu.m365.user_mailboxes")
-        or _membership_menu_can(user, membership, "menu.m365.shared_mailboxes")
-    ):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Mailbox permission access required")
-
-    try:
-        body = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        body = {}
-
-    mailbox_upn = str((body or {}).get("mailbox_upn") or "").strip()
-    mailbox_display_name = str((body or {}).get("mailbox_display_name") or mailbox_upn).strip()
-    notes = str((body or {}).get("notes") or "").strip()
-    removals_raw = (body or {}).get("removals") or []
-    additions_raw = (body or {}).get("additions") or []
-    if not mailbox_upn:
-        return JSONResponse({"error": "A mailbox is required."}, status_code=400)
-
-    user_mbs = await m365_service.get_user_mailboxes(company_id)
-    shared_mbs = await m365_service.get_shared_mailboxes(company_id)
-    known_upns = {str(mb.get("user_principal_name") or "").strip().lower() for mb in user_mbs + shared_mbs}
-    if mailbox_upn.lower() not in known_upns:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox not found")
-
-    def _clean_change_items(items: Any, *, value_key: str) -> list[dict[str, str]]:
-        cleaned: list[dict[str, str]] = []
-        if not isinstance(items, list):
-            return cleaned
-        seen: set[str] = set()
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            value = str(item.get(value_key) or item.get("upn") or item.get("email") or "").strip()
-            label = str(item.get("label") or value).strip()
-            if not value or value.lower() in seen:
-                continue
-            seen.add(value.lower())
-            cleaned.append({value_key: value, "label": label or value})
-        return cleaned
-
-    removals = _clean_change_items(removals_raw, value_key="upn")
-    additions = _clean_change_items(additions_raw, value_key="email")
-    if not removals and not additions:
-        return JSONResponse({"error": "Select at least one permission change."}, status_code=400)
-
-    active_staff = await staff_repo.list_active_staff_for_offboarding(company_id)
-    active_staff_emails = {str(staff.get("email") or "").strip().lower() for staff in active_staff}
-    additions = [item for item in additions if item["email"].lower() in active_staff_emails]
-    if additions_raw and not additions and not removals:
-        return JSONResponse({"error": "Select at least one active staff member to add."}, status_code=400)
-
-    removal_lines = "".join(f"<li>{escape(item['label'])}</li>" for item in removals) or "<li>None</li>"
-    addition_lines = "".join(f"<li>{escape(item['label'])}</li>" for item in additions) or "<li>None</li>"
-    requester_name = str(user.get("name") or user.get("email") or "Current user")
-    description = (
-        f"<p>{escape(requester_name)} requested mailbox permission changes for "
-        f"<strong>{escape(mailbox_display_name)}</strong> ({escape(mailbox_upn)}).</p>"
-        f"<h3>Request Removal for existing permissions</h3><ul>{removal_lines}</ul>"
-        f"<h3>Add active staff members</h3><ul>{addition_lines}</ul>"
-    )
-    if notes:
-        description += f"<h3>Notes</h3><p>{escape(notes)}</p>"
-
-    requester_id = int(user["id"])
-    ticket = await tickets_service.create_ticket(
-        subject=f"Mailbox permission change request: {mailbox_display_name or mailbox_upn}",
-        description=description,
-        requester_id=requester_id,
-        company_id=company_id,
-        assigned_user_id=None,
-        priority="normal",
-        status=await tickets_service.resolve_status_or_default(None),
-        category="Microsoft 365",
-        module_slug="m365_admin",
-        external_reference=f"m365-mailbox-permissions:{mailbox_upn}",
-        trigger_automations=True,
-        initial_reply_author_id=requester_id,
-    )
-    try:
-        await tickets_repo.add_watcher(ticket["id"], requester_id)
-    except Exception:
-        logger.exception("Failed to add mailbox permission requester as ticket watcher")
-
-    log_info(
-        "M365 mailbox permission change ticket created",
-        company_id=company_id,
-        user_id=user.get("id"),
-        mailbox_upn=mailbox_upn,
-        ticket_id=ticket.get("id"),
-        removals=len(removals),
-        additions=len(additions),
-    )
-    return JSONResponse({"ticket_id": ticket.get("id"), "ticket_number": ticket.get("ticket_number")})
-
-
-@app.post("/m365/checks/report-privacy", response_class=RedirectResponse)
-async def check_m365_report_privacy(request: Request):
-    """Check whether Microsoft 365 report privacy concealment is active for this tenant.
-
-    Detects the *Display concealed user, group, and site names in all reports*
-    setting.  When enabled, mailbox identifiers in reports are replaced with hex
-    hashes, breaking mailbox sync.  Redirects back to ``/m365`` with a success or
-    error message.
-    """
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    try:
-        concealed = await m365_service.check_report_privacy(company_id)
-    except m365_service.M365Error as exc:
-        return flash_redirect("/m365", str(exc), "error")
-    if concealed:
-        msg = (
-            "Mailbox sync failed because Microsoft 365 reports are concealing mailbox identifiers. "
-            "Disable the Microsoft 365 admin center privacy option "
-            "'Display concealed user, group, and site names in all reports', "
-            "then run mailbox sync again."
-        )
-        return flash_redirect("/m365", msg, "error")
-    return flash_redirect("/m365", "Mailbox report privacy check passed – identifiers are not concealed", "success")
-
-
-@app.post("/m365/permissions/verify")
-async def verify_m365_permissions(request: Request):
-    """Check (and optionally auto-grant) missing Graph API permissions for this company.
-
-    Returns a JSON object with:
-    - ``all_ok``  – True if all required permissions are present
-    - ``missing`` – list of role IDs that are not yet granted
-    - ``present`` – list of role IDs that are currently granted
-    - ``updated`` – True if missing permissions were successfully auto-granted
-    - ``error``   – human-readable message when the check or update failed
-    """
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    try:
-        result = await m365_service.verify_tenant_permissions(company_id)
-    except m365_service.M365Error as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return JSONResponse(result)
-
-
-@app.get("/m365/diagnostics", response_class=HTMLResponse)
-async def m365_diagnostics_page(request: Request):
-    """Display the enterprise app permission diagnostics page."""
-    user, _, company, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        return RedirectResponse(url="/m365", status_code=status.HTTP_303_SEE_OTHER)
-
-    credentials = await m365_service.get_credentials(company_id)
-    last_results = await m365_service.get_last_enterprise_app_permissions(company_id)
-
-    extra = {
-        "title": "Office 365 Diagnostics",
-        "company": company,
-        "has_credentials": bool(credentials),
-        "catalog": m365_service.ENTERPRISE_APP_CATALOG,
-        "results": last_results,
-        "is_super_admin": True,
-    }
-    return await _render_template("m365/diagnostics.html", request, user, extra=extra)
-
-
-@app.post("/m365/diagnostics/check", response_class=RedirectResponse)
-async def run_m365_diagnostics_check(request: Request):
-    """Run the enterprise app permission check and store results."""
-    user, _, __, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        return RedirectResponse(url="/m365", status_code=status.HTTP_303_SEE_OTHER)
-    try:
-        await m365_service.check_enterprise_app_permissions(company_id)
-    except m365_service.M365Error as exc:
-        return flash_redirect("/m365/diagnostics", str(exc), "error")
-    return flash_redirect("/m365/diagnostics", "Permission check completed", "success")
-
-
-@app.post("/m365/diagnostics/repair", response_class=RedirectResponse)
-async def repair_m365_permissions(request: Request):
-    """Grant any missing enterprise app permissions and re-check results.
-
-    Uses the stored delegated refresh token from the admin connect flow.
-    If no token is available the admin is redirected to the connect flow
-    (with ``return_to=diagnostics`` in state) so that the repair runs
-    automatically after they re-authorise.
-    """
-    user, _, __, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        return RedirectResponse(url="/m365", status_code=status.HTTP_303_SEE_OTHER)
-
-    try:
-        outcome = await m365_service.repair_enterprise_app_permissions(company_id)
-    except m365_service.M365NoDelegatedTokenError:
-        # No delegated token available – redirect to the connect flow so the
-        # admin can re-authorise; the callback will automatically grant missing
-        # permissions and then return to the diagnostics page.
-        credentials = await m365_service.get_credentials(company_id)
-        if credentials:
-            state = oauth_state_serializer.dumps({
-                "company_id": company_id,
-                "user_id": user.get("id"),
-                "flow": "connect",
-                "return_to": "diagnostics",
-            })
-            params = {
-                "client_id": credentials["client_id"],
-                "response_type": "code",
-                "redirect_uri": _build_m365_redirect_uri(request),
-                "response_mode": "query",
-                "scope": m365_service.CONNECT_SCOPE,
-                "state": state,
-                "prompt": "consent",
-            }
-            authorize_url = (
-                f"https://login.microsoftonline.com/{credentials['tenant_id']}"
-                f"/oauth2/v2.0/authorize?{urlencode(params)}"
-            )
-            return RedirectResponse(url=authorize_url, status_code=status.HTTP_303_SEE_OTHER)
-        return flash_redirect("/m365/diagnostics", "No credentials configured", "error")
-    except m365_service.M365Error as exc:
-        return flash_redirect("/m365/diagnostics", str(exc), "error")
-
-    if outcome.get("granted"):
-        msg = "Missing permissions have been granted successfully."
-    else:
-        msg = "No new permissions were needed – all permissions are already granted."
-
-    return flash_redirect("/m365/diagnostics", msg, "success")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @app.post("/m365/credentials", response_class=RedirectResponse)
@@ -4245,53 +3259,8 @@ async def delete_m365_credentials(request: Request):
     return RedirectResponse(url="/m365", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.post("/m365/admin-credentials", response_class=RedirectResponse)
-async def save_m365_admin_credentials(
-    request: Request,
-    client_id: str = Form(..., alias="adminClientId"),
-    client_secret: str = Form("", alias="adminClientSecret"),
-    tenant_id: str = Form("", alias="adminTenantId"),
-):
-    """Save per-company M365 admin enterprise app credentials."""
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-
-    # Only update if client_secret is provided (non-empty)
-    # If empty, we might be updating other fields only
-    existing = await m365_service.get_company_admin_credentials(company_id)
-    if existing and not client_secret.strip():
-        # Keep existing secret when none provided
-        client_secret = existing.get("client_secret", "")
-
-    if not client_id.strip() or not client_secret.strip():
-        encoded = urlencode({"error": "Admin Client ID and Client Secret are required."})
-        return RedirectResponse(url=f"/m365?{encoded}", status_code=status.HTTP_303_SEE_OTHER)
-
-    await m365_service.upsert_company_admin_credentials(
-        company_id=company_id,
-        client_id=client_id.strip(),
-        client_secret=client_secret.strip(),
-        tenant_id=tenant_id.strip() if tenant_id.strip() else None,
-    )
-    log_info("M365 admin credentials updated", company_id=company_id, user_id=user.get("id"))
-    encoded = urlencode({"success": "Admin credentials saved successfully."})
-    return RedirectResponse(url=f"/m365?{encoded}", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.post("/m365/admin-credentials/delete", response_class=RedirectResponse)
-async def delete_m365_admin_credentials(request: Request):
-    """Delete per-company M365 admin enterprise app credentials."""
-    user, membership, _, company_id, redirect = await _load_license_context(request)
-    if redirect:
-        return redirect
-    if not user.get("is_super_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin privileges required")
-    await m365_service.delete_company_admin_credentials(company_id)
-    log_info("M365 admin credentials deleted", company_id=company_id, user_id=user.get("id"))
-    return RedirectResponse(url="/m365", status_code=status.HTTP_303_SEE_OTHER)
 
 
 def _build_m365_redirect_uri(request: Request) -> str:
@@ -4341,13 +3310,8 @@ async def sync_m365(request: Request):
         await m365_service.sync_company_licenses(company_id)
     except m365_service.M365Error as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    mailboxes_synced = 0
-    try:
-        mailboxes_synced = await m365_service.sync_mailboxes(company_id)
-    except Exception:
-        pass
     log_info("Microsoft 365 license sync triggered", company_id=company_id, user_id=user.get("id"))
-    return JSONResponse({"success": True, "mailboxes_synced": mailboxes_synced})
+    return JSONResponse({"success": True})
 
 
 @app.get("/m365/connect")
@@ -4528,76 +3492,6 @@ async def m365_discover(request: Request):
 
 
 
-@app.get("/admin/csp/provision")
-async def admin_csp_provision(request: Request):
-    """Provision the CSP/Lighthouse admin app registration automatically.
-
-    Redirects the super-admin to Microsoft's OAuth consent page.  The admin
-    must sign in with an account that has ``Application.ReadWrite.All`` and
-    ``AppRoleAssignment.ReadWrite.All`` permissions in their partner tenant.
-    After consent, the callback creates a dedicated app registration in the
-    partner tenant and stores the resulting credentials in the ``m365-admin``
-    integration module so that subsequent CSP sign-in can use them.
-
-    When no bootstrap credentials are configured the flow uses PKCE with the
-    well-known Azure CLI public client so that the admin can log in without
-    needing to pre-create an Azure app registration.
-    """
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    redirect_uri = str(request.url_for("m365_callback"))
-
-    # Prefer existing admin credentials, then an explicitly configured
-    # bootstrap client, and finally fall back to PKCE with the well-known
-    # Azure CLI public client so no manual credential setup is required.
-    existing_client_id, _ = await _get_m365_admin_credentials()
-    bootstrap_client_id = str(settings.m365_bootstrap_client_id or "").strip()
-
-    code_verifier: str | None = None
-    pkce_handle: str | None = None
-    if existing_client_id:
-        oauth_client_id = existing_client_id
-    elif bootstrap_client_id:
-        oauth_client_id = bootstrap_client_id
-    else:
-        # No credentials configured – use PKCE with a public client.
-        # Persist the code_verifier server-side and send only an opaque
-        # one-time handle in state so the verifier is never exposed in URLs.
-        # Use M365_PKCE_CLIENT_ID if configured; otherwise fall back to the
-        # Azure CLI public client (which may be blocked in some tenants).
-        code_verifier, code_challenge = m365_service.generate_pkce_pair()
-        pkce_handle = await _store_pkce_verifier(code_verifier)
-        oauth_client_id = m365_service.get_pkce_client_id()
-
-    state_payload: dict = {
-        "company_id": company_id,
-        "user_id": current_user.get("id"),
-        "flow": "discover",
-        "return_to": "company_edit",
-        "code_verifier": code_verifier,
-    }
-    if pkce_handle:
-        state_payload["pkce_handle"] = pkce_handle
-
-    state = oauth_state_serializer.dumps(state_payload)
-    params: dict = {
-        "client_id": oauth_client_id,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "response_mode": "query",
-        "scope": m365_service.DISCOVER_SCOPE,
-        "state": state,
-        "prompt": "select_account",
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-    }
-
-    authorize_url = (
-        "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize"
-        f"?{urlencode(params)}"
-    )
-    return RedirectResponse(url=authorize_url, status_code=status.HTTP_303_SEE_OTHER)
 
 
 async def _best_effort_sync_m365_email_domains(company_id: int) -> None:
@@ -4633,10 +3527,6 @@ async def m365_callback(request: Request, code: str | None = None, state: str | 
         if state:
             try:
                 state_data = oauth_state_serializer.loads(state)
-                if state_data.get("flow") == "m365_mail_auth":
-                    error_redirect = "/admin/modules/m365-mail"
-                elif state_data.get("flow") == "user_m365_contacts":
-                    error_redirect = "/admin/profile"
             except Exception:
                 pass
         # AADSTS700016 means the PKCE app registration no longer exists in the
@@ -4686,59 +3576,6 @@ async def m365_callback(request: Request, code: str | None = None, state: str | 
     except (TypeError, ValueError):
         company_id = 0
     flow = state_data.get("flow", "connect")
-
-    if flow == "user_m365_contacts":
-        current_user, auth_redirect = await _require_authenticated_user(request)
-        if auth_redirect or not current_user or int(current_user["id"]) != int(state_data.get("user_id") or 0):
-            return flash_redirect("/admin/profile", "The Microsoft sign-in session is not valid.", "error")
-        verifier = await _pop_m365_provision_code_verifier(state_data.get("pkce_handle"))
-        if not verifier:
-            return flash_redirect("/admin/profile", "The Microsoft sign-in verifier is missing.", "error")
-        redirect_uri = _build_m365_redirect_uri(request)
-        token_data = {
-            "client_id": await m365_service.get_effective_pkce_client_id(redirect_uri=redirect_uri),
-            "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri,
-            "code_verifier": verifier, "scope": user_m365_contacts_service.CONTACTS_SCOPE,
-        }
-        async with httpx.AsyncClient(timeout=30) as client:
-            token_response = await client.post(
-                "https://login.microsoftonline.com/organizations/oauth2/v2.0/token", data=token_data
-            )
-        if token_response.status_code != 200:
-            return flash_redirect("/admin/profile", "Microsoft 365 contact sign-in failed.", "error")
-        payload = token_response.json()
-        access_token, refresh_token = payload.get("access_token"), payload.get("refresh_token")
-        if not access_token or not refresh_token:
-            return flash_redirect("/admin/profile", "Microsoft did not grant offline contact access.", "error")
-        # Graph access tokens are intended for Microsoft Graph and are not
-        # guaranteed to be JWTs that this application can decode.  The ID
-        # token, on the other hand, is issued to this client and is the stable
-        # source for the signed-in tenant.  Keep the access-token fallback for
-        # older responses which did not include an ID token.
-        try:
-            tenant_id = user_m365_contacts_service.tenant_id_from_token_response(payload)
-        except ValueError:
-            return flash_redirect(
-                "/admin/profile",
-                "Microsoft did not return a usable account identity.",
-                "error",
-            )
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=float(payload.get("expires_in") or 3600))
-        await user_m365_contacts_service.store_tokens(
-            int(current_user["id"]), tenant_id=tenant_id, account_email=str(current_user.get("email") or "") or None,
-            refresh_token=str(refresh_token), access_token=str(access_token), expires_at=expires_at,
-        )
-        return flash_redirect("/admin/profile", "Outlook contacts connected.", "success")
-
-    if flow == "m365_mail_auth":
-        from app.features.m365_mail.oauth import handle_m365_mail_auth_callback as _pack_handler
-
-        return await _pack_handler(
-            request,
-            state_data=state_data,
-            code=code,
-            company_id=company_id,
-        )
 
     if flow == "discover":
         # ── Tenant-discovery flow ──────────────────────────────────────────
@@ -5130,7 +3967,7 @@ async def m365_callback(request: Request, code: str | None = None, state: str | 
         # Auto-create default sync tasks for the company if not already present.
         existing_commands = await scheduled_tasks_repo.get_commands_for_company(company_id)
         has_m365_sync_task = bool(
-            {"sync_m365_data", "sync_o365", "sync_m365_licenses", "sync_m365_contacts", "sync_m365_mailboxes"}
+            {"sync_m365_data", "sync_o365", "sync_m365_licenses", "sync_m365_contacts"}
             & existing_commands
         )
         sync_staff_task_name = (
@@ -5138,12 +3975,11 @@ async def m365_callback(request: Request, code: str | None = None, state: str | 
             if company_name
             else "Sync staff directory"
         )
-        # Create the three split M365 sync tasks if no M365 sync tasks exist yet
+        # Create the split M365 sync tasks if no M365 sync tasks exist yet
         if not has_m365_sync_task:
             for command, label_suffix in (
                 ("sync_m365_licenses", "Sync Microsoft 365 licenses"),
                 ("sync_m365_contacts", "Sync Microsoft 365 contacts"),
-                ("sync_m365_mailboxes", "Sync Microsoft 365 mailboxes"),
             ):
                 label = f"{company_name} - {label_suffix}" if company_name else label_suffix
                 await scheduled_tasks_repo.create_task(
@@ -5240,13 +4076,6 @@ async def m365_callback(request: Request, code: str | None = None, state: str | 
         _best_effort_sync_m365_email_domains(company_id),
         name=f"sync_m365_email_domains_{company_id}",
     )
-    if state_data.get("return_to") == "diagnostics":
-        # Re-run the diagnostics check so the page shows fresh results after repair.
-        try:
-            await m365_service.check_enterprise_app_permissions(company_id)
-        except m365_service.M365Error:
-            pass
-        return flash_redirect("/m365/diagnostics", "Permissions repaired and re-checked", "success")
     return RedirectResponse(url="/m365", status_code=status.HTTP_303_SEE_OTHER)
 
 
@@ -5331,101 +4160,8 @@ async def search_by_phone_number(request: Request):
     )
 
 
-@app.get("/myforms", response_class=HTMLResponse)
-async def forms_page(request: Request):
-    (
-        user,
-        _membership,
-        company,
-        company_id,
-        redirect,
-    ) = await _load_company_section_context(
-        request,
-        permission_field="can_access_forms",
-        allow_super_admin_without_company=True,
-    )
-    if redirect:
-        return redirect
-
-    active_company_id = company_id
-    active_company = company
-    if active_company is None:
-        fallback_company_id = getattr(request.state, "active_company_id", None)
-        if fallback_company_id is not None:
-            try:
-                active_company = await company_repo.get_company_by_id(int(fallback_company_id))
-                active_company_id = int(fallback_company_id)
-            except (TypeError, ValueError):
-                active_company = None
-
-    portal_base = str(settings.portal_url) if settings.portal_url else str(request.base_url).rstrip("/")
-    login_url = str(request.url_for("login_page"))
-
-    replacements = template_variables.build_template_replacement_map(
-        template_variables.TemplateContext(
-            user=template_variables.TemplateContextUser(
-                id=user.get("id"),
-                email=user.get("email"),
-                first_name=user.get("first_name"),
-                last_name=user.get("last_name"),
-            ),
-            company=template_variables.TemplateContextCompany(
-                id=int(active_company_id) if active_company_id is not None else None,
-                name=(active_company or {}).get("name"),
-                syncro_customer_id=(active_company or {}).get("syncro_company_id"),
-            ),
-            portal=template_variables.TemplateContextPortal(
-                base_url=portal_base,
-                login_url=login_url,
-            ),
-        )
-    )
-
-    raw_forms = await forms_repo.list_forms_for_user(user["id"])
-    hydrated_forms: list[dict[str, Any]] = []
-    for form in raw_forms:
-        iframe_url = template_variables.apply_template_variables(form.get("url", ""), replacements)
-        embed_html: str | None = None
-        embed_code = form.get("embed_code")
-        if embed_code:
-            try:
-                normalized = normalize_opnform_embed_code(embed_code, allowed_host=OPNFORM_ALLOWED_HOST)
-                embed_html = template_variables.apply_template_variables(
-                    normalized.sanitized_embed_code,
-                    replacements,
-                )
-                iframe_url = template_variables.apply_template_variables(
-                    normalized.form_url,
-                    replacements,
-                )
-            except OpnformValidationError as exc:
-                log_error(
-                    "Failed to normalise OpnForm embed for rendering",
-                    form_id=form.get("id"),
-                    error=str(exc),
-                )
-        hydrated_forms.append(
-            {
-                "id": form.get("id"),
-                "name": form.get("name"),
-                "description": form.get("description"),
-                "iframe_url": iframe_url,
-                "embed_html": embed_html,
-            }
-        )
-
-    extra = {
-        "title": "Forms",
-        "forms": hydrated_forms,
-        "opnform_base_url": _opnform_base_url(),
-    }
-    return await _render_template("forms/index.html", request, user, extra=extra)
 
 
-@app.get("/forms", include_in_schema=False)
-async def legacy_forms_redirect() -> RedirectResponse:
-    """Maintain compatibility for legacy bookmarks under /forms."""
-    return RedirectResponse(url="/myforms", status_code=status.HTTP_308_PERMANENT_REDIRECT)
 
 
 @app.head("/admin/service-status", response_class=HTMLResponse)
@@ -5595,9 +4331,6 @@ async def admin_service_status_check_now(request: Request, service_id: int):
     return await _admin_service_status_check_now_handler(request, service_id)
 
 
-# ---------------------------------------------------------------------------
-# Backup History admin pages
-# ---------------------------------------------------------------------------
 @app.get("/admin/profile", response_class=HTMLResponse)
 async def admin_profile_page(request: Request):
     user, redirect = await _require_authenticated_user(request)
@@ -5635,7 +4368,6 @@ async def admin_profile_page(request: Request):
         totp_devices.append({"id": identifier, "name": name})
 
     totp_devices.sort(key=lambda entry: entry["name"].lower())
-    m365_contacts_status = await user_m365_contacts_service.status_for_user(int(user["id"]))
 
     context = await _build_base_context(
         request,
@@ -5645,60 +4377,15 @@ async def admin_profile_page(request: Request):
             "profile_membership": membership,
             "profile_show_technician_tools": _can_edit_profile_technician_tools(user, membership),
             "profile_totp_devices": totp_devices,
-            "profile_m365_contacts": m365_contacts_status,
         },
     )
     return templates.TemplateResponse(context["request"], "admin/profile.html", context)
 
 
-@app.get("/admin/profile/m365-contacts/connect")
-async def profile_m365_contacts_connect(request: Request):
-    user, redirect = await _require_authenticated_user(request)
-    if redirect:
-        return redirect
-    redirect_uri = _build_m365_redirect_uri(request)
-    verifier, challenge = m365_service.generate_pkce_pair()
-    verifier_id = await _store_m365_provision_code_verifier(verifier)
-    state = oauth_state_serializer.dumps({
-        "flow": "user_m365_contacts", "user_id": int(user["id"]), "pkce_handle": verifier_id,
-    })
-    client_id = await m365_service.get_effective_pkce_client_id(redirect_uri=redirect_uri)
-    params = {
-        "client_id": client_id, "response_type": "code", "redirect_uri": redirect_uri,
-        "response_mode": "query", "scope": user_m365_contacts_service.CONTACTS_SCOPE,
-        "state": state, "prompt": "select_account", "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    }
-    return RedirectResponse(
-        "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?" + urlencode(params),
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
 
 
-@app.post("/admin/profile/m365-contacts/disconnect")
-async def profile_m365_contacts_disconnect(request: Request):
-    user, redirect = await _require_authenticated_user(request)
-    if redirect:
-        return redirect
-    from app.repositories import user_m365_contacts as user_contacts_repo
-    await user_contacts_repo.delete_integration(int(user["id"]))
-    return flash_redirect("/admin/profile", "Outlook contacts disconnected.", "success")
 
 
-@app.api_route(
-    "/api/profile/m365-contacts/phones",
-    methods=["GET", "POST"],
-    response_class=JSONResponse,
-)
-async def profile_m365_contact_phones(request: Request, name: str = Query(..., min_length=1, max_length=200)):
-    user, redirect = await _require_authenticated_user(request)
-    if redirect:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
-    try:
-        phones = await user_m365_contacts_service.lookup_phones(int(user["id"]), name.strip())
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return JSONResponse({"phones": phones})
 
 
 @app.post("/api/tickets/{ticket_id}/requester/mobile", response_class=JSONResponse)
@@ -6050,11 +4737,8 @@ async def admin_scheduled_tasks(
 
     available_commands = (
         "update_mac_vendors", "sync_staff", "sync_m365_data", "sync_m365_licenses",
-        "sync_m365_contacts", "sync_m365_mailboxes", "refresh_m365_consent_status",
-        "sync_huntress", "sync_to_xero", "sync_to_xero_auto_send", "generate_invoice",
-        "unbill_time_entries", "send_price_change_notifications", "create_scheduled_ticket",
-        "sync_recordings", "sync_unifi_talk_recordings", "queue_transcriptions",
-        "process_transcription", "update_tray_icon_installer", "rag_index_start",
+        "sync_m365_contacts", "refresh_m365_consent_status", "unbill_time_entries",
+        "create_scheduled_ticket", "rag_index_start",
         "rag_index_stop", "rag_matching_pause", "rag_matching_resume",
         "rag_cleanup_stale_matches",
     )
@@ -6446,1184 +5130,94 @@ async def admin_bulk_redistribute_scheduled_tasks(request: Request):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/admin/tray/devices", response_class=HTMLResponse)
-async def admin_tray_devices_page(
-    request: Request,
-    search: str | None = None,
-    status: str | None = None,
-):
-    current_user, redirect = await _require_authenticated_user(request)
-    if redirect:
-        return redirect
-    if not (current_user.get("is_super_admin") or current_user.get("is_helpdesk_technician")):
-        return RedirectResponse(url="/", status_code=303)
-
-    from app.repositories import tray as tray_repo
-    from app.services import tray_installer as tray_installer_service
-
-    devices = await tray_repo.list_devices(status=(status or None))
-    if search:
-        needle = search.strip().lower()
-        devices = [
-            d for d in devices
-            if needle in str(d.get("hostname") or "").lower()
-            or needle in str(d.get("device_uid") or "").lower()
-            or needle in str(d.get("console_user") or "").lower()
-        ]
-    trmm_scripts: list[dict] = []
-    trmm_scripts_error: str | None = None
-    selected_update_script_id: int | None = None
-    if current_user.get("is_super_admin"):
-        trmm_scripts, trmm_scripts_error = await _get_tray_trmm_scripts_for_form()
-        selected_update_script_id = await site_settings_repo.get_tray_update_trmm_script_id()
-    tray_release = tray_installer_service.get_cached_latest_release_info()
-    latest_tray_version = tray_release.get("version") if isinstance(tray_release, dict) else None
-    outdated_device_count = sum(
-        1
-        for device in devices
-        if device.get("status") != "revoked"
-        and _is_tray_agent_outdated(device.get("agent_version"), latest_tray_version)
-    )
-    extra = {
-        "title": "Tray devices",
-        "devices": devices,
-        "filters": {"search": search or "", "status": status or ""},
-        "matrix_enabled": settings.matrix_enabled,
-        "tray_release": tray_release,
-        "outdated_device_count": outdated_device_count,
-        "trmm_scripts": trmm_scripts,
-        "trmm_scripts_error": trmm_scripts_error,
-        "selected_update_script_id": selected_update_script_id,
-    }
-    return await _render_template("admin/tray/devices.html", request, current_user, extra=extra)
-
-
-@app.post("/admin/tray/update-script", response_class=HTMLResponse)
-async def admin_tray_save_update_script(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    form = await request.form()
-    raw_script_id = str(form.get("script_id") or "").strip()
-    if not raw_script_id:
-        await site_settings_repo.set_tray_update_trmm_script_id(None)
-        return flash_redirect(
-            "/admin/tray/devices",
-            "Tray update Tactical RMM script selection cleared.",
-            "success",
-        )
-    try:
-        script_id = int(raw_script_id)
-    except ValueError:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "Select a valid Tactical RMM script for tray updates.",
-            "error",
-        )
-    await site_settings_repo.set_tray_update_trmm_script_id(script_id)
-    return flash_redirect(
-        "/admin/tray/devices",
-        "Tray update Tactical RMM script saved.",
-        "success",
-    )
-
-
-@app.post("/admin/tray/devices/{device_id}/update", response_class=HTMLResponse)
-async def admin_tray_update_device(device_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import assets as assets_repo
-    from app.repositories import tray as tray_repo
-    from app.services import tacticalrmm as tacticalrmm_service
-
-    device = await tray_repo.get_device_by_id(device_id)
-    if not device:
-        return flash_redirect("/admin/tray/devices", "Tray device not found.", "error")
-    if device.get("status") == "revoked":
-        return flash_redirect(
-            "/admin/tray/devices",
-            "Revoked tray devices cannot receive update commands.",
-            "error",
-        )
-
-    script_id = await site_settings_repo.get_tray_update_trmm_script_id()
-    if not script_id:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "Select a Tactical RMM script before running tray updates.",
-            "error",
-        )
-    asset_id = device.get("asset_id")
-    if not asset_id:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "This tray device is not linked to an asset with a Tactical RMM agent ID.",
-            "error",
-        )
-    asset = await assets_repo.get_asset_by_id(int(asset_id))
-    tactical_agent_id = str((asset or {}).get("tactical_asset_id") or "").strip()
-    if not tactical_agent_id:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "The linked asset is missing a Tactical RMM agent ID.",
-            "error",
-        )
-
-    payload = {
-        "type": "tacticalrmm_script",
-        "purpose": "tray_update",
-        "script_id": script_id,
-        "tactical_agent_id": tactical_agent_id,
-    }
-    command_id = await tray_repo.log_command(
-        device_id=int(device["id"]),
-        command="trmm_update_script",
-        payload_json=json.dumps(payload),
-        initiated_by_user_id=current_user.get("id") if current_user else None,
-        status="queued",
-    )
-    try:
-        result = await tacticalrmm_service.run_script_on_agent(tactical_agent_id, script_id)
-    except Exception as exc:  # pragma: no cover - external integration availability
-        await tray_repo.mark_command_delivered(command_id, error=str(exc))
-        return flash_redirect(
-            "/admin/tray/devices",
-            f"Unable to start Tactical RMM update script: {exc}",
-            "error",
-        )
-    payload["tactical_rmm_response"] = result.get("response")
-    await tray_repo.mark_command_delivered(command_id)
-    return flash_redirect(
-        "/admin/tray/devices",
-        "Tactical RMM update script started for the tray device.",
-        "success",
-    )
-
-
-@app.post("/admin/tray/devices/bulk-update-outdated", response_class=HTMLResponse)
-async def admin_tray_bulk_update_outdated_devices(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import assets as assets_repo
-    from app.repositories import tray as tray_repo
-    from app.services import tacticalrmm as tacticalrmm_service
-    from app.services import tray_installer as tray_installer_service
-
-    script_id = await site_settings_repo.get_tray_update_trmm_script_id()
-    if not script_id:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "Select a Tactical RMM script before running tray updates.",
-            "error",
-        )
-
-    tray_release = tray_installer_service.get_cached_latest_release_info()
-    latest_tray_version = tray_release.get("version") if isinstance(tray_release, dict) else None
-    if not latest_tray_version:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "The latest tray app release is not loaded, so outdated devices cannot be determined.",
-            "error",
-        )
-
-    devices = await tray_repo.list_devices()
-    outdated_devices = [
-        device
-        for device in devices
-        if device.get("status") != "revoked"
-        and _is_tray_agent_outdated(device.get("agent_version"), latest_tray_version)
-    ]
-    if not outdated_devices:
-        return flash_redirect(
-            "/admin/tray/devices",
-            "No linked tray devices are outdated.",
-            "info",
-        )
-
-    started_count = 0
-    skipped_count = 0
-    failed_count = 0
-    for device in outdated_devices:
-        asset_id = device.get("asset_id")
-        if not asset_id:
-            skipped_count += 1
-            continue
-        asset = await assets_repo.get_asset_by_id(int(asset_id))
-        tactical_agent_id = str((asset or {}).get("tactical_asset_id") or "").strip()
-        if not tactical_agent_id:
-            skipped_count += 1
-            continue
-        payload = {
-            "type": "tacticalrmm_script",
-            "purpose": "tray_update",
-            "script_id": script_id,
-            "tactical_agent_id": tactical_agent_id,
-            "latest_tray_version": latest_tray_version,
-            "current_agent_version": device.get("agent_version"),
-        }
-        command_id = await tray_repo.log_command(
-            device_id=int(device["id"]),
-            command="trmm_update_script",
-            payload_json=json.dumps(payload),
-            initiated_by_user_id=current_user.get("id") if current_user else None,
-            status="queued",
-        )
-        try:
-            result = await tacticalrmm_service.run_script_on_agent(tactical_agent_id, script_id)
-        except Exception as exc:  # pragma: no cover - external integration availability
-            failed_count += 1
-            await tray_repo.mark_command_delivered(command_id, error=str(exc))
-            continue
-        payload["tactical_rmm_response"] = result.get("response")
-        await tray_repo.mark_command_delivered(command_id)
-        started_count += 1
-
-    message = f"Queued Tactical RMM update script for {started_count} outdated tray device(s)."
-    if skipped_count or failed_count:
-        message += f" Skipped {skipped_count}; failed {failed_count}."
-    category = "success" if started_count else "warning"
-    return flash_redirect("/admin/tray/devices", message, category)
-
-
-@app.post("/admin/tray/devices/{device_id}/revoke", response_class=HTMLResponse)
-async def admin_tray_revoke_device(device_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    await tray_repo.revoke_device(device_id)
-    return RedirectResponse(url="/admin/tray/devices?status=", status_code=303)
-
-
-@app.post("/admin/tray/devices/{device_id}/reactivate", response_class=HTMLResponse)
-async def admin_tray_reactivate_device(device_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    device = await tray_repo.get_device_by_id(device_id)
-    if not device:
-        raise HTTPException(status_code=404, detail="Tray device not found")
-    if device.get("status") != "revoked":
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot reactivate device: device is not in revoked state",
-        )
-    await tray_repo.reactivate_device(device_id)
-    return RedirectResponse(url="/admin/tray/devices?status=", status_code=303)
-
-
-@app.post("/admin/tray/devices/{device_id}/delete", response_class=HTMLResponse)
-async def admin_tray_delete_device(device_id: int, request: Request):
-    _current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    device = await tray_repo.get_device_by_id(device_id)
-    if not device:
-        return flash_redirect("/admin/tray/devices", "Tray device not found.", "error")
-    if device.get("status") != "revoked":
-        return flash_redirect(
-            "/admin/tray/devices",
-            "Only revoked tray devices can be deleted.",
-            "error",
-        )
-    await tray_repo.delete_device(device_id)
-    return flash_redirect(
-        "/admin/tray/devices",
-        "Deleted revoked tray device.",
-        "success",
-    )
-
-
-@app.post("/admin/tray/devices/bulk-delete-revoked", response_class=HTMLResponse)
-async def admin_tray_bulk_delete_revoked_devices(request: Request):
-    _current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    deleted_count = await tray_repo.delete_revoked_devices()
-    if deleted_count <= 0:
-        return flash_redirect("/admin/tray/devices", "No revoked tray devices to delete.", "info")
-    suffix = "device" if deleted_count == 1 else "devices"
-    return flash_redirect(
-        "/admin/tray/devices",
-        f"Deleted {deleted_count} revoked tray {suffix}.",
-        "success",
-    )
-
-
-@app.get("/admin/tray/install-tokens", response_class=HTMLResponse)
-async def admin_tray_install_tokens_page(
-    request: Request,
-    new_token: str | None = None,
-    show_revoked: bool = False,
-):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    from app.repositories import tray as tray_repo
-    from app.repositories import companies as companies_repo
-    from app.services import tray as tray_service
-
-    tokens = await tray_repo.list_install_tokens()
-    hidden_revoked_count = 0
-    if not show_revoked:
-        hidden_revoked_count = sum(1 for token in tokens if token.get("revoked_at"))
-        tokens = [token for token in tokens if not token.get("revoked_at")]
-    companies = await companies_repo.list_companies(include_archived=False)
-    portal_url = (
-        str(settings.portal_url).rstrip("/")
-        if settings.portal_url
-        else str(request.base_url.replace(scheme="https")).rstrip("/")
-    )
-    extra = {
-        "title": "Tray install tokens",
-        "tokens": tokens,
-        "show_revoked": show_revoked,
-        "hidden_revoked_count": hidden_revoked_count,
-        "companies": companies,
-        "new_token": new_token,
-        "now_iso": datetime.now(timezone.utc).isoformat(),
-        "portal_url": portal_url,
-        "trmm_token_field_name": tray_service.trmm_client_token_field_name(),
-    }
-    return await _render_template(
-        "admin/tray/install_tokens.html", request, current_user, extra=extra
-    )
-
-
-@app.post("/admin/tray/install-tokens", response_class=HTMLResponse)
-async def admin_tray_create_install_token(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    form = await request.form()
-    label = (str(form.get("label", "")).strip() or "Untitled token")[:150]
-    company_raw = str(form.get("company_id", "")).strip()
-    company_id = int(company_raw) if company_raw.isdigit() else None
-
-    from app.repositories import tray as tray_repo
-    from app.services import tray as tray_service
-
-    raw_token = tray_service.generate_install_token()
-    await tray_repo.create_install_token(
-        label=label,
-        company_id=company_id,
-        token_hash=tray_service.hash_token(raw_token),
-        token_prefix=tray_service.token_prefix(raw_token),
-        created_by_user_id=int(current_user["id"]),
-    )
-    # Redirect with the raw token in the query string so the admin sees it once.
-    # The token cannot be reconstructed later — only the prefix is displayed.
-    return RedirectResponse(
-        url=f"/admin/tray/install-tokens?new_token={raw_token}", status_code=303
-    )
-
-
-@app.post("/admin/tray/install-tokens/{token_id}/revoke", response_class=HTMLResponse)
-async def admin_tray_revoke_install_token(token_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    await tray_repo.revoke_install_token(token_id)
-    return RedirectResponse(url="/admin/tray/install-tokens", status_code=303)
-
-
-@app.post("/admin/tray/install-tokens/bulk-purge-revoked", response_class=HTMLResponse)
-async def admin_tray_bulk_purge_revoked_install_tokens(request: Request):
-    _current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    deleted_count = await tray_repo.delete_revoked_install_tokens()
-    if deleted_count <= 0:
-        return flash_redirect(
-            "/admin/tray/install-tokens", "No revoked install tokens to purge.", "info"
-        )
-    suffix = "token" if deleted_count == 1 else "tokens"
-    return flash_redirect(
-        "/admin/tray/install-tokens",
-        f"Purged {deleted_count} revoked install {suffix}.",
-        "success",
-    )
-
-
-@app.post("/admin/tray/install-tokens/sync-tactical-rmm", response_class=HTMLResponse)
-async def admin_tray_sync_install_tokens_to_tactical_rmm(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    from app.services import modules as modules_service
-    from app.services import tray as tray_service
-
-    try:
-        await modules_service.ensure_tacticalrmm_ready()
-    except ValueError as exc:
-        log_error("Unable to sync tray tokens to Tactical RMM", error=str(exc))
-        return flash_redirect("/admin/tray/install-tokens", str(exc), "error")
-
-    task_id = uuid4().hex
-
-    async def _on_success(summary: Mapping[str, Any]) -> None:
-        log_info(
-            "Tactical RMM tray token sync completed",
-            task_id=task_id,
-            processed=summary.get("processed"),
-            updated=summary.get("updated"),
-            skipped=len(summary.get("skipped") or []),
-            errors=len(summary.get("errors") or []),
-        )
-
-    async def _on_error(exc: Exception) -> None:
-        log_error("Tactical RMM tray token sync failed", task_id=task_id, error=str(exc))
-
-    user_id = int(current_user["id"]) if current_user.get("id") is not None else None
-    background_tasks.queue_background_task(
-        lambda: tray_service.sync_all_company_trmm_tray_tokens(
-            created_by_user_id=user_id
-        ),
-        task_id=task_id,
-        description="tacticalrmm-tray-token-sync",
-        on_complete=_on_success,
-        on_error=_on_error,
-    )
-
-    return flash_redirect(
-        "/admin/tray/install-tokens",
-        f"Tactical RMM tray token sync queued. Task ID: {task_id[:8]}",
-        "success",
-    )
-
-
-@app.get("/admin/tray/configurations", response_class=HTMLResponse)
-async def admin_tray_configurations_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    configurations = await tray_repo.list_menu_configs()
-    for cfg in configurations:
-        scope = cfg.get("scope")
-        ref = cfg.get("scope_ref_id")
-        cfg["scope_target_label"] = f"#{ref}" if ref else None
-    extra = {
-        "title": "Tray menu configurations",
-        "configurations": configurations,
-    }
-    return await _render_template(
-        "admin/tray/configurations.html", request, current_user, extra=extra
-    )
-
-
-async def _get_tray_trmm_scripts_for_form() -> tuple[list[dict], str | None]:
-    from app.services import tacticalrmm as tacticalrmm_service
-
-    try:
-        return await tacticalrmm_service.fetch_scripts(), None
-    except Exception as exc:  # pragma: no cover - external integration availability
-        return [], str(exc)
-
-
-async def _get_tray_companies_for_form() -> list[dict]:
-    from app.repositories import companies as company_repo
-
-    companies = await company_repo.list_companies(include_archived=True)
-    return [
-        {
-            "id": int(company["id"]),
-            "name": str(company.get("name") or f"Company #{company['id']}"),
-        }
-        for company in companies
-        if company.get("id") is not None
-    ]
-
-
-@app.get("/admin/tray/configurations/new", response_class=HTMLResponse)
-async def admin_tray_new_configuration_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    trmm_scripts, trmm_scripts_error = await _get_tray_trmm_scripts_for_form()
-    companies = await _get_tray_companies_for_form()
-    extra = {
-        "title": "New tray configuration",
-        "heading": "New tray menu configuration",
-        "form_action": "/admin/tray/configurations",
-        "config": {
-            "name": "",
-            "scope": "global",
-            "scope_ref_id": None,
-            "enabled": True,
-            "display_text": "",
-            "env_allowlist_csv": "",
-            "branding_icon_url": "",
-            "payload_json": "[]",
-        },
-        "trmm_scripts": trmm_scripts,
-        "trmm_scripts_error": trmm_scripts_error,
-        "companies": companies,
-    }
-    return await _render_template(
-        "admin/tray/configuration_form.html", request, current_user, extra=extra
-    )
-
-
-@app.get("/admin/tray/configurations/{config_id}/edit", response_class=HTMLResponse)
-async def admin_tray_edit_configuration_page(config_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    record = await tray_repo.get_menu_config(config_id)
-    if not record:
-        return RedirectResponse(url="/admin/tray/configurations", status_code=303)
-    trmm_scripts, trmm_scripts_error = await _get_tray_trmm_scripts_for_form()
-    companies = await _get_tray_companies_for_form()
-    extra = {
-        "title": "Edit tray configuration",
-        "heading": f"Edit configuration: {record.get('name')}",
-        "form_action": f"/admin/tray/configurations/{config_id}",
-        "config": {
-            "name": record.get("name"),
-            "scope": record.get("scope"),
-            "scope_ref_id": record.get("scope_ref_id"),
-            "enabled": bool(record.get("enabled")),
-            "display_text": record.get("display_text") or "",
-            "env_allowlist_csv": record.get("env_allowlist") or "",
-            "branding_icon_url": record.get("branding_icon_url") or "",
-            "payload_json": record.get("payload_json") or "[]",
-        },
-        "trmm_scripts": trmm_scripts,
-        "trmm_scripts_error": trmm_scripts_error,
-        "companies": companies,
-    }
-    return await _render_template(
-        "admin/tray/configuration_form.html", request, current_user, extra=extra
-    )
-
-
-async def _save_tray_configuration_from_form(form, current_user, *, config_id: int | None):
-    import json as _json
-    from app.repositories import tray as tray_repo
-    from app.services import sanitization
-
-    name = (str(form.get("name", "")).strip() or "Untitled")[:150]
-    scope = str(form.get("scope", "global")).strip().lower()
-    if scope not in {"global", "company", "tag", "device"}:
-        scope = "global"
-    scope_ref_raw = str(form.get("scope_ref_id", "")).strip()
-    scope_ref_id = int(scope_ref_raw) if scope_ref_raw.isdigit() else None
-    enabled = str(form.get("enabled", "")).lower() in {"1", "true", "on", "yes"}
-    payload_raw = str(form.get("payload_json", "[]")).strip() or "[]"
-    try:
-        parsed = _json.loads(payload_raw)
-        if not isinstance(parsed, list):
-            raise ValueError("Menu payload must be a JSON array")
-    except (ValueError, TypeError):
-        parsed = []
-    payload_json = _json.dumps(parsed)
-    display_text = str(form.get("display_text", "") or "")
-    if display_text:
-        sanitized = sanitization.sanitize_rich_text(display_text)
-        display_text = sanitized.html if sanitized else None
-    else:
-        display_text = None
-    env_csv = ",".join(
-        v.strip()
-        for v in str(form.get("env_allowlist", "") or "").split(",")
-        if v.strip()
-    )
-    branding = (str(form.get("branding_icon_url", "")).strip() or None)
-
-    if config_id is None:
-        await tray_repo.create_menu_config(
-            name=name,
-            scope=scope,
-            scope_ref_id=scope_ref_id,
-            payload_json=payload_json,
-            display_text=display_text,
-            env_allowlist=env_csv,
-            branding_icon_url=branding,
-            enabled=enabled,
-            created_by_user_id=int(current_user["id"]),
-        )
-    else:
-        await tray_repo.update_menu_config(
-            config_id,
-            name=name,
-            payload_json=payload_json,
-            display_text=display_text,
-            env_allowlist=env_csv,
-            branding_icon_url=branding,
-            enabled=enabled,
-            updated_by_user_id=int(current_user["id"]),
-        )
-
-
-@app.post("/admin/tray/configurations", response_class=HTMLResponse)
-async def admin_tray_create_configuration(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    form = await request.form()
-    await _save_tray_configuration_from_form(form, current_user, config_id=None)
-    return RedirectResponse(url="/admin/tray/configurations", status_code=303)
-
-
-@app.post("/admin/tray/configurations/{config_id}", response_class=HTMLResponse)
-async def admin_tray_update_configuration(config_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    form = await request.form()
-    await _save_tray_configuration_from_form(form, current_user, config_id=config_id)
-    return RedirectResponse(url="/admin/tray/configurations", status_code=303)
-
-
-@app.post("/admin/tray/configurations/{config_id}/delete", response_class=HTMLResponse)
-async def admin_tray_delete_configuration(config_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    await tray_repo.delete_menu_config(config_id)
-    return RedirectResponse(url="/admin/tray/configurations", status_code=303)
-
-
-# ---------------------------------------------------------------------------
-# Phase 5 – Admin: diagnostics page
-# ---------------------------------------------------------------------------
-
-
-@app.get("/admin/tray/diagnostics", response_class=HTMLResponse)
-async def admin_tray_diagnostics_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    bundles = await tray_repo.list_diagnostics()
-    return await _render_template(
-        "admin/tray/diagnostics.html",
-        request,
-        current_user,
-        extra={"bundles": bundles},
-    )
-
-
-@app.get("/admin/tray/diagnostics/{diag_id}/download")
-async def admin_tray_diagnostics_download(diag_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-    from fastapi.responses import FileResponse
-
-    row = await tray_repo.get_diagnostic(diag_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Diagnostic not found.")
-    path = row.get("stored_path", "")
-    import os
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Diagnostic file not found on disk.")
-    return FileResponse(
-        path,
-        media_type="application/zip",
-        filename=row.get("filename", f"diag-{diag_id}.zip"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Phase 5 – Admin: versions page
-# ---------------------------------------------------------------------------
-
-
-@app.get("/admin/tray/versions", response_class=HTMLResponse)
-async def admin_tray_versions_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    versions = await tray_repo.list_tray_versions()
-    return await _render_template(
-        "admin/tray/versions.html",
-        request,
-        current_user,
-        extra={"versions": versions},
-    )
-
-
-@app.post("/admin/tray/versions", response_class=HTMLResponse)
-async def admin_tray_versions_publish(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    form = await request.form()
-    version = str(form.get("version", "")).strip()
-    platform = str(form.get("platform", "all")).strip().lower()
-    download_url = str(form.get("download_url", "")).strip()
-    required = bool(form.get("required"))
-    try:
-        rollout_percent = max(1, min(100, int(form.get("rollout_percent") or 100)))
-    except (TypeError, ValueError):
-        rollout_percent = 100
-    if version and download_url:
-        await tray_repo.publish_tray_version(
-            version=version,
-            platform=platform,
-            download_url=download_url,
-            required=required,
-            release_notes=None,
-            published_by_user_id=int(current_user["id"]),
-            rollout_percent=rollout_percent,
-        )
-    return RedirectResponse(url="/admin/tray/versions", status_code=303)
-
-
-@app.post("/admin/tray/versions/{version_id}/rollout", response_class=HTMLResponse)
-async def admin_tray_version_rollout_update(version_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray as tray_repo
-
-    form = await request.form()
-    try:
-        rollout_percent = max(1, min(100, int(form.get("rollout_percent") or 100)))
-    except (TypeError, ValueError):
-        rollout_percent = 100
-    await tray_repo.update_tray_version_rollout(version_id, rollout_percent=rollout_percent)
-    return RedirectResponse(url="/admin/tray/versions", status_code=303)
-
-
-# ---------------------------------------------------------------------------
-# Tray icon (system-tray branding)
-# ---------------------------------------------------------------------------
-
-
-_TRAY_ICON_DIR = _private_uploads_path / "tray-icon"
-_TRAY_ICON_MAX_BYTES = 1 * 1024 * 1024  # 1 MB is plenty for a multi-res .ico
-
-
-def _tray_icon_uploads_root() -> Path:
-    _TRAY_ICON_DIR.mkdir(parents=True, exist_ok=True)
-    return _private_uploads_path
-
-
-@app.get(
-    "/tray/icon.ico",
-    include_in_schema=False,
-)
-async def tray_icon_endpoint() -> Response:
-    """Serve the active tray-icon ``.ico`` file.
-
-    Returns the admin-uploaded override when present, otherwise a default
-    icon generated at runtime from the website favicon palette. No
-    authentication is required — the icon is public branding consumed by
-    every tray client at startup.
-    """
-    from app.services import tray_icon as tray_icon_service
-
-    data = await tray_icon_service.get_tray_icon_bytes(_private_uploads_path)
-    return Response(
-        content=data,
-        media_type="image/x-icon",
-        headers={"Cache-Control": "public, max-age=300"},
-    )
-
-
-@app.get(
-    "/tray/icon.png",
-    include_in_schema=False,
-)
-async def tray_icon_png_endpoint() -> Response:
-    """Serve the active tray icon as a PNG for macOS clients.
-
-    macOS system-tray (NSStatusItem) cannot render ``.ico`` files; it
-    needs a PNG.  This endpoint returns the same icon as ``/tray/icon.ico``
-    but as a raw PNG: the embedded PNG is extracted from uploaded ICO files,
-    or the default PNG is returned when no upload is present.
-    """
-    from app.services import tray_icon as tray_icon_service
-
-    data = await tray_icon_service.get_tray_icon_png_bytes(_private_uploads_path)
-    return Response(
-        content=data,
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=300"},
-    )
-
-
-@app.get("/admin/tray/branding", response_class=HTMLResponse)
-async def admin_tray_branding_page(
-    request: Request,
-):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    current_path = await site_settings_repo.get_tray_icon_path()
-    tooltip_name = await site_settings_repo.get_tray_icon_tooltip_name()
-    extra = {
-        "title": "Tray icon",
-        "current_path": current_path,
-        "tooltip_name": tooltip_name or "",
-        "default_tooltip_name": "MyPortal Helpdesk",
-    }
-    return await _render_template(
-        "admin/tray/branding.html", request, current_user, extra=extra
-    )
-
-
-@app.post("/admin/tray/branding", response_class=HTMLResponse)
-async def admin_tray_branding_upload(
-    request: Request,
-    icon: UploadFile = File(None),
-    tooltip_name: str | None = Form(None),
-):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    from app.services import tray_icon as tray_icon_service
-
-    normalized_tooltip_name = re.sub(r"\s+", " ", str(tooltip_name or "").strip())
-    if len(normalized_tooltip_name) > 100:
-        return flash_redirect(
-            "/admin/tray/branding",
-            "Display name must be 100 characters or fewer",
-            "error",
-        )
-    if icon is None or not icon.filename:
-        if tooltip_name is not None:
-            await site_settings_repo.set_tray_icon_tooltip_name(
-                normalized_tooltip_name or None
-            )
-        await audit_service.log_action(
-            action="admin.tray.branding.update",
-            user_id=current_user.get("id"),
-            entity_type="site_settings",
-            entity_id=1,
-            metadata={"tooltip_name": normalized_tooltip_name or None},
-            request=request,
-        )
-        return flash_redirect("/admin/tray/branding", "Tray branding updated", "success")
-
-    data = await icon.read(_TRAY_ICON_MAX_BYTES + 1)
-    if len(data) > _TRAY_ICON_MAX_BYTES:
-        return flash_redirect("/admin/tray/branding", "File too large (max 1 MB)", "error")
-    if not tray_icon_service.is_valid_ico(data):
-        return flash_redirect("/admin/tray/branding", "Not a valid .ico file", "error")
-
-    uploads_root = _tray_icon_uploads_root()
-    target = _TRAY_ICON_DIR / "tray-icon.ico"
-    try:
-        target.write_bytes(data)
-    except OSError as exc:
-        log_error(f"Failed to write tray icon: {exc}")
-        return flash_redirect("/admin/tray/branding", "Failed to save icon", "error")
-
-    relative_path = str(target.relative_to(uploads_root)).replace("\\", "/")
-    await site_settings_repo.set_tray_icon_path(relative_path)
-    if tooltip_name is not None:
-        await site_settings_repo.set_tray_icon_tooltip_name(
-            normalized_tooltip_name or None
-        )
-    await audit_service.log_action(
-        action="admin.tray.icon.upload",
-        user_id=current_user.get("id"),
-        entity_type="site_settings",
-        entity_id=1,
-        metadata={
-            "path": relative_path,
-            "bytes": len(data),
-            "tooltip_name": normalized_tooltip_name or None,
-        },
-        request=request,
-    )
-    return flash_redirect("/admin/tray/branding", "Tray branding updated", "success")
-
-
-@app.post("/admin/tray/branding/delete", response_class=HTMLResponse)
-async def admin_tray_branding_delete(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    current_path = await site_settings_repo.get_tray_icon_path()
-    if current_path:
-        try:
-            candidate = (_private_uploads_path / current_path).resolve()
-            uploads_root_resolved = _private_uploads_path.resolve()
-            if (
-                uploads_root_resolved == candidate
-                or uploads_root_resolved in candidate.parents
-            ) and candidate.is_file():
-                candidate.unlink()
-        except OSError:
-            pass
-    await site_settings_repo.set_tray_icon_path(None)
-    await audit_service.log_action(
-        action="admin.tray.icon.delete",
-        user_id=current_user.get("id"),
-        entity_type="site_settings",
-        entity_id=1,
-        metadata={},
-        request=request,
-    )
-    return flash_redirect("/admin/tray/branding", "Tray icon reset to default", "success")
-
-
-# ---------------------------------------------------------------------------
-# Tray ticket questions (global admin)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/admin/tray/ticket-questions", response_class=HTMLResponse)
-async def admin_tray_ticket_questions_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray_ticket_questions as tq_repo
-
-    questions = await tq_repo.list_questions()
-    all_ids = [int(q["id"]) for q in questions]
-    from app.repositories import tray_ticket_questions as _tq
-    cond_rows = await _tq.list_conditions_for_questions(all_ids)
-    cond_index: dict = {}
-    for c in cond_rows:
-        cond_index.setdefault(int(c["question_id"]), []).append(dict(c))
-    for q in questions:
-        q["conditions"] = cond_index.get(int(q["id"]), [])
-
-    params = request.query_params
-    extra = {
-        "title": "Ticket intake questions",
-        "questions": questions,
-        "success_message": params.get("success"),
-        "error_message": params.get("error"),
-    }
-    return await _render_template(
-        "admin/tray/ticket_questions.html", request, current_user, extra=extra
-    )
-
-
-@app.get("/admin/tray/ticket-questions/new", response_class=HTMLResponse)
-async def admin_tray_new_ticket_question_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray_ticket_questions as tq_repo
-    from app.repositories import companies as companies_repo
-
-    all_questions = await tq_repo.list_questions(active_only=False)
-    companies = await companies_repo.list_companies()
-    extra = {
-        "title": "New ticket intake question",
-        "question": None,
-        "all_questions": all_questions,
-        "companies": companies,
-        "error_message": None,
-    }
-    return await _render_template(
-        "admin/tray/ticket_question_form.html", request, current_user, extra=extra
-    )
-
-
-@app.post("/admin/tray/ticket-questions/new", response_class=HTMLResponse)
-async def admin_tray_create_ticket_question(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray_ticket_questions as tq_repo
-    from app.repositories import companies as companies_repo
-
-    form = await request.form()
-    scope = str(form.get("scope") or "global").strip()
-    company_id_raw = form.get("company_id")
-    company_id = int(company_id_raw) if company_id_raw else None
-    field_type = str(form.get("field_type") or "text").strip()
-    label = str(form.get("label") or "").strip()
-    placeholder = str(form.get("placeholder") or "").strip() or None
-    is_required = bool(form.get("is_required"))
-    is_active = bool(form.get("is_active"))
-    sort_order = int(form.get("sort_order") or 0)
-    options_text = str(form.get("options_text") or "")
-    options = [o.strip() for o in options_text.splitlines() if o.strip()]
-
-    if not label:
-        all_questions = await tq_repo.list_questions(active_only=False)
-        companies = await companies_repo.list_companies()
-        extra = {
-            "title": "New ticket intake question",
-            "question": None,
-            "all_questions": all_questions,
-            "companies": companies,
-            "error_message": "Label is required.",
-        }
-        return await _render_template(
-            "admin/tray/ticket_question_form.html", request, current_user, extra=extra
-        )
-
-    record = await tq_repo.create_question(
-        scope=scope,
-        company_id=company_id,
-        field_type=field_type,
-        label=label,
-        placeholder=placeholder,
-        is_required=is_required,
-        options=options,
-        sort_order=sort_order,
-        is_active=is_active,
-        created_by_user_id=int(current_user["id"]),
-    )
-
-    # Conditions
-    parent_ids = form.getlist("cond_parent_id[]")
-    operators = form.getlist("cond_operator[]")
-    expected_vals = form.getlist("cond_expected[]")
-    conditions = [
-        {"parent_question_id": int(p), "operator": o, "expected_value": e}
-        for p, o, e in zip(parent_ids, operators, expected_vals)
-        if p
-    ]
-    if conditions:
-        await tq_repo.replace_conditions_for_question(int(record["id"]), conditions)
-
-    from urllib.parse import urlencode
-    return RedirectResponse(
-        url="/admin/tray/ticket-questions?" + urlencode({"success": "Question created."}),
-        status_code=303,
-    )
-
-
-@app.get("/admin/tray/ticket-questions/{question_id}/edit", response_class=HTMLResponse)
-async def admin_tray_edit_ticket_question_page(question_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray_ticket_questions as tq_repo
-    from app.repositories import companies as companies_repo
-
-    question = await tq_repo.get_question(question_id)
-    if not question:
-        return RedirectResponse(url="/admin/tray/ticket-questions", status_code=303)
-    question["conditions"] = await tq_repo.list_conditions_for_question(question_id)
-    all_questions = await tq_repo.list_questions(active_only=False)
-    companies = await companies_repo.list_companies()
-    extra = {
-        "title": f"Edit question — {question['label']}",
-        "question": question,
-        "all_questions": all_questions,
-        "companies": companies,
-        "error_message": None,
-    }
-    return await _render_template(
-        "admin/tray/ticket_question_form.html", request, current_user, extra=extra
-    )
-
-
-@app.post("/admin/tray/ticket-questions/{question_id}/edit", response_class=HTMLResponse)
-async def admin_tray_update_ticket_question(question_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray_ticket_questions as tq_repo
-    from app.repositories import companies as companies_repo
-
-    question = await tq_repo.get_question(question_id)
-    if not question:
-        return RedirectResponse(url="/admin/tray/ticket-questions", status_code=303)
-
-    form = await request.form()
-    field_type = str(form.get("field_type") or "text").strip()
-    label = str(form.get("label") or "").strip()
-    placeholder = str(form.get("placeholder") or "").strip() or None
-    is_required = bool(form.get("is_required"))
-    is_active = bool(form.get("is_active"))
-    sort_order = int(form.get("sort_order") or 0)
-    options_text = str(form.get("options_text") or "")
-    options = [o.strip() for o in options_text.splitlines() if o.strip()]
-
-    if not label:
-        question["conditions"] = await tq_repo.list_conditions_for_question(question_id)
-        all_questions = await tq_repo.list_questions(active_only=False)
-        companies = await companies_repo.list_companies()
-        extra = {
-            "title": f"Edit question — {question.get('label')}",
-            "question": question,
-            "all_questions": all_questions,
-            "companies": companies,
-            "error_message": "Label is required.",
-        }
-        return await _render_template(
-            "admin/tray/ticket_question_form.html", request, current_user, extra=extra
-        )
-
-    await tq_repo.update_question(
-        question_id,
-        field_type=field_type,
-        label=label,
-        placeholder=placeholder,
-        is_required=is_required,
-        options=options,
-        sort_order=sort_order,
-        is_active=is_active,
-    )
-
-    parent_ids = form.getlist("cond_parent_id[]")
-    operators = form.getlist("cond_operator[]")
-    expected_vals = form.getlist("cond_expected[]")
-    conditions = [
-        {"parent_question_id": int(p), "operator": o, "expected_value": e}
-        for p, o, e in zip(parent_ids, operators, expected_vals)
-        if p
-    ]
-    await tq_repo.replace_conditions_for_question(question_id, conditions)
-
-    from urllib.parse import urlencode
-    return RedirectResponse(
-        url="/admin/tray/ticket-questions?" + urlencode({"success": "Question updated."}),
-        status_code=303,
-    )
-
-
-@app.post("/admin/tray/ticket-questions/{question_id}/delete", response_class=HTMLResponse)
-async def admin_tray_delete_ticket_question(question_id: int, request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    from app.repositories import tray_ticket_questions as tq_repo
-
-    await tq_repo.delete_question(question_id)
-    from urllib.parse import urlencode
-    return RedirectResponse(
-        url="/admin/tray/ticket-questions?" + urlencode({"success": "Question deleted."}),
-        status_code=303,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-company tray settings
-# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @app.get("/admin/audit-logs", response_class=HTMLResponse)
 async def admin_audit_logs(
@@ -7808,121 +5402,6 @@ async def admin_change_log(
     return await _render_template("admin/change_log.html", request, current_user, extra=extra)
 
 
-@app.get("/admin/forms", response_class=HTMLResponse)
-async def admin_forms_page(request: Request):
-    current_user, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    forms_task = asyncio.create_task(forms_repo.list_forms())
-    companies_task = asyncio.create_task(company_repo.list_companies())
-    assignments_task = asyncio.create_task(user_company_repo.list_assignments())
-    permissions_task = asyncio.create_task(forms_repo.list_permission_entries())
-
-    forms, companies, assignments, permission_entries = await asyncio.gather(
-        forms_task,
-        companies_task,
-        assignments_task,
-        permissions_task,
-    )
-
-    company_lookup: dict[int, dict[str, Any]] = {}
-    for company in companies:
-        company_id = int(company.get("id")) if company.get("id") is not None else None
-        if company_id is None:
-            continue
-        company_lookup[company_id] = {
-            "id": company_id,
-            "name": company.get("name", "Unnamed company"),
-            "users": [],
-        }
-
-    seen_assignments: set[tuple[int, int]] = set()
-    for record in assignments:
-        company_id = record.get("company_id")
-        user_id = record.get("user_id")
-        if company_id is None or user_id is None:
-            continue
-        company_entry = company_lookup.get(int(company_id))
-        if not company_entry:
-            continue
-        key = (int(company_id), int(user_id))
-        if key in seen_assignments:
-            continue
-        seen_assignments.add(key)
-
-        first_name = (record.get("first_name") or "").strip()
-        last_name = (record.get("last_name") or "").strip()
-        full_name_parts = [part for part in (first_name, last_name) if part]
-        full_name = " ".join(full_name_parts)
-        email = (record.get("email") or "").strip()
-        label: str
-        if full_name and email:
-            label = f"{full_name} ({email})"
-        elif full_name:
-            label = full_name
-        elif email:
-            label = email
-        else:
-            label = f"User {user_id}"
-
-        company_entry["users"].append(
-            {
-                "id": int(user_id),
-                "label": label,
-                "email": email,
-                "name": full_name,
-            }
-        )
-
-    for company in company_lookup.values():
-        company["users"].sort(key=lambda item: item.get("label", "").lower())
-
-    company_user_options = sorted(company_lookup.values(), key=lambda item: item.get("name", ""))
-
-    permissions_map: dict[int, dict[int, set[int]]] = {}
-    for entry in permission_entries:
-        form_id = entry.get("form_id")
-        company_id = entry.get("company_id")
-        user_id = entry.get("user_id")
-        if form_id is None or company_id is None or user_id is None:
-            continue
-        form_map = permissions_map.setdefault(int(form_id), {})
-        user_set = form_map.setdefault(int(company_id), set())
-        user_set.add(int(user_id))
-
-    permissions_json: dict[str, dict[str, list[int]]] = {}
-    for form_id, company_map in permissions_map.items():
-        json_companies: dict[str, list[int]] = {}
-        for company_id, user_ids in company_map.items():
-            json_companies[str(company_id)] = sorted(user_ids)
-        permissions_json[str(form_id)] = json_companies
-
-    form_assignment_summary: dict[int, dict[str, int]] = {}
-    for form in forms:
-        form_id = form.get("id")
-        if form_id is None:
-            continue
-        company_map = permissions_map.get(int(form_id), {})
-        company_count = 0
-        user_count = 0
-        for users in company_map.values():
-            if users:
-                company_count += 1
-                user_count += len(users)
-        form_assignment_summary[int(form_id)] = {
-            "companies": company_count,
-            "users": user_count,
-        }
-
-    extra = {
-        "title": "Forms admin",
-        "forms": forms,
-        "opnform_base_url": _opnform_base_url(),
-        "company_user_options": company_user_options,
-        "form_permissions_map": permissions_json,
-        "form_assignment_summary": form_assignment_summary,
-    }
-    return await _render_template("admin/forms.html", request, current_user, extra=extra)
 
 
 @app.get("/admin/tag-exclusions", response_class=HTMLResponse)
@@ -7996,86 +5475,10 @@ async def _prepare_kb_editor_options() -> tuple[list[dict[str, Any]], list[dict[
     return user_options, company_options
 
 
-@app.post("/myforms/admin")
-async def admin_create_form(
-    request: Request,
-    name: str = Form(...),
-    url: str = Form(...),
-    description: str = Form(""),
-):
-    _, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    cleaned_name = name.strip()
-    if not cleaned_name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Form name cannot be empty")
-    try:
-        normalized_url = normalize_opnform_form_url(url, allowed_host=OPNFORM_ALLOWED_HOST)
-    except OpnformValidationError as exc:
-        log_error("Invalid OpnForm URL supplied", error=str(exc))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    await forms_repo.create_form(
-        name=cleaned_name,
-        url=normalized_url,
-        embed_code=None,
-        description=description.strip() or None,
-    )
-    return RedirectResponse(url="/admin/forms", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.post("/myforms/admin/edit")
-async def admin_edit_form(
-    request: Request,
-    id: str = Form(...),
-    name: str = Form(...),
-    url: str = Form(...),
-    description: str = Form(""),
-):
-    _, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    try:
-        form_id = int(id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid form identifier")
-    existing = await forms_repo.get_form(form_id)
-    if not existing:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Form not found")
-    cleaned_name = name.strip()
-    if not cleaned_name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Form name cannot be empty")
-    try:
-        normalized_url = normalize_opnform_form_url(url, allowed_host=OPNFORM_ALLOWED_HOST)
-    except OpnformValidationError as exc:
-        log_error("Invalid OpnForm URL during update", form_id=form_id, error=str(exc))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    await forms_repo.update_form(
-        form_id,
-        name=cleaned_name,
-        url=normalized_url,
-        embed_code=existing.get("embed_code"),
-        description=description.strip() or None,
-    )
-    return RedirectResponse(url="/admin/forms", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.post("/myforms/admin/delete")
-async def admin_delete_form(
-    request: Request,
-    id: str = Form(...),
-):
-    _, redirect = await _require_super_admin_page(request)
-    if redirect:
-        return redirect
-    try:
-        form_id = int(id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid form identifier")
-    existing = await forms_repo.get_form(form_id)
-    if not existing:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Form not found")
-    await forms_repo.delete_form(form_id)
-    return RedirectResponse(url="/admin/forms", status_code=status.HTTP_303_SEE_OTHER)
 
 
 async def _render_portal_tickets_page(
@@ -8529,9 +5932,6 @@ async def _render_portal_ticket_detail(
         log_error("Failed to load per-reply recipient counts", error=str(exc))
         reply_recipient_counts = {}
 
-    # Fetch call recordings linked to this ticket
-    from app.repositories import call_recordings as call_recordings_repo
-    call_recordings = await call_recordings_repo.list_ticket_call_recordings(ticket_id)
 
     related_user_ids: set[int] = set()
     for key in ("assigned_user_id", "requester_id"):
@@ -8643,56 +6043,6 @@ async def _render_portal_ticket_detail(
             }
         )
     
-    # Add call recordings to timeline
-    for recording in call_recordings:
-        call_date = recording.get("call_date")
-        call_date_iso = (
-            call_date.astimezone(timezone.utc).isoformat()
-            if hasattr(call_date, "astimezone")
-            else ""
-        )
-        
-        minutes_value = recording.get("minutes_spent")
-        minutes_spent = minutes_value if isinstance(minutes_value, int) and minutes_value >= 0 else None
-        billable_flag = bool(recording.get("is_billable"))
-        labour_type_name = str(recording.get("labour_type_name") or "").strip() or None
-        time_summary = tickets_service.format_reply_time_summary(
-            minutes_spent,
-            billable_flag,
-            labour_type_name,
-        )
-        
-        # Format caller/callee information
-        caller_name = None
-        if recording.get("caller_first_name") or recording.get("caller_last_name"):
-            caller_name = f"{recording.get('caller_first_name', '')} {recording.get('caller_last_name', '')}".strip()
-        elif recording.get("caller_number"):
-            caller_name = recording.get("caller_number")
-        
-        callee_name = None
-        if recording.get("callee_first_name") or recording.get("callee_last_name"):
-            callee_name = f"{recording.get('callee_first_name', '')} {recording.get('callee_last_name', '')}".strip()
-        elif recording.get("callee_number"):
-            callee_name = recording.get("callee_number")
-        
-        timeline_entries.append(
-            {
-                "id": recording.get("id"),
-                "type": "call_recording",
-                "created_iso": call_date_iso,
-                "file_name": recording.get("file_name"),
-                "caller_name": caller_name or "Unknown",
-                "callee_name": callee_name or "Unknown",
-                "duration_seconds": recording.get("duration_seconds"),
-                "transcription": recording.get("transcription"),
-                "time_summary": time_summary,
-                "minutes_spent": minutes_spent,
-                "is_billable": billable_flag,
-                "labour_type_name": labour_type_name,
-                "labour_type_code": recording.get("labour_type_code"),
-            }
-        )
-    
     # Sort timeline entries by date
     timeline_entries.sort(key=lambda e: e.get("created_iso", ""), reverse=True)
 
@@ -8797,14 +6147,6 @@ async def _render_portal_ticket_detail(
     except Exception as exc:  # pragma: no cover - defensive logging
         log_error("Failed to load merged child tickets", ticket_id=ticket_id, error=str(exc))
 
-    # Fetch linked chat room for this ticket (if matrix chat is enabled)
-    ticket_chat_room: dict[str, Any] | None = None
-    if settings.matrix_enabled:
-        from app.repositories import chat as chat_repo
-        try:
-            ticket_chat_room = await chat_repo.get_room_by_ticket_id(ticket_id)
-        except Exception as exc:
-            log_error("Failed to load linked chat room for ticket", ticket_id=ticket_id, error=str(exc))
 
     extra = {
         "title": f"Ticket {ticket_id}",
@@ -8849,8 +6191,6 @@ async def _render_portal_ticket_detail(
         "ticket_reply_default_status": reply_default_status,
         "relevant_services": relevant_services,
         "service_status_lookup": service_status_lookup,
-        "matrix_chat_enabled": settings.matrix_enabled,
-        "ticket_chat_room": ticket_chat_room,
         "merged_child_tickets": merged_child_tickets,
         "can_reply": bool(has_helpdesk_access or is_super_admin or is_requester),
         "is_requester": is_requester,
@@ -9216,63 +6556,6 @@ async def _render_ticket_detail(
                 module_info = module
                 break
 
-    tactical_module = next((module for module in modules if module.get("slug") == "tacticalrmm"), None)
-    tactical_base_url = ""
-    if tactical_module:
-        tactical_settings = tactical_module.get("settings") or {}
-        if isinstance(tactical_settings, Mapping):
-            base_rmm_url = str(
-                tactical_settings.get("base_rmm_url")
-                or tactical_settings.get("base_url")
-                or ""
-            ).strip()
-            if base_rmm_url:
-                tactical_base_url = base_rmm_url.rstrip("/")
-
-    hudu_module = next((module for module in modules if module.get("slug") == "hudu"), None)
-    hudu_base_url = ""
-    hudu_company_url = ""
-    if hudu_module and hudu_module.get("enabled"):
-        hudu_settings = hudu_module.get("settings") or {}
-        if isinstance(hudu_settings, Mapping):
-            hudu_base_url = str(hudu_settings.get("base_url") or "").strip().rstrip("/")
-        if hudu_base_url and company and company.get("hudu_id"):
-            from app.services import hudu as hudu_service
-            from app.services.hudu import HuduConfigurationError
-            try:
-                hudu_company_url = await hudu_service.get_company_url(str(company["hudu_id"])) or ""
-            except HuduConfigurationError:
-                # Hudu not configured - fall back to constructing URL from base_url
-                hudu_company_url = f"{hudu_base_url}/companies/{company['hudu_id']}"
-            except Exception as _exc:
-                log_error(
-                    "Failed to resolve Hudu company URL, using fallback",
-                    company_id=ticket_company_id,
-                    hudu_id=company.get("hudu_id"),
-                    error=str(_exc),
-                )
-                hudu_company_url = f"{hudu_base_url}/companies/{company['hudu_id']}"
-
-    # Resolve Solidtime project link / timer URL for the top-right action menu.
-    solidtime_links: dict[str, Any] = {
-        "enabled": False,
-        "project_url": "",
-        "timer_url": "",
-        "project_id": "",
-        "organization_id": "",
-        "last_synced_at": None,
-        "sync_status": "",
-    }
-    try:
-        from app.services import solidtime as _solidtime_service
-
-        solidtime_links = await _solidtime_service.get_ticket_links(int(ticket_id))
-    except Exception as _exc:  # pragma: no cover - defensive logging
-        log_error(
-            "Failed to resolve Solidtime ticket links",
-            ticket_id=ticket_id,
-            error=str(_exc),
-        )
 
     ordered_replies = sorted(
         replies,
@@ -9293,10 +6576,7 @@ async def _render_ticket_detail(
         log_error("Failed to load per-reply recipient counts (admin)", error=str(exc))
         admin_reply_recipient_counts = {}
 
-    # Fetch call recordings linked to this ticket
-    from app.repositories import call_recordings as call_recordings_repo
     from app.repositories import ticket_canned_responses as canned_responses_repo
-    call_recordings = await call_recordings_repo.list_ticket_call_recordings(ticket_id)
 
     attachment_records: list[Mapping[str, Any]] = []
     try:
@@ -9394,48 +6674,6 @@ async def _render_ticket_detail(
             }
         )
     
-    # Process call recordings
-    enriched_recordings: list[dict[str, Any]] = []
-    for recording in call_recordings:
-        minutes_value = recording.get("minutes_spent")
-        minutes_spent = minutes_value if isinstance(minutes_value, int) and minutes_value >= 0 else None
-        billable_flag = bool(recording.get("is_billable"))
-        if minutes_spent is not None:
-            if billable_flag:
-                total_billable_minutes += minutes_spent
-            else:
-                total_non_billable_minutes += minutes_spent
-        labour_type_name = str(recording.get("labour_type_name") or "").strip() or None
-        time_summary = tickets_service.format_reply_time_summary(
-            minutes_spent,
-            billable_flag,
-            labour_type_name,
-        )
-        
-        # Format caller/callee information
-        caller_name = None
-        if recording.get("caller_first_name") or recording.get("caller_last_name"):
-            caller_name = f"{recording.get('caller_first_name', '')} {recording.get('caller_last_name', '')}".strip()
-        elif recording.get("caller_number"):
-            caller_name = recording.get("caller_number")
-        
-        callee_name = None
-        if recording.get("callee_first_name") or recording.get("callee_last_name"):
-            callee_name = f"{recording.get('callee_first_name', '')} {recording.get('callee_last_name', '')}".strip()
-        elif recording.get("callee_number"):
-            callee_name = recording.get("callee_number")
-        
-        enriched_recordings.append(
-            {
-                **recording,
-                "caller_name": caller_name,
-                "callee_name": callee_name,
-                "minutes_spent": minutes_spent,
-                "is_billable": billable_flag,
-                "time_summary": time_summary,
-                "labour_type_name": labour_type_name,
-            }
-        )
 
     enriched_watchers: list[dict[str, Any]] = []
     for watcher in watchers:
@@ -9581,22 +6819,12 @@ async def _render_ticket_detail(
                 "serial_number": (str(asset.get("serial_number") or "").strip() or None),
                 "status": (str(asset.get("status") or "").strip() or None),
                 "tactical_asset_id": (str(asset.get("tactical_asset_id") or "").strip() or None),
-                "tray_device_uid": (str(asset.get("tray_device_uid") or "").strip() or None),
             }
         )
 
     asset_options: list[dict[str, Any]] = []
     if ticket_company_id is not None:
         company_assets = await assets_repo.list_company_assets(ticket_company_id)
-        company_asset_ids: list[int] = []
-        for asset_row in company_assets:
-            try:
-                company_asset_ids.append(int(asset_row.get("id")))
-            except (AttributeError, TypeError, ValueError):
-                continue
-        from app.repositories import tray as tray_repo
-
-        tray_devices_by_asset = await tray_repo.list_active_devices_by_asset_ids(company_asset_ids)
 
         def _format_asset_label(asset_row: Mapping[str, Any]) -> str:
             asset_name = str(asset_row.get("name") or "").strip() or "Asset"
@@ -9617,7 +6845,6 @@ async def _render_ticket_detail(
                 asset_id_int = int(asset_id)
             except (TypeError, ValueError):
                 continue
-            tray_device = tray_devices_by_asset.get(asset_id_int)
             asset_options.append(
                 {
                     "id": asset_id_int,
@@ -9626,10 +6853,6 @@ async def _render_ticket_detail(
                     "serial_number": str(asset_row.get("serial_number") or "").strip() or None,
                     "status": str(asset_row.get("status") or "").strip() or None,
                     "tactical_asset_id": str(asset_row.get("tactical_asset_id") or "").strip() or None,
-                    "tray_device_uid": (
-                        str((tray_device or {}).get("device_uid") or asset_row.get("tray_device_uid") or "").strip()
-                        or None
-                    ),
                 }
             )
 
@@ -9668,14 +6891,6 @@ async def _render_ticket_detail(
     except Exception as exc:  # pragma: no cover - defensive logging
         log_error("Failed to load merged child tickets", ticket_id=ticket_id, error=str(exc))
 
-    # Fetch linked chat room for this ticket (if matrix chat is enabled)
-    ticket_chat_room: dict[str, Any] | None = None
-    if settings.matrix_enabled:
-        from app.repositories import chat as chat_repo
-        try:
-            ticket_chat_room = await chat_repo.get_room_by_ticket_id(ticket_id)
-        except Exception as exc:
-            log_error("Failed to load linked chat room for ticket", ticket_id=ticket_id, error=str(exc))
 
     extra = {
         "title": f"Ticket #{ticket_id}",
@@ -9686,7 +6901,6 @@ async def _render_ticket_detail(
         "ticket_assigned_user": user_lookup.get(ticket.get("assigned_user_id")),
         "ticket_requester": user_lookup.get(ticket.get("requester_id")),
         "ticket_replies": enriched_replies,
-        "ticket_call_recordings": enriched_recordings,
         "ticket_watchers": enriched_watchers,
         "ticket_shipment_watch": shipment_watch,
         "ticket_attachments": formatted_attachments,
@@ -9729,15 +6943,10 @@ async def _render_ticket_detail(
         "ticket_asset_options": asset_options,
         "ticket_asset_selection": asset_selection,
         "ticket_asset_linked_data": serialisable_ticket_assets,
-        "tacticalrmm_base_url": tactical_base_url,
-        "hudu_base_url": hudu_base_url,
-        "hudu_company_url": hudu_company_url,
-        "solidtime_links": solidtime_links,
         "can_delete_ticket": bool(user.get("is_super_admin")),
         "relevant_kb_articles": relevant_articles,
         "relevant_services": relevant_services,
         "service_status_lookup": service_status_lookup,
-        "ticket_chat_room": ticket_chat_room,
         "merged_child_tickets": merged_child_tickets,
         "success_message": success_message,
         "error_message": error_message,
@@ -9770,10 +6979,6 @@ async def _render_modules_dashboard(
     module_webhook_urls = {
         "smtp2go": f"{public_base}/api/webhooks/smtp2go/events",
         "trello": f"{public_base}/api/integration-modules/trello/webhook",
-        "uptimekuma": f"{public_base}/api/integration-modules/uptimekuma/alerts",
-        "huntress": f"{public_base}/api/integration-modules/huntress/callback",
-        "xero": f"{public_base}/api/integration-modules/xero/callback",
-        "xero_webhook": f"{public_base}/api/integration-modules/xero/webhook",
     }
     extra = {
         "title": "Integration modules",
@@ -10030,17 +7235,3 @@ async def readiness_probe() -> JSONResponse:
         status_code=status_code,
         content={"status": "ok" if ok else "not_ready", "checks": checks},
     )
-
-
-# Chat page routes have been migrated to the ``chat`` feature pack
-# at ``app/features/chat/``.  They are loaded on startup via the
-# ``FEATURE_PACKS`` setting and can be hot-reloaded without restarting
-# the application.
-
-
-def _public_shop_product_payload(product: Mapping[str, Any], *, is_vip: bool) -> dict[str, Any]:
-    """Compatibility wrapper for the shop feature-pack public payload helper."""
-
-    from app.features.shop.handlers import _public_shop_product_payload as shop_payload
-
-    return shop_payload(product, is_vip=is_vip)

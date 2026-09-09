@@ -1,1 +1,0 @@
-ALTER TABLE staff ADD COLUMN mobile_phone VARCHAR(20);

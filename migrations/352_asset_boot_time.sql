@@ -1,2 +1,0 @@
-ALTER TABLE assets
-  ADD COLUMN boot_time DATETIME DEFAULT NULL AFTER last_sync;
