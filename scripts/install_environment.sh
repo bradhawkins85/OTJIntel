@@ -225,8 +225,56 @@ ensure_python_venv_available() {
   fi
 }
 
+_bootstrap_pip_in_venv() {
+  # Ensure pip is available inside the venv whose Python interpreter is $1.
+  local venv_py="$1"
+
+  if "$venv_py" -m pip --version >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Try the stdlib ensurepip module first.
+  "$venv_py" -m ensurepip --upgrade 2>/dev/null || true
+
+  if "$venv_py" -m pip --version >/dev/null 2>&1; then
+    "$venv_py" -m pip install --quiet --upgrade pip setuptools wheel
+    return 0
+  fi
+
+  # ensurepip either failed or left no pip wheel (stripped Debian/Ubuntu).
+  # Fall back to get-pip.py.
+  echo "ensurepip did not install pip; falling back to get-pip.py…" >&2
+  local get_pip_url="https://bootstrap.pypa.io/get-pip.py"
+  local get_pip_tmp
+  get_pip_tmp=$(mktemp /tmp/get-pip-XXXXXX.py)
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$get_pip_url" -o "$get_pip_tmp"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$get_pip_url" -O "$get_pip_tmp"
+  else
+    echo "Error: pip could not be bootstrapped and neither curl nor wget is available." >&2
+    echo "Install python3-pip and rerun the installer." >&2
+    rm -f "$get_pip_tmp"
+    exit 1
+  fi
+  "$venv_py" "$get_pip_tmp" --quiet
+  rm -f "$get_pip_tmp"
+
+  "$venv_py" -m pip install --quiet --upgrade pip setuptools wheel
+}
+
 ensure_virtualenv() {
+  local venv_py
+
   if [[ -d "$VENV_DIR" ]]; then
+    venv_py=$(venv_python)
+    # Re-bootstrap pip if the venv exists but pip is missing (e.g. the venv
+    # was created with --without-pip on a previous run that failed mid-way).
+    if [[ -n "$venv_py" ]] && ! "$venv_py" -m pip --version >/dev/null 2>&1; then
+      echo "Existing venv is missing pip; re-bootstrapping…" >&2
+      _bootstrap_pip_in_venv "$venv_py"
+      echo "pip bootstrapped in ${VENV_DIR}." >&2
+    fi
     return
   fi
 
@@ -237,38 +285,13 @@ ensure_virtualenv() {
   "$SYSTEM_PYTHON" -m venv --without-pip "$VENV_DIR"
   echo "Created virtual environment at ${VENV_DIR}." >&2
 
-  local venv_py
   venv_py=$(venv_python)
   if [[ -z "$venv_py" ]]; then
     echo "Error: Unable to locate virtualenv python interpreter after creation." >&2
     exit 1
   fi
 
-  # Bootstrap pip inside the venv using the stdlib ensurepip module.
-  "$venv_py" -m ensurepip --upgrade
-
-  # Verify pip is now importable; on stripped Debian/Ubuntu images ensurepip
-  # may succeed but leave no pip wheel. Fall back to the system pip installer.
-  if ! "$venv_py" -m pip --version >/dev/null 2>&1; then
-    echo "ensurepip did not install pip; falling back to get-pip.py…" >&2
-    local get_pip_url="https://bootstrap.pypa.io/get-pip.py"
-    local get_pip_tmp
-    get_pip_tmp=$(mktemp /tmp/get-pip-XXXXXX.py)
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$get_pip_url" -o "$get_pip_tmp"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -q "$get_pip_url" -O "$get_pip_tmp"
-    else
-      echo "Error: pip could not be bootstrapped and neither curl nor wget is available." >&2
-      echo "Install python3-pip and rerun the installer." >&2
-      rm -f "$get_pip_tmp"
-      exit 1
-    fi
-    "$venv_py" "$get_pip_tmp" --quiet
-    rm -f "$get_pip_tmp"
-  fi
-
-  "$venv_py" -m pip install --quiet --upgrade pip setuptools wheel
+  _bootstrap_pip_in_venv "$venv_py"
   echo "pip bootstrapped in ${VENV_DIR}." >&2
 }
 
