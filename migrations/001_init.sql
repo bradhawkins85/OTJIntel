@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   email VARCHAR(255) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
-  company_id INT NOT NULL,
+  company_id INT NULL,
   FOREIGN KEY (company_id) REFERENCES companies(id)
 )
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -389,6 +389,7 @@ ALTER TABLE apps
 CREATE TABLE IF NOT EXISTS user_sessions (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
+  active_company_id INT NULL,
   session_token CHAR(64) NOT NULL UNIQUE,
   csrf_token CHAR(64) NOT NULL,
   created_at DATETIME NOT NULL,
@@ -398,7 +399,13 @@ CREATE TABLE IF NOT EXISTS user_sessions (
   user_agent VARCHAR(255) NULL,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   pending_totp_secret TEXT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  impersonator_user_id INT NULL,
+  impersonator_session_id INT NULL,
+  impersonation_started_at DATETIME NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (active_company_id) REFERENCES companies(id) ON DELETE SET NULL,
+  FOREIGN KEY (impersonator_user_id) REFERENCES users(id) ON DELETE SET NULL,
+  FOREIGN KEY (impersonator_session_id) REFERENCES user_sessions(id) ON DELETE SET NULL
 )
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

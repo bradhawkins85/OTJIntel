@@ -1,0 +1,7 @@
+{
+  "guid": "a2bb95ee-132a-4aeb-af2a-74e7a873ef86",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Fixed initial super-administrator registration before any company is configured and aligned the session schema with session creation.",
+  "content_hash": "e738e37c0e67acff1226089474ce09a0c393fa6b9d242bcb150b7d1b5c5b6b68"
+}
