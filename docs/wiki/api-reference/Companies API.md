@@ -32,7 +32,6 @@ The response is an array of asset records ordered alphabetically by name. Each r
     "performance_score": 87.0,
     "warranty_status": "In warranty",
     "warranty_end_date": "2026-06-01",
-    "syncro_asset_id": "98765",
     "tactical_asset_id": "dd0c1e28-ffab-4f29-97c8-0f63a5d151f0"
   }
 ]

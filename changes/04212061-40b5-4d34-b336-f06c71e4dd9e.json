@@ -1,0 +1,7 @@
+{
+  "guid": "04212061-40b5-4d34-b336-f06c71e4dd9e",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Remove the retired Syncro asset identifier from asset queries, imports, search, and API responses",
+  "content_hash": "b5aeeea1006915014b1d17539b0e03a025539a57e949b7a4cb6e062e4c7ecfc1"
+}

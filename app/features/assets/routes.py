@@ -198,7 +198,6 @@ async def assets_page(request: Request):
             "form_factor": _clean_text(row.get("form_factor")),
             "last_user": _clean_text(row.get("last_user")),
             "warranty_status": _clean_text(row.get("warranty_status")),
-            "syncro_asset_id": _clean_text(row.get("syncro_asset_id")),
             "tactical_asset_id": _clean_text(row.get("tactical_asset_id")),
         }
 

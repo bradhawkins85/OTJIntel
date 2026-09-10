@@ -61,9 +61,6 @@ async def import_assets_for_company(
         approx_age = details.get("cpu_age")
         performance_score = details.get("performance_score")
 
-        syncro_asset_id = asset.get("id") or details.get("id")
-        syncro_asset_id = str(syncro_asset_id) if syncro_asset_id is not None else None
-
         await assets_repo.upsert_asset(
             company_id=company_id,
             name=name,
@@ -83,7 +80,7 @@ async def import_assets_for_company(
             performance_score=performance_score,
             warranty_status=warranty_status,
             warranty_end_date=warranty_end,
-            syncro_asset_id=syncro_asset_id,
+            match_name=True,
         )
         processed += 1
 

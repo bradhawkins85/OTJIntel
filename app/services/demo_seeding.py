@@ -518,7 +518,6 @@ async def seed_demo_data(seeded_by_user_id: int | None = None) -> dict[str, Any]
                 performance_score=None,
                 warranty_status=spec.get("warranty_status"),
                 warranty_end_date=spec.get("warranty_end_date"),
-                syncro_asset_id=None,
                 tactical_asset_id=None,
             )
             created_assets += 1
