@@ -1,0 +1,7 @@
+{
+  "guid": "860bc84d-9c4d-42d7-8c8a-3d849f8bb270",
+  "occurred_at": "2026-09-10T01:10Z",
+  "change_type": "Fix",
+  "summary": "Removed the unused legacy external integration table from startup migrations and company deletion.",
+  "content_hash": "1773116bc5d27b8ec4368f97c96e60824603c5b5714da4e987e5fd633be49c0e"
+}

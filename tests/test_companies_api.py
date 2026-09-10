@@ -334,7 +334,6 @@ async def test_delete_company_clears_child_records(monkeypatch):
         "DELETE FROM staff",
         "DELETE FROM licenses",
         "DELETE FROM invoices",
-        "DELETE FROM external_api_settings",
         "DELETE FROM company_app_prices",
         "DELETE FROM office_groups",
         "DELETE FROM user_companies",
