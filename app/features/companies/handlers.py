@@ -119,7 +119,6 @@ async def _render_companies_dashboard(
     include_archived: bool = False,
     status_code: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
-    from app.repositories import company_recurring_invoice_items as recurring_items_repo
     from app.repositories import m365 as m365_repo
     from app.repositories import roles as role_repo
     from app.repositories import scheduled_tasks as scheduled_tasks_repo
@@ -145,20 +144,16 @@ async def _render_companies_dashboard(
 
     if company_ids_with_rows:
         company_ids = [company_id for company_id, _ in company_ids_with_rows]
-        credentials_rows, automation_counts, recurring_item_counts = await asyncio.gather(
+        credentials_rows, automation_counts = await asyncio.gather(
             asyncio.gather(
                 *(m365_repo.get_credentials(company_id) for company_id in company_ids)
             ),
             scheduled_tasks_repo.count_tasks_by_company_ids(company_ids),
-            recurring_items_repo.count_items_by_company_ids(company_ids),
         )
         for (_, company), credentials in zip(company_ids_with_rows, credentials_rows):
             company["m365_tenant_id"] = (credentials or {}).get("tenant_id", "").strip()
         for company_id, company in company_ids_with_rows:
             company["automation_count"] = automation_counts.get(company_id, 0)
-            company["recurring_invoice_item_count"] = recurring_item_counts.get(
-                company_id, 0
-            )
 
     # Fetch M365 consent status for companies that have credentials configured.
     m365_company_ids = [
@@ -268,7 +263,6 @@ async def _render_company_edit_page(
     from app.repositories import company_variables as company_variables_repo
     from app.repositories import companies as company_repo
     from app.repositories import pending_staff_access as pending_staff_access_repo
-    from app.repositories import company_recurring_invoice_items as recurring_items_repo
     from app.repositories import roles as role_repo
     from app.repositories import scheduled_tasks as scheduled_tasks_repo
     from app.repositories import staff as staff_repo
@@ -778,21 +772,6 @@ async def _render_company_edit_page(
 
         company_automation_tasks.sort(key=lambda item: (item.get("name") or "").lower())
 
-    # Fetch recurring invoice items for the company
-    recurring_invoice_items = []
-    if is_super_admin:
-        try:
-            items = await recurring_items_repo.list_company_recurring_invoice_items(
-                company_id
-            )
-        except RuntimeError as exc:  # pragma: no cover - defensive guard for tests
-            if "Database pool not initialised" in str(exc):
-                items = []
-            else:
-                raise
-        for item in items:
-            recurring_invoice_items.append(_main()._serialise_mapping(item))
-
     # Fetch billing contacts for the company
     billing_contacts = []
     company_staff = []
@@ -882,7 +861,6 @@ async def _render_company_edit_page(
         "company_automation_tasks": company_automation_tasks,
         "automation_command_options": automation_command_options,
         "automation_company_options": automation_company_options,
-        "recurring_invoice_items": recurring_invoice_items,
         "billing_contacts": billing_contacts,
         "company_staff": company_staff,
         "show_inactive_tasks": show_inactive_tasks,

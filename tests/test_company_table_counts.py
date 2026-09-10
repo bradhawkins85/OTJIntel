@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
-from app.repositories import company_recurring_invoice_items, scheduled_tasks
+from app.repositories import scheduled_tasks
 
 
 @pytest.fixture
@@ -30,31 +31,25 @@ async def test_scheduled_task_counts_are_grouped_by_company(monkeypatch):
     assert params == (2, 7)
 
 
-@pytest.mark.anyio
-async def test_recurring_item_counts_are_grouped_by_company(monkeypatch):
-    fetch_all = AsyncMock(
-        return_value=[{"company_id": 2, "item_count": 4}]
-    )
-    monkeypatch.setattr(company_recurring_invoice_items.db, "fetch_all", fetch_all)
-
-    result = await company_recurring_invoice_items.count_items_by_company_ids([9, 2])
-
-    assert result == {2: 4}
-    query, params = fetch_all.await_args.args
-    assert "company_recurring_invoice_items" in query
-    assert "GROUP BY company_id" in query
-    assert params == (2, 9)
-
-
-def test_company_table_exposes_optional_counts_and_edit_links():
+def test_company_table_exposes_automation_counts_and_edit_links():
     template = open("app/templates/admin/companies.html", encoding="utf-8").read()
 
     assert '"key": "automations"' in template
-    assert '"key": "recurring_invoice_items"' in template
-    assert template.count('"default_visible": false') >= 2
+    assert "recurring_invoice_items" not in template
+    assert '"default_visible": false' in template
     assert 'data-column-key="automations"' in template
-    assert 'data-column-key="recurring_invoice_items"' in template
     assert (
         '<a href="/admin/companies/{{ company.id }}/edit">{{ company.name }}</a>'
         in template
     )
+
+
+def test_company_admin_has_no_recurring_invoice_item_dependencies():
+    handler = Path("app/features/companies/handlers.py").read_text(encoding="utf-8")
+    edit_template = Path("app/templates/admin/company_edit.html").read_text(encoding="utf-8")
+    admin_script = Path("app/static/js/admin.js").read_text(encoding="utf-8")
+
+    assert "company_recurring_invoice_items" not in handler
+    assert "recurring_invoice_items" not in handler
+    assert "recurring-invoice-items" not in edit_template
+    assert "recurring-item" not in admin_script
