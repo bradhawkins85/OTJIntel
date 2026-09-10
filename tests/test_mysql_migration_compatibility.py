@@ -102,6 +102,22 @@ async def test_asset_detail_migration_skips_columns_already_present() -> None:
     ]
 
 
+@pytest.mark.anyio
+async def test_mysql_conditional_add_supports_mixed_modify_clause() -> None:
+    cursor = _Cursor(set())
+    statement = """ALTER TABLE staff
+        MODIFY date_onboarded DATETIME NULL,
+        ADD COLUMN IF NOT EXISTS date_offboarded DATETIME NULL"""
+
+    await Database()._execute_mysql_migration_statement(cursor, statement)
+
+    assert cursor.executed == [
+        ("ALTER TABLE staff MODIFY date_onboarded DATETIME NULL", None),
+        ("SHOW COLUMNS FROM staff WHERE Field = %s", ("date_offboarded",)),
+        ("ALTER TABLE staff ADD COLUMN date_offboarded DATETIME NULL", None),
+    ]
+
+
 def test_consolidated_migration_has_no_unconditional_add_column() -> None:
     migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
 
