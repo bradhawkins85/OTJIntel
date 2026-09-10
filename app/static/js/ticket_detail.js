@@ -25,20 +25,7 @@
         phones.forEach((item) => {
           const line = document.createElement('p');
           line.className = 'form-help';
-          const dialButton = document.createElement('button');
-          dialButton.type = 'button';
-          dialButton.className = 'click-to-call';
-          dialButton.textContent = item.phone;
-          dialButton.title = `Call ${item.phone}`;
-          dialButton.addEventListener('click', () => {
-            const clickToCall = window.__portalClickToCall;
-            if (clickToCall && clickToCall.isEnabled()) {
-              clickToCall.call(item.phone);
-              return;
-            }
-            status.textContent = 'Enable click to call in your profile to dial this number.';
-          });
-          line.append(`${item.name}: `, dialButton);
+          line.append(`${item.name}: ${item.phone}`);
 
           const staffId = root.dataset.requesterStaffId;
           const ticketId = root.dataset.ticketId;
