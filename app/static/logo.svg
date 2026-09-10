@@ -1,15 +1,33 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-labelledby="title desc">
-  <title id="title">MyPortal Logo</title>
-  <desc id="desc">Stylised portal glyph</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-labelledby="otj-logo-title otj-logo-desc">
+  <title id="otj-logo-title">OTJIntel logo</title>
+  <desc id="otj-logo-desc">An O-shaped signal ring surrounding a combined T and J monogram</desc>
   <defs>
-    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#38bdf8" />
-      <stop offset="100%" stop-color="#6366f1" />
+    <linearGradient id="otj-bg" x1="12" y1="8" x2="108" y2="112" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172554" />
+      <stop offset="1" stop-color="#07111f" />
     </linearGradient>
+    <linearGradient id="otj-signal" x1="25" y1="23" x2="96" y2="98" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22d3ee" />
+      <stop offset="0.52" stop-color="#38bdf8" />
+      <stop offset="1" stop-color="#818cf8" />
+    </linearGradient>
+    <filter id="otj-glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="2.5" />
+    </filter>
   </defs>
-  <rect width="120" height="120" rx="28" fill="#0f172a" />
-  <circle cx="60" cy="60" r="42" fill="url(#grad)" opacity="0.9" />
-  <circle cx="60" cy="60" r="24" fill="#0f172a" opacity="0.95" />
-  <path d="M60 28a32 32 0 0132 32v4a32 32 0 01-32 32 32 32 0 01-32-32v-4a32 32 0 0132-32z" fill="none" stroke="#f8fafc" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" opacity="0.85" />
-  <circle cx="60" cy="60" r="10" fill="#f8fafc" opacity="0.85" />
+
+  <rect x="3" y="3" width="114" height="114" rx="27" fill="url(#otj-bg)" />
+  <rect x="3.75" y="3.75" width="112.5" height="112.5" rx="26.25" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="1.5" />
+
+  <!-- A restrained halo keeps the mark legible without losing its crisp silhouette. -->
+  <circle cx="60" cy="60" r="36" fill="none" stroke="#22d3ee" stroke-opacity="0.18" stroke-width="7" filter="url(#otj-glow)" />
+
+  <!-- The open signal ring forms the O and suggests connected intelligence. -->
+  <path d="M89.1 38.8A36 36 0 1 0 94.7 69.5" fill="none" stroke="url(#otj-signal)" stroke-width="7" stroke-linecap="round" />
+  <circle cx="89.1" cy="38.8" r="4.4" fill="#67e8f9" />
+  <circle cx="94.7" cy="69.5" r="4.4" fill="#818cf8" />
+
+  <!-- One continuous monogram resolves into both the T and the hooked J. -->
+  <path d="M43 43H77M60 43V70C60 79 55.5 84 47 84C42.7 84 39.2 82.6 36.5 79.8" fill="none" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="60" cy="60" r="3" fill="#22d3ee" />
 </svg>
