@@ -160,6 +160,33 @@ class Database:
         and named indexes before issuing each operation so partially applied
         migrations are safe on both servers.
         """
+        create_index_match = re.match(
+            r"^\s*CREATE\s+(?:(UNIQUE)\s+)?INDEX\s+"
+            r"(?:IF\s+NOT\s+EXISTS\s+)?"
+            r"(`?[A-Za-z0-9_]+`?)\s+ON\s+"
+            r"(`?[A-Za-z0-9_]+`?)\s*(\(.+)$",
+            statement,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if create_index_match:
+            unique, index, table, definition = create_index_match.groups()
+            await cursor.execute(
+                "SHOW INDEX FROM " + table + " WHERE Key_name = %s",
+                (index.strip("`"),),
+            )
+            if await cursor.fetchone() is None:
+                await cursor.execute(
+                    "CREATE "
+                    + ("UNIQUE " if unique else "")
+                    + "INDEX "
+                    + index
+                    + " ON "
+                    + table
+                    + " "
+                    + definition
+                )
+            return
+
         match = re.match(
             r"^\s*ALTER\s+TABLE\s+(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             statement,
