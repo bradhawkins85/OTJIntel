@@ -122,7 +122,6 @@ def _base_monkeypatches(monkeypatch, company_record=None):
     monkeypatch.setattr(main.staff_repo, "list_staff_with_users", AsyncMock(return_value=[]))
     monkeypatch.setattr(main.scheduled_tasks_repo, "list_tasks", AsyncMock(return_value=[]))
     monkeypatch.setattr(main.recurring_items_repo, "list_company_recurring_invoice_items", AsyncMock(return_value=[]))
-    monkeypatch.setattr(main.billing_contacts_repo, "list_billing_contacts_for_company", AsyncMock(return_value=[]))
     monkeypatch.setattr(main.staff_repo, "list_staff", AsyncMock(return_value=[]))
 
 

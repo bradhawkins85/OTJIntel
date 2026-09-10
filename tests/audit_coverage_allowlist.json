@@ -72,8 +72,6 @@
   "POST /admin/companies/users/create",
   "POST /admin/companies/users/invite",
   "POST /admin/companies/{company_id}",
-  "POST /admin/companies/{company_id}/billing-contacts/add",
-  "POST /admin/companies/{company_id}/billing-contacts/{staff_id}/remove",
   "POST /admin/companies/{company_id}/m365-credentials",
   "POST /admin/companies/{company_id}/m365-credentials/delete",
   "POST /admin/companies/{company_id}/staff-custom-fields",
