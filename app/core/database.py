@@ -153,11 +153,12 @@ class Database:
     async def _execute_mysql_migration_statement(self, cursor: Any, statement: str) -> None:
         """Execute SQL, emulating MariaDB's conditional column syntax on MySQL.
 
-        MySQL does not accept ``ADD COLUMN IF NOT EXISTS`` even though MariaDB
-        does. Migrations use that syntax to remain safe when upgrading an
+        MySQL does not accept conditional ``ADD COLUMN`` or ``DROP COLUMN``
+        syntax on all supported versions even though MariaDB does. Migrations
+        use that syntax to remain safe when upgrading an
         installation whose schema predates migration tracking. Inspect columns
-        and named indexes before issuing each ADD so partially applied migrations
-        are safe on both servers.
+        and named indexes before issuing each operation so partially applied
+        migrations are safe on both servers.
         """
         match = re.match(
             r"^\s*ALTER\s+TABLE\s+(`?[A-Za-z0-9_]+`?)\s+(.+)$",
@@ -174,6 +175,11 @@ class Database:
             r"^\s*ADD\s+(?:COLUMN\s+)?IF\s+NOT\s+EXISTS\s+"
             r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             flags=re.IGNORECASE | re.DOTALL,
+        )
+        conditional_drop_column = re.compile(
+            r"^\s*DROP\s+(?:COLUMN\s+)?IF\s+EXISTS\s+"
+            r"(`?[A-Za-z0-9_]+`?)\s*$",
+            flags=re.IGNORECASE,
         )
         named_index = re.compile(
             r"^\s*ADD\s+(?:(UNIQUE)\s+)?(INDEX|KEY)\s+"
@@ -193,12 +199,16 @@ class Database:
         )
         for clause in clauses:
             column_match = conditional_column.match(clause)
+            drop_column_match = conditional_drop_column.match(clause)
             index_match = named_index.match(clause)
             drop_foreign_key_match = drop_foreign_key.match(clause)
             constraint_match = add_named_constraint.match(clause)
             if column_match:
                 kind = "column"
                 clause_match = column_match
+            elif drop_column_match:
+                kind = "drop_column"
+                clause_match = drop_column_match
             elif index_match:
                 kind = "index"
                 clause_match = index_match
@@ -215,16 +225,21 @@ class Database:
                 await cursor.execute("ALTER TABLE " + table + " " + clause)
                 continue
 
-            if kind == "column":
+            if kind in {"column", "drop_column"}:
                 column = clause_match.group(1)
                 await cursor.execute(
                     "SHOW COLUMNS FROM " + table + " WHERE Field = %s",
                     (column.strip("`"),),
                 )
-                if await cursor.fetchone() is None:
+                column_exists = await cursor.fetchone() is not None
+                if kind == "column" and not column_exists:
                     definition = clause_match.group(2)
                     await cursor.execute(
                         "ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition
+                    )
+                elif kind == "drop_column" and column_exists:
+                    await cursor.execute(
+                        "ALTER TABLE " + table + " DROP COLUMN " + column
                     )
             elif kind == "index":
                 unique, keyword, index, definition = clause_match.groups()

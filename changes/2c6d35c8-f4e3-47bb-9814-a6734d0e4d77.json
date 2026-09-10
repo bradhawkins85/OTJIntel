@@ -1,0 +1,7 @@
+{
+  "guid": "2c6d35c8-f4e3-47bb-9814-a6734d0e4d77",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Fixed MySQL startup migrations so obsolete app pricing columns, including default_price, are removed safely on database versions that do not support DROP COLUMN IF EXISTS.",
+  "content_hash": "3d6a1d77f6ad53d75243cc7b5c6831735c6fcd0f0e5b14347f3e6617507b2cad"
+}

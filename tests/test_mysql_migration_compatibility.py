@@ -81,6 +81,22 @@ async def test_mysql_conditional_add_preserves_commas_inside_column_type() -> No
 
 
 @pytest.mark.anyio
+async def test_mysql_conditional_drop_removes_only_existing_columns() -> None:
+    cursor = _Cursor({"default_price"})
+    statement = """ALTER TABLE apps
+        DROP COLUMN IF EXISTS default_price,
+        DROP COLUMN IF EXISTS contract_term"""
+
+    await Database()._execute_mysql_migration_statement(cursor, statement)
+
+    assert cursor.executed == [
+        ("SHOW COLUMNS FROM apps WHERE Field = %s", ("default_price",)),
+        ("ALTER TABLE apps DROP COLUMN default_price", None),
+        ("SHOW COLUMNS FROM apps WHERE Field = %s", ("contract_term",)),
+    ]
+
+
+@pytest.mark.anyio
 async def test_mysql_conditional_add_supports_indexes_mixed_with_columns() -> None:
     cursor = _Cursor({"m365_message_id"})
     statement = """ALTER TABLE ticket_replies
