@@ -179,18 +179,22 @@ class Database:
             r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             flags=re.IGNORECASE | re.DOTALL,
         )
-        parsed = [
-            ("column", conditional_column.match(clause))
-            if conditional_column.match(clause)
-            else ("index", conditional_index.match(clause))
-            for clause in clauses
-        ]
-        if not all(clause_match for _, clause_match in parsed):
-            await cursor.execute(statement)
-            return
+        for clause in clauses:
+            column_match = conditional_column.match(clause)
+            index_match = conditional_index.match(clause)
+            if column_match:
+                kind = "column"
+                clause_match = column_match
+            elif index_match:
+                kind = "index"
+                clause_match = index_match
+            else:
+                # A statement may mix an ordinary operation (such as MODIFY)
+                # with a conditional ADD. Execute it separately so the MySQL-
+                # incompatible conditional clause is never sent unchanged.
+                await cursor.execute("ALTER TABLE " + table + " " + clause)
+                continue
 
-        for kind, clause_match in parsed:
-            assert clause_match is not None
             if kind == "column":
                 column = clause_match.group(1)
                 await cursor.execute(
