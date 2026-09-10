@@ -110,17 +110,17 @@ def company_admin_context(monkeypatch):
     yield
 
 
-def test_company_admin_sees_authorised_menu_items(company_admin_context):
+def test_company_admin_menu_omits_links_without_pages(company_admin_context):
     with TestClient(app) as client:
         response = client.get("/")
 
     assert response.status_code == 200
     html = response.text
     assert 'href="/tickets"' in html
-    assert 'href="/shop"' in html
+    assert 'href="/shop"' not in html
     assert 'href="/cart"' not in html
-    assert 'href="/myforms"' in html
-    assert 'href="/invoices"' in html
+    assert 'href="/myforms"' not in html
+    assert 'href="/invoices"' not in html
     assert 'href="/staff"' in html
     assert 'href="/orders"' not in html
     assert 'href="/licenses"' not in html
@@ -128,6 +128,26 @@ def test_company_admin_sees_authorised_menu_items(company_admin_context):
     assert 'action="/auth/logout"' in html
     assert 'name="_csrf" value="csrf-token"' in html
     assert "Log out" in html
+
+
+def test_sidebar_template_does_not_link_to_removed_pages():
+    template = Path("app/templates/base.html").read_text()
+
+    removed_paths = {
+        "/admin/marketing",
+        "/shop",
+        "/quotes",
+        "/orders",
+        "/myforms",
+        "/devices",
+        "/defender",
+        "/subscriptions",
+        "/invoices",
+        "/dmarc",
+    }
+
+    for path in removed_paths:
+        assert f'href="{path}"' not in template
 
 
 def test_m365_menu_item_has_data_menu_key(monkeypatch):
@@ -719,11 +739,11 @@ def test_staff_link_hidden_without_an_active_company_membership():
     assert 'href="/staff"' not in html
 
 
-def test_network_devices_link_uses_its_own_permission():
+def test_network_devices_permission_does_not_restore_removed_link():
     template = Path("app/templates/base.html").read_text(encoding="utf-8")
 
-    assert "menu_access.get('menu.network_devices') in ['read', 'write']" in template
-    assert "{% if can_access_network_devices %}" in template
+    assert 'href="/devices"' not in template
+    assert "{% if can_access_network_devices %}" not in template
 
 
 def test_tickets_menu_permission_uses_no_access_own_all_levels():
