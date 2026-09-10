@@ -55,6 +55,7 @@ from starlette.datastructures import FormData, URL
 from http import HTTPStatus
 
 from app.api.routes import (
+    ai_tag_synonyms,
     api_keys,
     asset_custom_fields,
     audit_logs,
@@ -896,6 +897,7 @@ async def authenticated_swagger_ui(request: Request) -> Response:
     )
 
 app.include_router(auth.router)
+app.include_router(ai_tag_synonyms.router)
 app.include_router(dashboard_api.router)
 app.include_router(users.router)
 app.include_router(companies.router)
