@@ -10,6 +10,10 @@ from app.services import scheduler as scheduler_module
 from app.services.scheduler import SchedulerService
 
 
+async def _noop_monitoring_jobs() -> None:
+    pass
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -36,7 +40,7 @@ async def test_start_runs_refresh_in_background(monkeypatch):
         shutdown=fake_shutdown,
         timezone=timezone.utc,
     )
-    monkeypatch.setattr(service, "_ensure_monitoring_jobs", lambda: None)
+    monkeypatch.setattr(service, "_ensure_monitoring_jobs", _noop_monitoring_jobs)
 
     refresh_started = asyncio.Event()
     refresh_continue = asyncio.Event()
@@ -80,7 +84,7 @@ async def test_stop_waits_for_refresh_completion(monkeypatch):
         shutdown=fake_shutdown,
         timezone=timezone.utc,
     )
-    monkeypatch.setattr(service, "_ensure_monitoring_jobs", lambda: None)
+    monkeypatch.setattr(service, "_ensure_monitoring_jobs", _noop_monitoring_jobs)
 
     refresh_started = asyncio.Event()
     refresh_continue = asyncio.Event()
@@ -117,7 +121,7 @@ async def test_refresh_failure_logged(monkeypatch):
         shutdown=lambda *_, **__: None,
         timezone=timezone.utc,
     )
-    monkeypatch.setattr(service, "_ensure_monitoring_jobs", lambda: None)
+    monkeypatch.setattr(service, "_ensure_monitoring_jobs", _noop_monitoring_jobs)
 
     async def failing_refresh(self) -> None:  # type: ignore[override]
         raise RuntimeError("boom")
@@ -155,6 +159,14 @@ def test_build_trigger_normalises_last_day_of_month_alias():
 def test_normalise_cron_day_field_handles_list_case_and_whitespace():
     assert scheduler_module._normalise_cron_day_field("L") == "last"
     assert scheduler_module._normalise_cron_day_field("1, 15, l, L") == "1,15,last,last"
+
+
+def test_scheduler_has_no_removed_solidtime_callbacks():
+    """Startup must not retain callbacks for the removed Solidtime service."""
+    service = SchedulerService()
+
+    assert not hasattr(service, "_run_solidtime_reconcile")
+    assert "solidtime" not in scheduler_module.COMMANDS_BY_MODULE
 
 
 def test_build_trigger_rejects_wrong_cron_field_count():
