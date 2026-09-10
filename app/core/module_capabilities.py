@@ -56,7 +56,6 @@ MODULE_CAPABILITIES: dict[str, ModuleCapabilities] = {
     "hudu": _c(services=("hudu.api",), ui=("hudu",)),
     "huntress": _c(commands=("sync_huntress",), services=("huntress.api",), ui=("huntress",)),
     "trello": _c(pack="trello", routes=("webhooks.trello",), services=("trello.api",), ui=("trello",)),
-    "solidtime": _c(commands=("solidtime_reconcile",), services=("solidtime.api",), ui=("solidtime",)),
     "matrix-chat-assign": _c(commands=("matrix_chat_assign",), services=("matrix.assignment",), ui=("matrix.chat_assign",)),
     "voice-monitor": _c(commands=("voice_monitor_dispatch",), services=("voice_monitor.provider",), ui=("voice_monitor",)),
 }
