@@ -21,7 +21,6 @@ Mirrors the routes that used to live in ``app/main.py``:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import re
 from collections.abc import Sequence
@@ -52,7 +51,6 @@ from app.repositories import email_blocklist as email_blocklist_repo
 from app.repositories import attachment_blocklist as attachment_blocklist_repo
 from app.repositories import users as user_repo
 from app.repositories import site_settings as site_settings_repo
-from app.services import agent as agent_service
 from app.services import labour_types as labour_types_service
 from app.services import ticket_attachments as attachments_service
 from app.services import rag_retrieval
@@ -610,7 +608,6 @@ async def admin_rescan_ticket_related(ticket_id: int, request: Request):
     replies = await tickets_repo.list_replies(ticket_id, include_internal=True)
     attachments = await attachments_repo.list_attachments(ticket_id)
     query = _build_related_ticket_query(ticket, replies, attachments)
-    search_terms = _related_search_terms(_ticket_related_text_parts(ticket, replies, attachments))
     if not query:
         return JSONResponse({
             "items": [],
@@ -620,20 +617,12 @@ async def admin_rescan_ticket_related(ticket_id: int, request: Request):
         })
     active_company_id = getattr(request.state, "active_company_id", None)
     available_companies = getattr(request.state, "available_companies", None)
-    result, rag_candidates = await asyncio.gather(
-        agent_service.execute_agent_query(
-            query,
-            current_user,
-            active_company_id=active_company_id,
-            memberships=available_companies,
-        ),
-        _retrieve_related_rag_candidates(
-            query,
-            current_user,
-            active_company_id=active_company_id,
-            memberships=available_companies,
-            ticket_id=ticket_id,
-        ),
+    rag_candidates = await _retrieve_related_rag_candidates(
+        query,
+        current_user,
+        active_company_id=active_company_id,
+        memberships=available_companies,
+        ticket_id=ticket_id,
     )
 
     items: list[dict[str, str]] = []
@@ -661,17 +650,11 @@ async def admin_rescan_ticket_related(ticket_id: int, request: Request):
         if len(items) >= 12:
             break
 
-    if not items:
-        items = _related_items_from_agent_sources(
-            dict(result.get("sources") or {}),
-            ticket_id,
-            search_terms=search_terms,
-        )
     return JSONResponse({
         "items": items,
         "scanned": True,
         "skipped": False,
-        "generated_at": result.get("generated_at"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     })
 
 @router.post("/admin/tickets/next-number", response_class=HTMLResponse)

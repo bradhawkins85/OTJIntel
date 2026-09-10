@@ -289,7 +289,13 @@ class FeatureRegistry:
             return pack.routers[0]
         parent = APIRouter()
         for child in pack.routers:
-            parent.include_router(child)
+            # FastAPI versions with lazy ``include_router`` support may append
+            # an ``original_router`` proxy instead of materialising each child
+            # route.  A feature pack with multiple routers would consequently
+            # mount only those inert proxies and every URL would return 404.
+            # Flatten the already-constructed child route lists here; the app's
+            # final include still performs FastAPI's normal route copying.
+            parent.routes.extend(child.routes)
         return parent
 
     @staticmethod
