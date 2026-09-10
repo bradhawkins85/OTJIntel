@@ -1,11 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="otj-icon-title">
+  <title id="otj-icon-title">OTJIntel</title>
   <defs>
-    <linearGradient id="fg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#38bdf8" />
-      <stop offset="100%" stop-color="#6366f1" />
+    <linearGradient id="icon-bg" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172554" />
+      <stop offset="1" stop-color="#07111f" />
+    </linearGradient>
+    <linearGradient id="icon-signal" x1="13" y1="12" x2="52" y2="53" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22d3ee" />
+      <stop offset="0.52" stop-color="#38bdf8" />
+      <stop offset="1" stop-color="#818cf8" />
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="16" fill="#0f172a" />
-  <circle cx="32" cy="32" r="22" fill="url(#fg)" />
-  <circle cx="32" cy="32" r="12" fill="#0f172a" />
+
+  <rect x="1" y="1" width="62" height="62" rx="15" fill="url(#icon-bg)" />
+  <rect x="1.5" y="1.5" width="61" height="61" rx="14.5" fill="none" stroke="#ffffff" stroke-opacity="0.14" />
+  <path d="M47.5 20.7A19.5 19.5 0 1 0 50.8 37.2" fill="none" stroke="url(#icon-signal)" stroke-width="4" stroke-linecap="round" />
+  <circle cx="47.5" cy="20.7" r="2.5" fill="#67e8f9" />
+  <circle cx="50.8" cy="37.2" r="2.5" fill="#818cf8" />
+  <path d="M23 23H41M32 23V37.5C32 42.3 29.7 45 25.2 45C22.9 45 21 44.2 19.6 42.7" fill="none" stroke="#f8fafc" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="32" cy="32" r="1.7" fill="#22d3ee" />
 </svg>
