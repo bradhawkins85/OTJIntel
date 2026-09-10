@@ -214,6 +214,11 @@ class Database:
             r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             flags=re.IGNORECASE | re.DOTALL,
         )
+        drop_index = re.compile(
+            r"^\s*DROP\s+(?:INDEX|KEY)\s+(?:IF\s+EXISTS\s+)?"
+            r"(`?[A-Za-z0-9_]+`?)\s*$",
+            flags=re.IGNORECASE,
+        )
         drop_foreign_key = re.compile(
             r"^\s*DROP\s+FOREIGN\s+KEY\s+(?:IF\s+EXISTS\s+)?"
             r"(`?[A-Za-z0-9_]+`?)\s*$",
@@ -228,6 +233,7 @@ class Database:
             column_match = conditional_column.match(clause)
             drop_column_match = conditional_drop_column.match(clause)
             index_match = named_index.match(clause)
+            drop_index_match = drop_index.match(clause)
             drop_foreign_key_match = drop_foreign_key.match(clause)
             constraint_match = add_named_constraint.match(clause)
             if column_match:
@@ -239,6 +245,9 @@ class Database:
             elif index_match:
                 kind = "index"
                 clause_match = index_match
+            elif drop_index_match:
+                kind = "drop_index"
+                clause_match = drop_index_match
             elif drop_foreign_key_match:
                 kind = "drop_foreign_key"
                 clause_match = drop_foreign_key_match
@@ -285,6 +294,16 @@ class Database:
                         + index
                         + " "
                         + definition
+                    )
+            elif kind == "drop_index":
+                index = clause_match.group(1)
+                await cursor.execute(
+                    "SHOW INDEX FROM " + table + " WHERE Key_name = %s",
+                    (index.strip("`"),),
+                )
+                if await cursor.fetchone() is not None:
+                    await cursor.execute(
+                        "ALTER TABLE " + table + " DROP INDEX " + index
                     )
             else:
                 constraint = clause_match.group(1)
