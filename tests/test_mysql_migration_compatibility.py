@@ -170,6 +170,39 @@ async def test_mysql_add_unique_key_preserves_unique_when_missing() -> None:
 
 
 @pytest.mark.anyio
+async def test_mysql_create_index_skips_existing_index() -> None:
+    cursor = _Cursor({"idx_audit_logs_entity"})
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "CREATE INDEX idx_audit_logs_entity "
+        "ON audit_logs(entity_type, entity_id)",
+    )
+
+    assert cursor.executed == [
+        (
+            "SHOW INDEX FROM audit_logs WHERE Key_name = %s",
+            ("idx_audit_logs_entity",),
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_mysql_create_unique_index_adds_missing_index() -> None:
+    cursor = _Cursor(set())
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)",
+    )
+
+    assert cursor.executed == [
+        ("SHOW INDEX FROM users WHERE Key_name = %s", ("idx_users_email",)),
+        ("CREATE UNIQUE INDEX idx_users_email ON users (email)", None),
+    ]
+
+
+@pytest.mark.anyio
 async def test_mysql_conditional_add_supports_mixed_modify_clause() -> None:
     cursor = _Cursor(set())
     statement = """ALTER TABLE staff

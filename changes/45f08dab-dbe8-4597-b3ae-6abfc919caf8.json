@@ -1,0 +1,7 @@
+{
+  "guid": "45f08dab-dbe8-4597-b3ae-6abfc919caf8",
+  "occurred_at": "2026-09-10T04:01:22Z",
+  "change_type": "Fix",
+  "summary": "Prevented MySQL startup failures by making standalone named index creation idempotent when an index already exists.",
+  "content_hash": "3e591594c7d2dd7a464a250eee889da1dbc0dc66edb1c5ec1132626e7f52d2ed"
+}
