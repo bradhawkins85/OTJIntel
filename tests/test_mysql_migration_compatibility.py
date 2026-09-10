@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from app.core.database import Database
@@ -81,6 +84,40 @@ async def test_mysql_conditional_add_supports_indexes_mixed_with_columns() -> No
         "(m365_message_id(191))",
         None,
     )
+
+
+@pytest.mark.anyio
+async def test_asset_detail_migration_skips_columns_already_present() -> None:
+    cursor = _Cursor({"os_name", "cpu_name"})
+    statement = """ALTER TABLE assets
+        ADD COLUMN IF NOT EXISTS os_name VARCHAR(255) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS cpu_name VARCHAR(255) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS ram_gb INT DEFAULT NULL"""
+
+    await Database()._execute_mysql_migration_statement(cursor, statement)
+
+    alterations = [sql for sql, _ in cursor.executed if sql.startswith("ALTER TABLE")]
+    assert alterations == [
+        "ALTER TABLE assets ADD COLUMN ram_gb INT DEFAULT NULL"
+    ]
+
+
+def test_consolidated_migration_has_no_unconditional_add_column() -> None:
+    migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
+
+    assert re.search(
+        r"\bADD\s+COLUMN\s+(?!IF\s+NOT\s+EXISTS\b)",
+        migration,
+        flags=re.IGNORECASE,
+    ) is None
+
+
+def test_sqlite_adapter_places_autoincrement_after_primary_key() -> None:
+    sql = Database()._adapt_sql_for_sqlite(
+        "CREATE TABLE example (id INT AUTO_INCREMENT PRIMARY KEY)"
+    )
+
+    assert "id INTEGER PRIMARY KEY AUTOINCREMENT" in sql
 
 
 @pytest.mark.anyio
