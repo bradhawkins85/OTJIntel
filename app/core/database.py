@@ -154,16 +154,17 @@ class Database:
         """Execute SQL, emulating MariaDB's conditional column syntax on MySQL.
 
         MySQL does not accept ``ADD COLUMN IF NOT EXISTS`` even though MariaDB
-        does.  Migrations use that syntax to remain safe when upgrading an
-        installation whose schema predates migration tracking.  Inspecting the
-        table before issuing each ADD preserves that behavior on both servers.
+        does. Migrations use that syntax to remain safe when upgrading an
+        installation whose schema predates migration tracking. Inspect columns
+        and named indexes before issuing each ADD so partially applied migrations
+        are safe on both servers.
         """
         match = re.match(
             r"^\s*ALTER\s+TABLE\s+(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             statement,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        if not match or "IF NOT EXISTS" not in statement.upper():
+        if not match:
             await cursor.execute(statement)
             return
 
@@ -174,14 +175,15 @@ class Database:
             r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             flags=re.IGNORECASE | re.DOTALL,
         )
-        conditional_index = re.compile(
-            r"^\s*ADD\s+(INDEX|KEY)\s+IF\s+NOT\s+EXISTS\s+"
+        named_index = re.compile(
+            r"^\s*ADD\s+(?:(UNIQUE)\s+)?(INDEX|KEY)\s+"
+            r"(?:IF\s+NOT\s+EXISTS\s+)?"
             r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             flags=re.IGNORECASE | re.DOTALL,
         )
         for clause in clauses:
             column_match = conditional_column.match(clause)
-            index_match = conditional_index.match(clause)
+            index_match = named_index.match(clause)
             if column_match:
                 kind = "column"
                 clause_match = column_match
@@ -198,23 +200,31 @@ class Database:
             if kind == "column":
                 column = clause_match.group(1)
                 await cursor.execute(
-                    f"SHOW COLUMNS FROM {table} WHERE Field = %s",
+                    "SHOW COLUMNS FROM " + table + " WHERE Field = %s",
                     (column.strip("`"),),
                 )
                 if await cursor.fetchone() is None:
                     definition = clause_match.group(2)
                     await cursor.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                        "ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition
                     )
             else:
-                keyword, index, definition = clause_match.groups()
+                unique, keyword, index, definition = clause_match.groups()
                 await cursor.execute(
-                    f"SHOW INDEX FROM {table} WHERE Key_name = %s",
+                    "SHOW INDEX FROM " + table + " WHERE Key_name = %s",
                     (index.strip("`"),),
                 )
                 if await cursor.fetchone() is None:
+                    index_kind = ("UNIQUE " if unique else "") + keyword.upper()
                     await cursor.execute(
-                        f"ALTER TABLE {table} ADD {keyword.upper()} {index} {definition}"
+                        "ALTER TABLE "
+                        + table
+                        + " ADD "
+                        + index_kind
+                        + " "
+                        + index
+                        + " "
+                        + definition
                     )
 
     async def connect(self) -> None:
