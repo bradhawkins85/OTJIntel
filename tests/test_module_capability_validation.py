@@ -10,10 +10,14 @@ def _validate(**kwargs):
 
 
 def test_database_slugs_map_explicitly_to_python_feature_packs():
-    assert registry.feature_pack_for_module("receive-sms") == "receive_sms"
     assert registry.feature_pack_for_module("m365-mail") == "m365_mail"
-    assert registry.module_for_feature_pack("call_recordings") == "call-recordings"
+    assert registry.module_for_feature_pack("m365_mail") == "m365-mail"
+    assert registry.feature_pack_for_module("receive-sms") is None
     assert registry.feature_pack_for_module("receive_sms") is None
+
+
+def test_removed_feature_packs_do_not_invalidate_registry():
+    assert _validate() == []
 
 
 def test_capability_unknown_default_module_is_reported(monkeypatch):
