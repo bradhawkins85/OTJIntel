@@ -1,0 +1,7 @@
+{
+  "guid": "9b0cc6ed-99fd-436c-a2bd-878c79e2afca",
+  "occurred_at": "2026-09-10T03:57Z",
+  "change_type": "Fix",
+  "summary": "Removed an orphaned product price alert index operation that prevented automatic database migrations from completing during application startup.",
+  "content_hash": "13de6543042c8137fd28cdc6b2cdd7ca9204218d6d5bcf16bf520cd6ba521dd4"
+}

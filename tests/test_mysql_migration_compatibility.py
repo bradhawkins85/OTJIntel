@@ -195,6 +195,12 @@ def test_consolidated_migration_has_no_unconditional_add_column() -> None:
     ) is None
 
 
+def test_consolidated_migration_does_not_reference_removed_price_alert_table() -> None:
+    migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
+
+    assert "product_price_alerts" not in migration
+
+
 def test_sqlite_adapter_places_autoincrement_after_primary_key() -> None:
     sql = Database()._adapt_sql_for_sqlite(
         "CREATE TABLE example (id INT AUTO_INCREMENT PRIMARY KEY)"
