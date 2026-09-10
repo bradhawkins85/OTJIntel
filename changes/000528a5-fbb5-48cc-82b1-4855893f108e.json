@@ -1,0 +1,7 @@
+{
+  "guid": "000528a5-fbb5-48cc-82b1-4855893f108e",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Restored the network device repository and Hudu service required to load the Assets feature pack, resolving the /assets Not Found response.",
+  "content_hash": "441de471d739d0b4334197cc9c58924586f2bd61d255c43ad8578858b77ba0b8"
+}
