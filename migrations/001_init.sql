@@ -108,18 +108,18 @@ ALTER TABLE user_companies
 
 -- Source: 011_asset_details.sql
 ALTER TABLE assets
-  ADD COLUMN os_name VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN cpu_name VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN ram_gb INT DEFAULT NULL,
-  ADD COLUMN hdd_size VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN last_sync DATETIME DEFAULT NULL,
-  ADD COLUMN motherboard_manufacturer VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN form_factor VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN last_user VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN approx_age INT DEFAULT NULL,
-  ADD COLUMN performance_score INT DEFAULT NULL,
-  ADD COLUMN warranty_status VARCHAR(255) DEFAULT NULL,
-  ADD COLUMN warranty_end_date DATE DEFAULT NULL;
+  ADD COLUMN IF NOT EXISTS os_name VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS cpu_name VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS ram_gb INT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS hdd_size VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS last_sync DATETIME DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS motherboard_manufacturer VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS form_factor VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS last_user VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS approx_age INT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS performance_score INT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS warranty_status VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS warranty_end_date DATE DEFAULT NULL;
 
 -- Source: 012_apps.sql
 CREATE TABLE IF NOT EXISTS apps (
@@ -162,9 +162,9 @@ ALTER TABLE user_companies
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_vip TINYINT(1) DEFAULT 0;
 
 -- Source: 022_add_syncro_xero_ids.sql
-ALTER TABLE companies ADD COLUMN syncro_company_id VARCHAR(255);
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS syncro_company_id VARCHAR(255);
 
-ALTER TABLE companies ADD COLUMN xero_id VARCHAR(255);
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS xero_id VARCHAR(255);
 
 -- Source: 025_office_groups.sql
 CREATE TABLE IF NOT EXISTS office_groups (
@@ -186,15 +186,15 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 025_staff_details.sql
 ALTER TABLE staff
-  ADD COLUMN street VARCHAR(255) NULL,
-  ADD COLUMN city VARCHAR(255) NULL,
-  ADD COLUMN state VARCHAR(255) NULL,
-  ADD COLUMN postcode VARCHAR(20) NULL,
-  ADD COLUMN country VARCHAR(255) NULL,
-  ADD COLUMN department VARCHAR(255) NULL,
-  ADD COLUMN job_title VARCHAR(255) NULL,
-  ADD COLUMN org_company VARCHAR(255) NULL,
-  ADD COLUMN manager_name VARCHAR(255) NULL;
+  ADD COLUMN IF NOT EXISTS street VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS city VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS state VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS postcode VARCHAR(20) NULL,
+  ADD COLUMN IF NOT EXISTS country VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS department VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS job_title VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS org_company VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS manager_name VARCHAR(255) NULL;
 
 -- Source: 026_audit_logs.sql
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -223,14 +223,14 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 -- Source: 028_staff_offboard_date.sql
 ALTER TABLE staff
   MODIFY date_onboarded DATETIME NULL,
-  ADD COLUMN date_offboarded DATETIME NULL;
+  ADD COLUMN IF NOT EXISTS date_offboarded DATETIME NULL;
 
 -- Source: 029_staff_account_action.sql
 ALTER TABLE staff
-  ADD COLUMN account_action VARCHAR(50) NULL;
+  ADD COLUMN IF NOT EXISTS account_action VARCHAR(50) NULL;
 
 -- Source: 030_add_totp_secret.sql
-ALTER TABLE users ADD COLUMN totp_secret VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(255);
 
 -- Source: 031_totp_authenticators.sql
 CREATE TABLE IF NOT EXISTS user_totp_authenticators (
@@ -246,11 +246,11 @@ ALTER TABLE users DROP COLUMN totp_secret;
 
 -- Source: 032_add_company_id_to_audit_logs.sql
 ALTER TABLE audit_logs
-  ADD COLUMN company_id INT NULL AFTER user_id,
+  ADD COLUMN IF NOT EXISTS company_id INT NULL AFTER user_id,
   ADD INDEX idx_audit_logs_company_id (company_id);
 
 -- Source: 033_add_mobile_phone_to_staff.sql
-ALTER TABLE staff ADD COLUMN mobile_phone VARCHAR(20);
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS mobile_phone VARCHAR(20);
 
 -- Source: 034_staff_verification_codes.sql
 CREATE TABLE IF NOT EXISTS staff_verification_codes (
@@ -263,12 +263,12 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 035_add_user_names.sql
 ALTER TABLE users
-  ADD COLUMN first_name VARCHAR(255) NULL,
-  ADD COLUMN last_name VARCHAR(255) NULL;
+  ADD COLUMN IF NOT EXISTS first_name VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS last_name VARCHAR(255) NULL;
 
 -- Source: 036_add_admin_name_to_verification_codes.sql
 ALTER TABLE staff_verification_codes
-  ADD COLUMN admin_name VARCHAR(255) NULL;
+  ADD COLUMN IF NOT EXISTS admin_name VARCHAR(255) NULL;
 
 -- Source: 037_site_settings.sql
 CREATE TABLE IF NOT EXISTS site_settings (
@@ -280,7 +280,7 @@ CREATE TABLE IF NOT EXISTS site_settings (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 038_force_password_change.sql
-ALTER TABLE users ADD COLUMN force_password_change TINYINT(1) NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_change TINYINT(1) NOT NULL DEFAULT 0;
 
 -- Source: 039_email_templates.sql
 CREATE TABLE IF NOT EXISTS email_templates (
@@ -292,10 +292,10 @@ CREATE TABLE IF NOT EXISTS email_templates (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 044_add_mobile_phone_to_users.sql
-ALTER TABLE users ADD COLUMN mobile_phone VARCHAR(20);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile_phone VARCHAR(20);
 
 -- Source: 045_add_syncro_contact_id_to_staff.sql
-ALTER TABLE staff ADD COLUMN syncro_contact_id VARCHAR(255);
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS syncro_contact_id VARCHAR(255);
 
 -- Source: 046_scheduled_tasks.sql
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -332,7 +332,7 @@ ALTER TABLE user_companies
   ADD CONSTRAINT fk_user_companies_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 
 -- Source: 050_add_favicon_to_site_settings.sql
-ALTER TABLE site_settings ADD COLUMN favicon LONGTEXT;
+ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS favicon LONGTEXT;
 
 -- Source: 050_company_section_permissions.sql
 ALTER TABLE user_companies
@@ -419,7 +419,7 @@ CREATE TABLE IF NOT EXISTS login_rate_limits (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 ALTER TABLE users
-  ADD COLUMN is_super_admin TINYINT(1) NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS is_super_admin TINYINT(1) NOT NULL DEFAULT 0;
 
 -- Source: 063_roles_and_memberships.sql
 CREATE TABLE IF NOT EXISTS roles (
@@ -453,9 +453,9 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 064_extend_audit_logs.sql
 ALTER TABLE audit_logs
-  ADD COLUMN entity_type VARCHAR(100) NULL AFTER action,
-  ADD COLUMN entity_id INT NULL AFTER entity_type,
-  ADD COLUMN metadata JSON NULL AFTER new_value;
+  ADD COLUMN IF NOT EXISTS entity_type VARCHAR(100) NULL AFTER action,
+  ADD COLUMN IF NOT EXISTS entity_id INT NULL AFTER entity_type,
+  ADD COLUMN IF NOT EXISTS metadata JSON NULL AFTER new_value;
 
 CREATE INDEX idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
 
@@ -544,9 +544,9 @@ ALTER TABLE api_keys
     MODIFY api_key VARCHAR(128) NOT NULL;
 
 ALTER TABLE api_keys
-    ADD COLUMN key_prefix VARCHAR(16) NULL AFTER api_key,
-    ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    ADD COLUMN last_used_at DATETIME NULL AFTER created_at;
+    ADD COLUMN IF NOT EXISTS key_prefix VARCHAR(16) NULL AFTER api_key,
+    ADD COLUMN IF NOT EXISTS created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS last_used_at DATETIME NULL AFTER created_at;
 
 CREATE INDEX idx_api_keys_created_at ON api_keys (created_at);
 
@@ -785,7 +785,7 @@ ALTER TABLE tickets
 
 -- Source: 074_knowledge_base_ai_tags.sql
 ALTER TABLE knowledge_base_articles
-    ADD COLUMN ai_tags JSON NULL AFTER summary;
+    ADD COLUMN IF NOT EXISTS ai_tags JSON NULL AFTER summary;
 
 -- Source: 074_ticket_ai_tags.sql
 ALTER TABLE tickets
@@ -806,10 +806,10 @@ ALTER TABLE webhook_event_attempts
 
 -- Source: 078_syncro_ticket_reply_enhancements.sql
 ALTER TABLE tickets
-    ADD COLUMN ticket_number VARCHAR(64) NULL AFTER external_reference;
+    ADD COLUMN IF NOT EXISTS ticket_number VARCHAR(64) NULL AFTER external_reference;
 
 ALTER TABLE ticket_replies
-    ADD COLUMN external_reference VARCHAR(128) NULL AFTER body,
+    ADD COLUMN IF NOT EXISTS external_reference VARCHAR(128) NULL AFTER body,
     ADD UNIQUE KEY uq_ticket_replies_external (ticket_id, external_reference);
 
 -- Source: 079_change_log.sql
@@ -884,18 +884,18 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 083_imap_priority.sql
 ALTER TABLE imap_accounts
-    ADD COLUMN priority SMALLINT NOT NULL DEFAULT 100 AFTER id;
+    ADD COLUMN IF NOT EXISTS priority SMALLINT NOT NULL DEFAULT 100 AFTER id;
 
 -- Source: 084_imap_filters.sql
 ALTER TABLE imap_accounts
-  ADD COLUMN filter_query TEXT NULL AFTER schedule_cron;
+  ADD COLUMN IF NOT EXISTS filter_query TEXT NULL AFTER schedule_cron;
 
 -- Source: 085_ticket_reply_time_tracking.sql
 ALTER TABLE ticket_replies
-    ADD COLUMN minutes_spent INT NULL;
+    ADD COLUMN IF NOT EXISTS minutes_spent INT NULL;
 
 ALTER TABLE ticket_replies
-    ADD COLUMN is_billable TINYINT(1) NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS is_billable TINYINT(1) NOT NULL DEFAULT 0;
 
 -- Source: 087_issue_tracker.sql
 CREATE TABLE IF NOT EXISTS issue_definitions (
@@ -1007,7 +1007,7 @@ CREATE INDEX idx_api_key_ip_restrictions_cidr
 
 -- Source: 091_api_key_enable_toggle.sql
 ALTER TABLE api_keys
-    ADD COLUMN is_enabled BOOLEAN NOT NULL DEFAULT 1;
+    ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN NOT NULL DEFAULT 1;
 
 CREATE INDEX idx_api_keys_is_enabled ON api_keys (is_enabled);
 
@@ -1070,7 +1070,7 @@ CREATE TABLE ticket_labour_types (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 ALTER TABLE ticket_replies
-    ADD COLUMN labour_type_id INT NULL AFTER minutes_spent;
+    ADD COLUMN IF NOT EXISTS labour_type_id INT NULL AFTER minutes_spent;
 
 ALTER TABLE ticket_replies
     ADD CONSTRAINT fk_ticket_replies_labour_type
@@ -1082,11 +1082,11 @@ CREATE INDEX idx_ticket_replies_labour_type
 
 -- Source: 097_tacticalrmm_assets.sql
 ALTER TABLE companies
-  ADD COLUMN tacticalrmm_client_id VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS tacticalrmm_client_id VARCHAR(255) DEFAULT NULL,
   ADD KEY companies_tacticalrmm_client_id (tacticalrmm_client_id);
 
 ALTER TABLE assets
-  ADD COLUMN tactical_asset_id VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS tactical_asset_id VARCHAR(255) DEFAULT NULL,
   ADD UNIQUE KEY assets_company_tactical_id (company_id, tactical_asset_id);
 
 CREATE TABLE IF NOT EXISTS ticket_assets (
@@ -1175,8 +1175,8 @@ CREATE UNIQUE INDEX uniq_issue_definitions_slug
 
 -- Source: 109_ticket_xero_billing.sql
 ALTER TABLE tickets
-    ADD COLUMN xero_invoice_number VARCHAR(64) NULL AFTER closed_at,
-    ADD COLUMN billed_at DATETIME(6) NULL AFTER xero_invoice_number;
+    ADD COLUMN IF NOT EXISTS xero_invoice_number VARCHAR(64) NULL AFTER closed_at,
+    ADD COLUMN IF NOT EXISTS billed_at DATETIME(6) NULL AFTER xero_invoice_number;
 
 CREATE INDEX idx_tickets_xero_invoice ON tickets(xero_invoice_number);
 
@@ -1964,7 +1964,7 @@ CREATE TABLE IF NOT EXISTS ticket_attachments (
 
 -- Source: 131_labour_type_rates.sql
 ALTER TABLE ticket_labour_types
-    ADD COLUMN rate DECIMAL(10,2) NULL AFTER name;
+    ADD COLUMN IF NOT EXISTS rate DECIMAL(10,2) NULL AFTER name;
 
 -- Source: 134_ticket_status_default.sql
 ALTER TABLE ticket_statuses 
@@ -2031,7 +2031,7 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 140_service_status_tags.sql
 ALTER TABLE service_status_services 
-ADD COLUMN tags TEXT NULL COMMENT 'Comma-separated tags generated by AI';
+ADD COLUMN IF NOT EXISTS tags TEXT NULL COMMENT 'Comma-separated tags generated by AI';
 
 -- Source: 141_add_booking_link_to_users.sql
 ALTER TABLE users ADD COLUMN IF NOT EXISTS booking_link_url VARCHAR(500);
@@ -2077,10 +2077,10 @@ CREATE INDEX idx_webhook_events_direction
 
 -- Source: 146_automation_one_time_scheduling.sql
 ALTER TABLE automations 
-ADD COLUMN scheduled_time DATETIME(6) NULL AFTER next_run_at;
+ADD COLUMN IF NOT EXISTS scheduled_time DATETIME(6) NULL AFTER next_run_at;
 
 ALTER TABLE automations 
-ADD COLUMN run_once TINYINT(1) NOT NULL DEFAULT 0 AFTER scheduled_time;
+ADD COLUMN IF NOT EXISTS run_once TINYINT(1) NOT NULL DEFAULT 0 AFTER scheduled_time;
 
 CREATE INDEX idx_automations_scheduled_time ON automations(scheduled_time);
 
@@ -2100,7 +2100,7 @@ ALTER TABLE user_companies
   MODIFY can_access_quotes TINYINT(1) DEFAULT 0 NOT NULL;
 
 -- Source: 152_automation_execution_order.sql
-ALTER TABLE automations ADD COLUMN execution_order INT NOT NULL DEFAULT 0 AFTER description;
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS execution_order INT NOT NULL DEFAULT 0 AFTER description;
 
 CREATE INDEX idx_automations_execution_order ON automations(execution_order);
 
@@ -2228,7 +2228,7 @@ ALTER TABLE company_m365_credentials
 
 -- Source: 181_license_sku_mapping_hidden.sql
 ALTER TABLE license_sku_friendly_names
-  ADD COLUMN hidden TINYINT(1) NOT NULL DEFAULT 0 AFTER friendly_name;
+  ADD COLUMN IF NOT EXISTS hidden TINYINT(1) NOT NULL DEFAULT 0 AFTER friendly_name;
 
 -- Source: 181_staff_onboarding_workflows.sql
 ALTER TABLE companies
@@ -2405,9 +2405,9 @@ MODIFY COLUMN email VARCHAR(255) NULL;
 
 -- Source: 186_staff_custom_field_conditionals.sql
 ALTER TABLE staff_custom_field_definitions
-    ADD COLUMN condition_parent_name VARCHAR(100) NULL AFTER is_active,
-    ADD COLUMN condition_operator ENUM('equals', 'not_equals', 'is_checked', 'is_not_checked') NULL AFTER condition_parent_name,
-    ADD COLUMN condition_value VARCHAR(255) NULL AFTER condition_operator;
+    ADD COLUMN IF NOT EXISTS condition_parent_name VARCHAR(100) NULL AFTER is_active,
+    ADD COLUMN IF NOT EXISTS condition_operator ENUM('equals', 'not_equals', 'is_checked', 'is_not_checked') NULL AFTER condition_parent_name,
+    ADD COLUMN IF NOT EXISTS condition_value VARCHAR(255) NULL AFTER condition_operator;
 
 -- Source: 187_staff_onboarding_lifecycle.sql
 ALTER TABLE staff
@@ -2526,7 +2526,7 @@ ALTER TABLE staff_custom_field_definitions
 
 -- Source: 195_staff_custom_field_help_text.sql
 ALTER TABLE staff_custom_field_definitions
-    ADD COLUMN help_text VARCHAR(500) NULL AFTER display_name;
+    ADD COLUMN IF NOT EXISTS help_text VARCHAR(500) NULL AFTER display_name;
 
 -- Source: 196_staff_custom_field_condition_one_of.sql
 ALTER TABLE staff_custom_field_definitions
@@ -2941,7 +2941,7 @@ ALTER TABLE licenses
 
 -- Source: 224_company_report_sections_detailed.sql
 ALTER TABLE company_report_sections
-    ADD COLUMN detailed TINYINT(1) NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS detailed TINYINT(1) NOT NULL DEFAULT 0;
 
 -- Source: 226_license_usage_history.sql
 CREATE TABLE IF NOT EXISTS license_usage_history (
@@ -2972,7 +2972,7 @@ CREATE TABLE IF NOT EXISTS demo_seed_log (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 230_pdf_cover_image.sql
-ALTER TABLE site_settings ADD COLUMN pdf_cover_image VARCHAR(500) DEFAULT NULL;
+ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS pdf_cover_image VARCHAR(500) DEFAULT NULL;
 
 -- Source: 232_ticket_reply_email_recipients.sql
 CREATE TABLE IF NOT EXISTS ticket_reply_email_recipients (
@@ -3118,7 +3118,7 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 254_notification_exclusions_message_pattern.sql
 ALTER TABLE notification_exclusions
-  ADD COLUMN message_pattern VARCHAR(500) NOT NULL DEFAULT '' AFTER event_type,
+  ADD COLUMN IF NOT EXISTS message_pattern VARCHAR(500) NOT NULL DEFAULT '' AFTER event_type,
   DROP INDEX uq_notification_exclusions_user_event,
   ADD UNIQUE KEY uq_notification_exclusions_user_event_pattern (user_id, event_type, message_pattern(200));
 
@@ -3153,7 +3153,7 @@ CREATE TABLE IF NOT EXISTS account_verification_tokens (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 268_add_user_last_login_at.sql
-ALTER TABLE users ADD COLUMN last_login_at DATETIME NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at DATETIME NULL;
 
 CREATE INDEX idx_users_last_login_at ON users (last_login_at);
 
@@ -3215,10 +3215,10 @@ ALTER TABLE staff_custom_field_definitions
 
 -- Source: 277_staff_custom_field_m365_sync.sql
 ALTER TABLE staff_custom_field_definitions
-    ADD COLUMN m365_upn VARCHAR(255) NULL AFTER visible_to_requester_emails;
+    ADD COLUMN IF NOT EXISTS m365_upn VARCHAR(255) NULL AFTER visible_to_requester_emails;
 
 ALTER TABLE staff_custom_field_options
-    ADD COLUMN m365_upn VARCHAR(255) NULL AFTER option_label;
+    ADD COLUMN IF NOT EXISTS m365_upn VARCHAR(255) NULL AFTER option_label;
 
 -- Source: 278_rag_index.sql
 CREATE TABLE IF NOT EXISTS rag_documents (
@@ -3332,7 +3332,7 @@ CREATE TABLE IF NOT EXISTS rag_matching_state (
 
 -- Source: 282_asset_machine_type.sql
 ALTER TABLE assets
-  ADD COLUMN machine_type VARCHAR(50) DEFAULT NULL;
+  ADD COLUMN IF NOT EXISTS machine_type VARCHAR(50) DEFAULT NULL;
 
 -- Source: 282_ticket_status_hide_from_technicians.sql
 ALTER TABLE ticket_statuses
@@ -3362,7 +3362,7 @@ CREATE INDEX idx_scheduled_tasks_disabled_by_module
   ON scheduled_tasks (disabled_by_module);
 
 -- Source: 290_ticket_syncro_updated_at.sql
-ALTER TABLE tickets ADD COLUMN syncro_updated_at DATETIME(6) NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS syncro_updated_at DATETIME(6) NULL;
 
 CREATE INDEX idx_tickets_syncro_updated_at ON tickets(syncro_updated_at);
 
@@ -3385,7 +3385,7 @@ CREATE INDEX idx_email_blocklist_email ON email_blocklist (email);
 CREATE INDEX idx_email_blocklist_source ON email_blocklist (source);
 
 -- Source: 291_ticket_review_date.sql
-ALTER TABLE tickets ADD COLUMN review_date DATE NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS review_date DATE NULL;
 
 CREATE INDEX idx_tickets_review_date ON tickets(review_date);
 
@@ -3449,7 +3449,7 @@ CREATE TABLE IF NOT EXISTS ticket_shipment_watches (
 
 -- Source: 300_ticket_shipment_watch_public_comments.sql
 ALTER TABLE ticket_shipment_watches
-    ADD COLUMN public_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+    ADD COLUMN IF NOT EXISTS public_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 -- Source: 301_company_default_ticket_reply_billable.sql
 ALTER TABLE companies
@@ -3717,7 +3717,7 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 352_asset_boot_time.sql
 ALTER TABLE assets
-  ADD COLUMN boot_time DATETIME DEFAULT NULL AFTER last_sync;
+  ADD COLUMN IF NOT EXISTS boot_time DATETIME DEFAULT NULL AFTER last_sync;
 
 -- Source: 354_bcp_global_assessment_library.sql
 CREATE TABLE IF NOT EXISTS bcp_global_risk (

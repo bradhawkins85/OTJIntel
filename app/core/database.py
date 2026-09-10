@@ -547,6 +547,12 @@ class Database:
         
         # Replace INT with INTEGER for primary key autoincrement compatibility
         sql = re.sub(r'\bINT\b(\s+AUTOINCREMENT|\s+PRIMARY\s+KEY)', r'INTEGER\1', sql, flags=re.IGNORECASE)
+        sql = re.sub(
+            r'\bINTEGER\s+AUTOINCREMENT\s+PRIMARY\s+KEY\b',
+            'INTEGER PRIMARY KEY AUTOINCREMENT',
+            sql,
+            flags=re.IGNORECASE,
+        )
         
         # Replace DATETIME with TEXT (SQLite uses TEXT for dates)
         sql = re.sub(r'\bDATETIME\b', 'TEXT', sql, flags=re.IGNORECASE)
