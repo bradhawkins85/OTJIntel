@@ -1674,7 +1674,6 @@ CREATE TABLE IF NOT EXISTS bcp_checklist_tick (
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (plan_id) REFERENCES bcp_plan(id) ON DELETE CASCADE,
   FOREIGN KEY (checklist_item_id) REFERENCES bcp_checklist_item(id) ON DELETE CASCADE,
-  FOREIGN KEY (incident_id) REFERENCES bcp_incident(id) ON DELETE CASCADE,
   INDEX idx_bcp_tick_incident (incident_id),
   INDEX idx_bcp_tick_item (checklist_item_id),
   INDEX idx_bcp_tick_plan (plan_id)
@@ -1757,7 +1756,6 @@ CREATE TABLE IF NOT EXISTS bcp_event_log_entry (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (plan_id) REFERENCES bcp_plan(id) ON DELETE CASCADE,
-  FOREIGN KEY (incident_id) REFERENCES bcp_incident(id) ON DELETE CASCADE,
   INDEX idx_bcp_event_plan (plan_id),
   INDEX idx_bcp_event_incident (incident_id),
   INDEX idx_bcp_event_time (happened_at)

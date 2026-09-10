@@ -1,0 +1,7 @@
+{
+  "guid": "6e82ba86-03ee-4d9b-b4ed-5bc9f1147c8c",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Fixed MySQL startup by removing foreign keys to the obsolete BCP incident table.",
+  "content_hash": "80ac854b4013e9d3851eb863724598815f70b7410c9310f76f91ef8697f06177"
+}
