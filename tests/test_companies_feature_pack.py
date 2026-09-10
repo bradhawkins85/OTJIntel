@@ -31,8 +31,6 @@ EXPECTED = {
     ("POST", "/admin/companies/assignment/{company_id}/{user_id}/role"),
     ("POST", "/admin/companies/assignment/{company_id}/{staff_id}/pending/remove"),
     ("POST", "/admin/companies/assignment/{company_id}/{user_id}/remove"),
-    ("POST", "/admin/companies/{company_id}/billing-contacts/add"),
-    ("POST", "/admin/companies/{company_id}/billing-contacts/{staff_id}/remove"),
     ("GET", "/admin/companies/{company_id}/m365-provision"),
     ("GET", "/admin/companies/{company_id}/m365-discover"),
     ("POST", "/admin/companies/{company_id}/m365-credentials"),

@@ -298,7 +298,7 @@ async def _preview_price_change_notifications() -> dict[str, Any]:
             or f"Product #{product.get('id')}",
             "category": product.get("category_name"),
             "effectiveDate": product.get("price_change_date"),
-            "action": "Notify subscribed billing contacts about the scheduled price change",
+            "action": "Notify subscribers about the scheduled price change",
         }
         for product in products
     ]

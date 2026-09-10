@@ -129,18 +129,6 @@ _add(
     ["POST"],
 )
 
-# --- Billing contacts --------------------------------------------------------
-_add(
-    "/admin/companies/{company_id}/billing-contacts/add",
-    handlers.admin_add_billing_contact,
-    ["POST"],
-)
-_add(
-    "/admin/companies/{company_id}/billing-contacts/{staff_id}/remove",
-    handlers.admin_remove_billing_contact,
-    ["POST"],
-)
-
 # --- Microsoft 365 per-company credentials -----------------------------------
 _add(
     "/admin/companies/{company_id}/m365-provision",

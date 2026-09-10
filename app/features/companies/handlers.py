@@ -259,7 +259,6 @@ async def _render_company_edit_page(
     status_code: int = status.HTTP_200_OK,
     show_inactive_tasks: bool = False,
 ) -> HTMLResponse:
-    from app.repositories import billing_contacts as billing_contacts_repo
     from app.repositories import company_variables as company_variables_repo
     from app.repositories import companies as company_repo
     from app.repositories import pending_staff_access as pending_staff_access_repo
@@ -772,30 +771,6 @@ async def _render_company_edit_page(
 
         company_automation_tasks.sort(key=lambda item: (item.get("name") or "").lower())
 
-    # Fetch billing contacts for the company
-    billing_contacts = []
-    company_staff = []
-    if is_super_admin:
-        try:
-            billing_contacts = (
-                await billing_contacts_repo.list_billing_contacts_for_company(
-                    company_id
-                )
-            )
-        except RuntimeError as exc:  # pragma: no cover - defensive guard for tests
-            if "Database pool not initialised" in str(exc):
-                billing_contacts = []
-            else:
-                raise
-        # Get all staff for this company for the dropdown
-        try:
-            company_staff = await staff_repo.list_staff(company_id)
-        except RuntimeError as exc:  # pragma: no cover - defensive guard for tests
-            if "Database pool not initialised" in str(exc):
-                company_staff = []
-            else:
-                raise
-
     # Fetch Microsoft 365 credentials for the company
     m365_credential_view: dict[str, Any] | None = None
     if is_super_admin:
@@ -861,8 +836,6 @@ async def _render_company_edit_page(
         "company_automation_tasks": company_automation_tasks,
         "automation_command_options": automation_command_options,
         "automation_company_options": automation_company_options,
-        "billing_contacts": billing_contacts,
-        "company_staff": company_staff,
         "show_inactive_tasks": show_inactive_tasks,
         "m365_credential": m365_credential_view,
         "m365_has_credentials": m365_credential_view is not None,
@@ -2233,77 +2206,6 @@ async def admin_remove_company_assignment(
     if redirect:
         return redirect
     await user_company_repo.remove_assignment(user_id=user_id, company_id=company_id)
-    return JSONResponse({"success": True})
-
-
-async def admin_add_billing_contact(company_id: int, request: Request):
-    """Add a staff member as a billing contact for a company."""
-    from app.repositories import billing_contacts as billing_contacts_repo
-    from app.repositories import companies as company_repo
-    from app.repositories import staff as staff_repo
-
-    current_user, redirect = await _main()._require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    payload = await request.json()
-    staff_id = payload.get("staff_id") or payload.get("staffId")
-
-    if not staff_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="staff_id required"
-        )
-
-    try:
-        staff_id_int = int(staff_id)
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid staff_id"
-        )
-
-    company = await company_repo.get_company_by_id(company_id)
-    if not company:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Company not found"
-        )
-
-    staff = await staff_repo.get_staff_by_id(staff_id_int)
-    if not staff:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Staff member not found",
-        )
-    if staff.get("company_id") != company_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Staff member must belong to the company",
-        )
-
-    contact = await billing_contacts_repo.add_billing_contact(company_id, staff_id_int)
-    return JSONResponse(
-        {
-            "success": True,
-            "contact": {
-                "staff_id": contact.get("staff_id"),
-                "email": contact.get("email"),
-                "first_name": contact.get("first_name"),
-                "last_name": contact.get("last_name"),
-            },
-        }
-    )
-
-
-async def admin_remove_billing_contact(
-    company_id: int, staff_id: int, request: Request
-):
-    """Remove a staff member as a billing contact for a company."""
-    from app.repositories import billing_contacts as billing_contacts_repo
-
-    current_user, redirect = await _main()._require_super_admin_page(request)
-    if redirect:
-        return redirect
-
-    await billing_contacts_repo.remove_billing_contact(company_id, staff_id)
     return JSONResponse({"success": True})
 
 
