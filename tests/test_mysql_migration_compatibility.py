@@ -203,6 +203,47 @@ async def test_mysql_create_unique_index_adds_missing_index() -> None:
 
 
 @pytest.mark.anyio
+async def test_mysql_conditional_drop_index_removes_existing_index() -> None:
+    cursor = _Cursor({"uq_ticket_watchers_ticket_user"})
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "ALTER TABLE ticket_watchers "
+        "DROP INDEX IF EXISTS uq_ticket_watchers_ticket_user",
+    )
+
+    assert cursor.executed == [
+        (
+            "SHOW INDEX FROM ticket_watchers WHERE Key_name = %s",
+            ("uq_ticket_watchers_ticket_user",),
+        ),
+        (
+            "ALTER TABLE ticket_watchers "
+            "DROP INDEX uq_ticket_watchers_ticket_user",
+            None,
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_mysql_conditional_drop_index_skips_missing_index() -> None:
+    cursor = _Cursor(set())
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "ALTER TABLE ticket_watchers "
+        "DROP INDEX IF EXISTS uq_ticket_watchers_ticket_user",
+    )
+
+    assert cursor.executed == [
+        (
+            "SHOW INDEX FROM ticket_watchers WHERE Key_name = %s",
+            ("uq_ticket_watchers_ticket_user",),
+        ),
+    ]
+
+
+@pytest.mark.anyio
 async def test_mysql_conditional_add_supports_mixed_modify_clause() -> None:
     cursor = _Cursor(set())
     statement = """ALTER TABLE staff
