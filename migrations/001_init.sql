@@ -2580,8 +2580,8 @@ CREATE UNIQUE INDEX uq_company_workflow_policy_company_dir
     ON company_onboarding_workflow_policies (company_id, direction);
 
 ALTER TABLE company_onboarding_workflow_policies
-    ADD CONSTRAINT fk_company_onboarding_workflow_policies_company
-        FOREIGN KEY IF NOT EXISTS (company_id) REFERENCES companies(id) ON DELETE CASCADE;
+    ADD CONSTRAINT IF NOT EXISTS fk_company_onboarding_workflow_policies_company
+        FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE;
 
 -- Source: 202_offboarding_request_fields.sql
 ALTER TABLE staff
@@ -2649,8 +2649,8 @@ CREATE UNIQUE INDEX uq_company_workflow_policy_company_dir_key
     ON company_onboarding_workflow_policies (company_id, direction, workflow_key);
 
 ALTER TABLE company_onboarding_workflow_policies
-    ADD CONSTRAINT fk_company_onboarding_workflow_policies_company
-        FOREIGN KEY IF NOT EXISTS (company_id) REFERENCES companies(id) ON DELETE CASCADE;
+    ADD CONSTRAINT IF NOT EXISTS fk_company_onboarding_workflow_policies_company
+        FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE;
 
 -- Source: 205_add_is_active_to_users.sql
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1;

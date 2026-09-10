@@ -269,6 +269,16 @@ def test_consolidated_migration_has_no_unconditional_add_column() -> None:
     ) is None
 
 
+def test_consolidated_migration_has_no_misplaced_foreign_key_condition() -> None:
+    migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
+
+    assert re.search(
+        r"\bFOREIGN\s+KEY\s+IF\s+NOT\s+EXISTS\b",
+        migration,
+        flags=re.IGNORECASE,
+    ) is None
+
+
 def test_consolidated_migration_does_not_reference_removed_price_alert_table() -> None:
     migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
 
@@ -332,6 +342,26 @@ async def test_mysql_missing_foreign_key_is_skipped_before_replacement() -> None
         "ALTER TABLE user_companies ADD CONSTRAINT fk_user_companies_user "
         "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
     ]
+
+
+@pytest.mark.anyio
+async def test_mysql_conditional_add_foreign_key_uses_valid_syntax() -> None:
+    cursor = _Cursor(set())
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "ALTER TABLE company_onboarding_workflow_policies "
+        "ADD CONSTRAINT IF NOT EXISTS "
+        "fk_company_onboarding_workflow_policies_company "
+        "FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE",
+    )
+
+    assert cursor.executed[-1] == (
+        "ALTER TABLE company_onboarding_workflow_policies ADD CONSTRAINT "
+        "fk_company_onboarding_workflow_policies_company FOREIGN KEY (company_id) "
+        "REFERENCES companies(id) ON DELETE CASCADE",
+        None,
+    )
 
 
 @pytest.mark.anyio
