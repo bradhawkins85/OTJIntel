@@ -181,15 +181,33 @@ class Database:
             r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
             flags=re.IGNORECASE | re.DOTALL,
         )
+        drop_foreign_key = re.compile(
+            r"^\s*DROP\s+FOREIGN\s+KEY\s+(?:IF\s+EXISTS\s+)?"
+            r"(`?[A-Za-z0-9_]+`?)\s*$",
+            flags=re.IGNORECASE,
+        )
+        add_named_constraint = re.compile(
+            r"^\s*ADD\s+CONSTRAINT\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+            r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         for clause in clauses:
             column_match = conditional_column.match(clause)
             index_match = named_index.match(clause)
+            drop_foreign_key_match = drop_foreign_key.match(clause)
+            constraint_match = add_named_constraint.match(clause)
             if column_match:
                 kind = "column"
                 clause_match = column_match
             elif index_match:
                 kind = "index"
                 clause_match = index_match
+            elif drop_foreign_key_match:
+                kind = "drop_foreign_key"
+                clause_match = drop_foreign_key_match
+            elif constraint_match:
+                kind = "constraint"
+                clause_match = constraint_match
             else:
                 # A statement may mix an ordinary operation (such as MODIFY)
                 # with a conditional ADD. Execute it separately so the MySQL-
@@ -208,7 +226,7 @@ class Database:
                     await cursor.execute(
                         "ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition
                     )
-            else:
+            elif kind == "index":
                 unique, keyword, index, definition = clause_match.groups()
                 await cursor.execute(
                     "SHOW INDEX FROM " + table + " WHERE Key_name = %s",
@@ -223,6 +241,30 @@ class Database:
                         + index_kind
                         + " "
                         + index
+                        + " "
+                        + definition
+                    )
+            else:
+                constraint = clause_match.group(1)
+                constraint_name = constraint.strip("`")
+                await cursor.execute(
+                    "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+                    "AND CONSTRAINT_NAME = %s",
+                    (table.strip("`"), constraint_name),
+                )
+                constraint_exists = await cursor.fetchone() is not None
+                if kind == "drop_foreign_key" and constraint_exists:
+                    await cursor.execute(
+                        "ALTER TABLE " + table + " DROP FOREIGN KEY " + constraint
+                    )
+                elif kind == "constraint" and not constraint_exists:
+                    definition = clause_match.group(2)
+                    await cursor.execute(
+                        "ALTER TABLE "
+                        + table
+                        + " ADD CONSTRAINT "
+                        + constraint
                         + " "
                         + definition
                     )
