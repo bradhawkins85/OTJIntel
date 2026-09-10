@@ -23,7 +23,9 @@ After=network-online.target mysql.service redis.service
 Wants=network-online.target
 
 [Service]
-Type=notify
+# start_with_auto_update.sh and Uvicorn do not implement the sd_notify
+# protocol, so Type=notify would eventually time out a healthy process.
+Type=simple
 User=myportal
 Group=myportal
 WorkingDirectory=/opt/myportal

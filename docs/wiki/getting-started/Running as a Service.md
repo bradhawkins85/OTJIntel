@@ -74,7 +74,9 @@ After=network-online.target mysql.service redis.service
 Wants=network-online.target
 
 [Service]
-Type=notify
+# The launcher and Uvicorn do not send sd_notify readiness messages. Type=simple
+# prevents systemd from timing out and terminating an otherwise healthy server.
+Type=simple
 User=myportal
 Group=myportal
 WorkingDirectory=/opt/myportal
@@ -102,9 +104,10 @@ Key points:
   Configure behaviour via `UVICORN_AUTO_UPDATE_ENABLED`,
   `UVICORN_AUTO_UPDATE_ATTEMPTS`, and
   `UVICORN_AUTO_UPDATE_RETRY_DELAY` in the environment file.
-- `Type=notify` allows Uvicorn to report readiness to systemd. Remove the
-  directive if you are not using Uvicorn's `--factory` or `--lifespan`
-  support.
+- `Type=simple` is required because neither `start_with_auto_update.sh` nor
+  Uvicorn sends an `sd_notify` readiness message. Setting `Type=notify` leaves
+  the start operation pending until `TimeoutStartSec`, at which point systemd
+  sends `SIGTERM` to an otherwise healthy server.
 - The service runs as the dedicated `myportal` user with a restricted
   home directory and `NoNewPrivileges` enabled.
 - `ProtectSystem` and `ProtectHome` restrict filesystem access while

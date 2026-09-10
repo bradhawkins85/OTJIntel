@@ -788,7 +788,10 @@ After=network-online.target mysql.service redis.service
 Wants=network-online.target
 
 [Service]
-Type=notify
+# The wrapper and Uvicorn do not emit sd_notify READY=1 messages. Using
+# Type=notify leaves the start job pending until systemd kills a healthy app
+# at TimeoutStartSec. Systemd supervises the long-running wrapper directly.
+Type=simple
 User=${service_user}
 Group=${service_group}
 WorkingDirectory=${PROJECT_ROOT}

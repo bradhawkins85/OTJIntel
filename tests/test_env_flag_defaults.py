@@ -48,6 +48,33 @@ def test_install_environment_installs_and_starts_systemd_service() -> None:
     assert 'run_privileged systemctl enable --now "$unit_name"' in contents
 
 
+def test_systemd_services_do_not_wait_for_unsupported_readiness_notification() -> None:
+    installer = (PROJECT_ROOT / "scripts" / "install_environment.sh").read_text(
+        encoding="utf-8"
+    )
+    deployment_unit = (
+        PROJECT_ROOT / "deploy" / "systemd" / "myportal@.service"
+    ).read_text(encoding="utf-8")
+    service_guide = (PROJECT_ROOT / "wiki" / "Systemd-Service.md").read_text(
+        encoding="utf-8"
+    )
+    bundled_service_guide = (
+        PROJECT_ROOT / "docs" / "wiki" / "getting-started" / "Running as a Service.md"
+    ).read_text(encoding="utf-8")
+
+    for contents in (
+        installer,
+        deployment_unit,
+        service_guide,
+        bundled_service_guide,
+    ):
+        directives = {
+            line.strip() for line in contents.splitlines() if not line.startswith("#")
+        }
+        assert "Type=simple" in directives
+        assert "Type=notify" not in directives
+
+
 def test_install_environment_uses_distinct_development_service_name() -> None:
     script_path = PROJECT_ROOT / "scripts" / "install_environment.sh"
     contents = script_path.read_text(encoding="utf-8")
