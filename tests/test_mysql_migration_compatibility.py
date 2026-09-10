@@ -275,6 +275,27 @@ def test_consolidated_migration_does_not_reference_removed_price_alert_table() -
     assert "product_price_alerts" not in migration
 
 
+def test_email_tracking_table_exists_before_its_first_alter() -> None:
+    migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
+
+    create_position = migration.index(
+        "CREATE TABLE IF NOT EXISTS email_tracking_events"
+    )
+    alter_position = migration.index("ALTER TABLE email_tracking_events")
+
+    assert create_position < alter_position
+
+
+def test_email_tracking_repair_migration_is_idempotent_and_complete() -> None:
+    migration = Path(
+        "migrations/002_restore_email_tracking_events.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS email_tracking_events" in migration
+    assert "smtp2go_data TEXT NULL" in migration
+    assert "'processed', 'rejected'" in migration
+
+
 def test_sqlite_adapter_places_autoincrement_after_primary_key() -> None:
     sql = Database()._adapt_sql_for_sqlite(
         "CREATE TABLE example (id INT AUTO_INCREMENT PRIMARY KEY)"
