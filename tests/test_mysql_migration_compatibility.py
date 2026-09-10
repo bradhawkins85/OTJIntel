@@ -285,6 +285,22 @@ def test_consolidated_migration_does_not_reference_removed_price_alert_table() -
     assert "product_price_alerts" not in migration
 
 
+def test_notification_exclusion_replacement_index_precedes_drop() -> None:
+    migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
+    section = migration.split(
+        "-- Source: 254_notification_exclusions_message_pattern.sql", 1
+    )[1].split("-- Source:", 1)[0]
+
+    replacement_position = section.index(
+        "ADD UNIQUE KEY uq_notification_exclusions_user_event_pattern"
+    )
+    old_index_drop_position = section.index(
+        "DROP INDEX uq_notification_exclusions_user_event"
+    )
+
+    assert replacement_position < old_index_drop_position
+
+
 def test_email_tracking_table_exists_before_its_first_alter() -> None:
     migration = Path("migrations/001_init.sql").read_text(encoding="utf-8")
 

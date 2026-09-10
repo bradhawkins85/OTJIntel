@@ -3127,8 +3127,8 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 -- Source: 254_notification_exclusions_message_pattern.sql
 ALTER TABLE notification_exclusions
   ADD COLUMN IF NOT EXISTS message_pattern VARCHAR(500) NOT NULL DEFAULT '' AFTER event_type,
-  DROP INDEX uq_notification_exclusions_user_event,
-  ADD UNIQUE KEY uq_notification_exclusions_user_event_pattern (user_id, event_type, message_pattern(200));
+  ADD UNIQUE KEY uq_notification_exclusions_user_event_pattern (user_id, event_type, message_pattern(200)),
+  DROP INDEX uq_notification_exclusions_user_event;
 
 -- Source: 260_company_chat_defaults.sql
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS customer_chat_enabled TINYINT(1) NOT NULL DEFAULT 1;
