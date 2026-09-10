@@ -9,8 +9,13 @@ from app.core.database import Database
 
 
 class _Cursor:
-    def __init__(self, existing_columns: set[str]) -> None:
+    def __init__(
+        self,
+        existing_columns: set[str],
+        existing_constraints: set[str] | None = None,
+    ) -> None:
         self.existing_columns = existing_columns
+        self.existing_constraints = existing_constraints or set()
         self.executed: list[tuple[str, tuple[str, ...] | None]] = []
         self._found: tuple[str] | None = None
 
@@ -19,6 +24,11 @@ class _Cursor:
         if sql.startswith(("SHOW COLUMNS", "SHOW INDEX")):
             assert params is not None
             self._found = (params[0],) if params[0] in self.existing_columns else None
+        elif sql.startswith("SELECT CONSTRAINT_NAME FROM information_schema"):
+            assert params is not None
+            self._found = (
+                (params[1],) if params[1] in self.existing_constraints else None
+            )
 
     async def fetchone(self) -> tuple[str] | None:
         return self._found
@@ -188,3 +198,50 @@ async def test_regular_mysql_statement_executes_unchanged() -> None:
     assert cursor.executed == [
         ("ALTER TABLE users MODIFY email VARCHAR(255) NOT NULL", None)
     ]
+
+
+@pytest.mark.anyio
+async def test_mysql_missing_foreign_key_is_skipped_before_replacement() -> None:
+    cursor = _Cursor(set())
+    statement = """ALTER TABLE user_companies
+        DROP FOREIGN KEY user_companies_ibfk_1,
+        ADD CONSTRAINT fk_user_companies_user
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"""
+
+    await Database()._execute_mysql_migration_statement(cursor, statement)
+
+    alterations = [sql for sql, _ in cursor.executed if sql.startswith("ALTER TABLE")]
+    assert alterations == [
+        "ALTER TABLE user_companies ADD CONSTRAINT fk_user_companies_user "
+        "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
+    ]
+
+
+@pytest.mark.anyio
+async def test_mysql_foreign_key_replacement_is_idempotent() -> None:
+    cursor = _Cursor(set(), {"fk_user_companies_user"})
+    statement = """ALTER TABLE user_companies
+        DROP FOREIGN KEY user_companies_ibfk_1,
+        ADD CONSTRAINT fk_user_companies_user
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"""
+
+    await Database()._execute_mysql_migration_statement(cursor, statement)
+
+    assert not any(
+        sql.startswith("ALTER TABLE") for sql, _ in cursor.executed
+    )
+
+
+@pytest.mark.anyio
+async def test_mysql_existing_foreign_key_is_dropped() -> None:
+    cursor = _Cursor(set(), {"user_companies_ibfk_1"})
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "ALTER TABLE user_companies DROP FOREIGN KEY user_companies_ibfk_1",
+    )
+
+    assert cursor.executed[-1] == (
+        "ALTER TABLE user_companies DROP FOREIGN KEY user_companies_ibfk_1",
+        None,
+    )
