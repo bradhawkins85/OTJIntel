@@ -147,10 +147,6 @@ ALTER TABLE user_companies
 ALTER TABLE user_companies
   MODIFY can_order_licenses TINYINT(1) DEFAULT 0 NOT NULL;
 
-ALTER TABLE external_api_settings
-  ADD COLUMN IF NOT EXISTS webhook_url VARCHAR(255),
-  ADD COLUMN IF NOT EXISTS webhook_api_key VARCHAR(255);
-
 -- Source: 013_shop.sql
 ALTER TABLE user_companies
   ADD COLUMN IF NOT EXISTS can_access_shop TINYINT(1);

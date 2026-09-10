@@ -305,9 +305,6 @@ async def delete_company(company_id: int) -> None:
     # invoice_lines and related rows cascade when invoices are deleted.
     await db.execute("DELETE FROM invoices WHERE company_id = %s", (company_id,))
     await db.execute(
-        "DELETE FROM external_api_settings WHERE company_id = %s", (company_id,)
-    )
-    await db.execute(
         "DELETE FROM company_app_prices WHERE company_id = %s", (company_id,)
     )
     # office_group_members and group_licenses cascade from office_groups.
