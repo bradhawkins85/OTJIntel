@@ -330,6 +330,28 @@ def test_sqlite_adapter_places_autoincrement_after_primary_key() -> None:
     assert "id INTEGER PRIMARY KEY AUTOINCREMENT" in sql
 
 
+def test_sqlite_adapter_makes_conditional_add_column_executable() -> None:
+    sql = Database()._adapt_sql_for_sqlite(
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS "
+        "merged_into_ticket_id INT NULL"
+    )
+
+    assert sql == (
+        "ALTER TABLE tickets ADD COLUMN merged_into_ticket_id INT NULL"
+    )
+
+
+def test_ticket_relationship_repair_migration_is_complete() -> None:
+    migration = Path("migrations/004_restore_ticket_merge_columns.sql").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ADD COLUMN IF NOT EXISTS merged_into_ticket_id INT NULL" in migration
+    assert "ADD COLUMN IF NOT EXISTS split_from_ticket_id INT NULL" in migration
+    assert "idx_tickets_merged_into" in migration
+    assert "idx_tickets_split_from" in migration
+
+
 @pytest.mark.anyio
 async def test_regular_mysql_statement_executes_unchanged() -> None:
     cursor = _Cursor(set())

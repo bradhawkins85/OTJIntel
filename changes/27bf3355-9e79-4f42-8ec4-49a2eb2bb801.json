@@ -1,0 +1,7 @@
+{
+  "guid": "27bf3355-9e79-4f42-8ec4-49a2eb2bb801",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Restored missing ticket split and merge relationship columns through the automatic startup migration runner.",
+  "content_hash": "8fb43f2293330b0d5decac62b78888836be387b92352faac6eff1c8ceb61fd06"
+}
