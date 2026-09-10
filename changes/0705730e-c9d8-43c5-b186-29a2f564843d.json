@@ -1,0 +1,7 @@
+{
+  "guid": "0705730e-c9d8-43c5-b186-29a2f564843d",
+  "occurred_at": "2026-09-10T11:21Z",
+  "change_type": "Fix",
+  "summary": "Removed obsolete recurring invoice item dependencies and controls from company administration pages.",
+  "content_hash": "9b79a0fe6095be82267c006e8d9bfa2a6e9550c0610c31a644dde141363d8d09"
+}
