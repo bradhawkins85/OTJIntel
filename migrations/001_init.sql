@@ -385,10 +385,6 @@ ALTER TABLE apps
 ALTER TABLE apps
   ADD COLUMN IF NOT EXISTS license_sku_id VARCHAR(255);
 
--- Source: 059_product_price_alerts.sql
-ALTER TABLE product_price_alerts
-  ADD INDEX idx_product_price_alerts_product_resolved (product_id, resolved_at);
-
 -- Source: 062_security_enhancements.sql
 CREATE TABLE IF NOT EXISTS user_sessions (
   id INT AUTO_INCREMENT PRIMARY KEY,
