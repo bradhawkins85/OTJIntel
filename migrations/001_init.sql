@@ -1051,12 +1051,12 @@ CREATE TABLE IF NOT EXISTS notification_event_settings (
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Source: 096_ticket_labour_types.sql
-CREATE TABLE ticket_labour_types (
+CREATE TABLE IF NOT EXISTS ticket_labour_types (
     id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     code VARCHAR(64) NOT NULL,
     name VARCHAR(128) NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     UNIQUE KEY uq_ticket_labour_code (code)
 )
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
