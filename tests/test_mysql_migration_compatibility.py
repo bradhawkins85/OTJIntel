@@ -103,6 +103,47 @@ async def test_asset_detail_migration_skips_columns_already_present() -> None:
 
 
 @pytest.mark.anyio
+async def test_mysql_add_index_skips_existing_index_in_mixed_alter() -> None:
+    cursor = _Cursor({"company_id", "idx_audit_logs_company_id"})
+    statement = """ALTER TABLE audit_logs
+        ADD COLUMN IF NOT EXISTS company_id INT NULL AFTER user_id,
+        ADD INDEX idx_audit_logs_company_id (company_id)"""
+
+    await Database()._execute_mysql_migration_statement(cursor, statement)
+
+    assert cursor.executed == [
+        ("SHOW COLUMNS FROM audit_logs WHERE Field = %s", ("company_id",)),
+        (
+            "SHOW INDEX FROM audit_logs WHERE Key_name = %s",
+            ("idx_audit_logs_company_id",),
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_mysql_add_unique_key_preserves_unique_when_missing() -> None:
+    cursor = _Cursor(set())
+
+    await Database()._execute_mysql_migration_statement(
+        cursor,
+        "ALTER TABLE assets ADD UNIQUE KEY assets_company_tactical_id "
+        "(company_id, tactical_asset_id)",
+    )
+
+    assert cursor.executed == [
+        (
+            "SHOW INDEX FROM assets WHERE Key_name = %s",
+            ("assets_company_tactical_id",),
+        ),
+        (
+            "ALTER TABLE assets ADD UNIQUE KEY assets_company_tactical_id "
+            "(company_id, tactical_asset_id)",
+            None,
+        ),
+    ]
+
+
+@pytest.mark.anyio
 async def test_mysql_conditional_add_supports_mixed_modify_clause() -> None:
     cursor = _Cursor(set())
     statement = """ALTER TABLE staff

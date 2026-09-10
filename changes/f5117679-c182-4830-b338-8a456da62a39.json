@@ -1,0 +1,7 @@
+{
+  "guid": "f5117679-c182-4830-b338-8a456da62a39",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Made MySQL startup migrations skip named indexes that already exist, including indexes in mixed ALTER TABLE statements.",
+  "content_hash": "a39f11fa01ef40bac907d2d5be81e06d3ce685591397d8d5d316c8964f25fb9e"
+}
