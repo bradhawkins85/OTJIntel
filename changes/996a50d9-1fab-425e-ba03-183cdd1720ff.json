@@ -1,0 +1,7 @@
+{
+  "guid": "996a50d9-1fab-425e-ba03-183cdd1720ff",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Fixed ticket labour type startup migration syntax for MySQL and made its table creation safe to retry.",
+  "content_hash": "e26bde93d426affc32f96339980ee1324f83dbc40315e689ba7a4c25b26a62b4"
+}
