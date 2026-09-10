@@ -15,7 +15,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
-from urllib.parse import parse_qsl, quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiomysql
@@ -1818,6 +1818,57 @@ def _membership_menu_can(user: dict[str, Any], membership: dict[str, Any] | None
     return _menu_can(menu_access, key, write=write)
 
 
+def _build_plausible_config(
+    module_lookup: Mapping[str, Mapping[str, Any]],
+    user: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a template-safe Plausible configuration.
+
+    The disabled shape is deliberately complete so every page extending the
+    base template can render even when modules have not loaded yet.
+    """
+    disabled: dict[str, Any] = {
+        "enabled": False,
+        "base_url": "",
+        "site_domain": "",
+        "track_pageviews": False,
+    }
+    plausible_module = module_lookup.get("plausible")
+    if not plausible_module or not plausible_module.get("enabled"):
+        return disabled
+
+    plausible_settings = plausible_module.get("settings") or {}
+    base_url = str(plausible_settings.get("base_url") or "").strip().rstrip("/")
+    site_domain = str(plausible_settings.get("site_domain") or "").strip()
+    parsed_url = urlparse(base_url)
+    valid_base_url = (
+        parsed_url.scheme in {"http", "https"}
+        and bool(parsed_url.netloc)
+        and parsed_url.username is None
+        and parsed_url.password is None
+        and not any(character in base_url for character in "<>\"'")
+    )
+    valid_site_domain = bool(re.fullmatch(r"[A-Za-z0-9._-]+(?::\d+)?", site_domain))
+    if not valid_base_url or not valid_site_domain:
+        return disabled
+
+    config: dict[str, Any] = {
+        "enabled": True,
+        "base_url": base_url,
+        "site_domain": site_domain,
+        "track_pageviews": bool(plausible_settings.get("track_pageviews")),
+    }
+    if config["track_pageviews"] and user and user.get("id"):
+        from app.security.plausible_tracking import hash_user_id_for_plausible
+
+        config["hashed_user_id"] = hash_user_id_for_plausible(
+            int(user["id"]),
+            str(plausible_settings.get("pepper") or "").strip(),
+            bool(plausible_settings.get("send_pii")),
+        )
+    return config
+
+
 async def _build_base_context(
     request: Request,
     user: dict[str, Any],
@@ -1935,6 +1986,10 @@ async def _build_base_context(
             module_list = []
         module_lookup = {module.get("slug"): module for module in module_list if module.get("slug")}
         request.state.module_lookup = module_lookup
+
+    plausible_module = (module_lookup or {}).get("plausible")
+    if plausible_module:
+        _get_plausible_module_settings._cached_module = plausible_module
     
 
     context: dict[str, Any] = {
@@ -1965,6 +2020,7 @@ async def _build_base_context(
             for slug, module in (module_lookup or {}).items()
             if bool(module.get("enabled"))
         ),
+        "plausible_config": _build_plausible_config(module_lookup or {}, user),
         "enable_auto_refresh": bool(settings.enable_auto_refresh),
         "is_impersonating": is_impersonating,
         "impersonator_user": impersonator_user,
@@ -2029,6 +2085,7 @@ async def _build_public_context(
         "can_view_m365_shared_mailboxes": False,
         "can_access_chat": False,
         "can_access_marketing": False,
+        "plausible_config": _build_plausible_config({}),
         "notification_unread_count": 0,
         "enable_auto_refresh": bool(settings.enable_auto_refresh),
         "integration_modules": {},
