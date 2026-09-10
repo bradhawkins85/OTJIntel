@@ -1,0 +1,7 @@
+{
+  "guid": "6d2c619c-19f3-406c-bbd0-94b2af1383c6",
+  "occurred_at": "2026-09-10T05:00Z",
+  "change_type": "Fix",
+  "summary": "Fixed MySQL startup migration failure by creating the replacement notification exclusion index before dropping the index required by its user foreign key.",
+  "content_hash": "f08f6d3c513ea78ea55c3797c636e850c1eaa38ec1e72b3b3bc257a8f5a2fac2"
+}
