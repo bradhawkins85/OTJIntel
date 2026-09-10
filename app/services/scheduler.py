@@ -106,6 +106,13 @@ class SchedulerService:
     async def start(self) -> None:
         if self._started:
             return
+        async with db.acquire_lock(
+            "ensure_system_update_task", timeout=10
+        ) as lock_acquired:
+            if lock_acquired:
+                await scheduled_tasks_repo.ensure_system_update_task()
+            else:
+                log_error("Unable to acquire lock to ensure system update task")
         self._scheduler.start()
         self._started = True
         await self._ensure_monitoring_jobs()

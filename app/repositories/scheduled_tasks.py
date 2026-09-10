@@ -141,6 +141,31 @@ async def list_active_tasks() -> list[dict[str, Any]]:
     return await list_tasks(include_inactive=False)
 
 
+async def ensure_system_update_task() -> dict[str, Any]:
+    """Return the global system-update task, creating its default if absent.
+
+    Inactive tasks are deliberately retained so an administrator's decision to
+    disable automatic updates is not undone on the next application start.
+    """
+    existing = await db.fetch_one(
+        "SELECT * FROM scheduled_tasks"
+        " WHERE company_id IS NULL AND command = %s"
+        " ORDER BY id ASC LIMIT 1",
+        ("system_update",),
+    )
+    if existing:
+        return _normalise_task(existing)
+
+    return await create_task(
+        name="Update MyPortal system",
+        command="system_update",
+        cron="0 * * * *",
+        description="Check GitHub hourly and schedule available system updates.",
+        active=True,
+        exclude_from_calendar=True,
+    )
+
+
 async def get_task(task_id: int) -> dict[str, Any] | None:
     row = await db.fetch_one(
         "SELECT * FROM scheduled_tasks WHERE id = %s",

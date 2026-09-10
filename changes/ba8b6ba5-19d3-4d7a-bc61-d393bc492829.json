@@ -1,0 +1,7 @@
+{
+  "guid": "ba8b6ba5-19d3-4d7a-bc61-d393bc492829",
+  "occurred_at": "2026-09-10T11:52Z",
+  "change_type": "Fix",
+  "summary": "Restore the missing hourly system update scheduled task automatically at scheduler startup.",
+  "content_hash": "ff99417b9e898c6ea4b6f72877de33a05bc85066d065afc221e93f0bbe6b412b"
+}
