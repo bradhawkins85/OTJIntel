@@ -1,0 +1,7 @@
+{
+  "guid": "f7055995-d76e-4c81-85dd-9ebf5727984c",
+  "occurred_at": "2026-09-10T00:00Z",
+  "change_type": "Fix",
+  "summary": "Restored ticket status configuration columns for upgraded installations to prevent the admin tickets page from failing.",
+  "content_hash": "0830280afe8896861f1d270e57be451bd7602b8821b25b623827961813673b73"
+}

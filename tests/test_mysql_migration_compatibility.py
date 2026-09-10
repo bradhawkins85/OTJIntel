@@ -352,6 +352,22 @@ def test_ticket_relationship_repair_migration_is_complete() -> None:
     assert "idx_tickets_split_from" in migration
 
 
+def test_ticket_status_configuration_repair_migration_is_complete() -> None:
+    migration = Path(
+        "migrations/006_restore_ticket_status_configuration.sql"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "ADD COLUMN IF NOT EXISTS is_default TINYINT(1) NOT NULL DEFAULT 0"
+        in migration
+    )
+    assert "ADD COLUMN IF NOT EXISTS hide_from_technicians" in migration
+    assert "ADD COLUMN IF NOT EXISTS hide_from_admins" in migration
+    assert "idx_ticket_statuses_default" in migration
+    assert "idx_ticket_statuses_hide_from_technicians" in migration
+    assert "idx_ticket_statuses_hide_from_admins" in migration
+
+
 @pytest.mark.anyio
 async def test_regular_mysql_statement_executes_unchanged() -> None:
     cursor = _Cursor(set())
