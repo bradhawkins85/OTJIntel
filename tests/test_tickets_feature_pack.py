@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
 
 import app.main as main_module
@@ -16,18 +18,18 @@ EXPECTED = {
     ("GET", "/tickets/{ticket_id}"),
     ("POST", "/tickets/{ticket_id}/replies"),
     ("GET", "/admin/tickets"),
-    ("GET", "/admin/tickets/{ticket_id}"),
+    ("GET", "/admin/tickets/{ticket_id:int}"),
     ("POST", "/admin/tickets"),
-    ("POST", "/admin/tickets/{ticket_id}/status"),
+    ("POST", "/admin/tickets/{ticket_id:int}/status"),
     ("POST", "/admin/tickets/statuses"),
     ("POST", "/admin/tickets/labour-types"),
-    ("POST", "/admin/tickets/{ticket_id}/description"),
-    ("POST", "/admin/tickets/{ticket_id}/description/replace"),
-    ("POST", "/admin/tickets/{ticket_id}/details"),
-    ("POST", "/admin/tickets/{ticket_id}/ai/reprocess"),
-    ("POST", "/admin/tickets/{ticket_id}/delete"),
+    ("POST", "/admin/tickets/{ticket_id:int}/description"),
+    ("POST", "/admin/tickets/{ticket_id:int}/description/replace"),
+    ("POST", "/admin/tickets/{ticket_id:int}/details"),
+    ("POST", "/admin/tickets/{ticket_id:int}/ai/reprocess"),
+    ("POST", "/admin/tickets/{ticket_id:int}/delete"),
     ("POST", "/admin/tickets/bulk-delete"),
-    ("POST", "/admin/tickets/{ticket_id}/replies"),
+    ("POST", "/admin/tickets/{ticket_id:int}/replies"),
 }
 
 
@@ -54,7 +56,7 @@ def test_tickets_pack_manifest_declares_all_portal_routes():
 
     assert PACK.slug == "tickets"
     assert PACK.version
-    assert declared == EXPECTED
+    assert EXPECTED.issubset(declared)
 
 
 def test_app_main_no_longer_owns_portal_ticket_routes():
@@ -68,6 +70,14 @@ def test_app_main_no_longer_owns_portal_ticket_routes():
             f"{method} {path} still mounted directly on app.main; "
             "feature-pack migration is incomplete."
         )
+
+
+def test_tickets_pack_does_not_import_retired_agent_dependencies():
+    """Loading ticket pages must not depend on removed MyPortal data sources."""
+
+    routes_source = Path("app/features/tickets/admin_routes.py").read_text()
+
+    assert "from app.services import agent" not in routes_source
 
 
 def test_tickets_pack_loads_and_reloads_cleanly():

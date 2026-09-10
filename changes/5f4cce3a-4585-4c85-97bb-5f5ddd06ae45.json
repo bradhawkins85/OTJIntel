@@ -1,0 +1,7 @@
+{
+  "guid": "5f4cce3a-4585-4c85-97bb-5f5ddd06ae45",
+  "occurred_at": "2026-09-10T00:00:00Z",
+  "change_type": "Fix",
+  "summary": "Restored portal and admin ticket pages by removing their startup dependency on retired MyPortal agent data sources.",
+  "content_hash": "fc28f3cb8181bac5f9f607db0d021472f9ef3469fe07dd387b56562f056bf453"
+}
