@@ -1987,11 +1987,6 @@ async def _build_base_context(
         module_lookup = {module.get("slug"): module for module in module_list if module.get("slug")}
         request.state.module_lookup = module_lookup
 
-    plausible_module = (module_lookup or {}).get("plausible")
-    if plausible_module:
-        _get_plausible_module_settings._cached_module = plausible_module
-    
-
     context: dict[str, Any] = {
         "request": request,
         "app_name": settings.app_name,

@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi import Request
 
@@ -43,6 +45,40 @@ async def test_register_template_renders_with_public_context():
 
     assert response.status_code == 200
     assert b"Create super administrator" in response.body
+
+
+@pytest.mark.anyio
+async def test_base_context_builds_enabled_plausible_config(monkeypatch):
+    request = _request("/portal")
+    request.state.available_companies = []
+    request.state.module_lookup = {
+        "plausible": {
+            "enabled": True,
+            "settings": {
+                "base_url": "https://analytics.example.com/",
+                "site_domain": "portal.example.com",
+                "track_pageviews": False,
+            },
+        }
+    }
+    monkeypatch.setattr(main.session_manager, "load_session", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "_is_helpdesk_technician", AsyncMock(return_value=False))
+    monkeypatch.setattr(main, "_has_admin_technician_access", AsyncMock(return_value=False))
+    monkeypatch.setattr(main, "_has_issue_tracker_access", AsyncMock(return_value=False))
+    monkeypatch.setattr(main, "_has_marketing_access", AsyncMock(return_value=False))
+    monkeypatch.setattr(main.notifications_repo, "count_notifications", AsyncMock(return_value=0))
+
+    context = await main._build_base_context(
+        request,
+        {"id": 1, "email": "admin@example.com", "is_super_admin": True},
+    )
+
+    assert context["plausible_config"] == {
+        "enabled": True,
+        "base_url": "https://analytics.example.com",
+        "site_domain": "portal.example.com",
+        "track_pageviews": False,
+    }
 
 
 def test_plausible_config_rejects_credential_bearing_url():
