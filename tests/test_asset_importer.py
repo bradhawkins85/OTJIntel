@@ -9,6 +9,30 @@ def anyio_backend():
 
 
 @pytest.mark.anyio
+async def test_import_syncro_assets_does_not_persist_syncro_asset_id(monkeypatch):
+    async def fake_get_company(company_id):
+        return {"id": company_id, "syncro_company_id": "syncro-company"}
+
+    async def fake_get_assets(company_id):
+        return [{"id": 987, "name": "Workstation"}]
+
+    captured: list[dict[str, object]] = []
+
+    async def fake_upsert_asset(**kwargs):
+        captured.append(kwargs)
+        return 42
+
+    monkeypatch.setattr(asset_importer.company_repo, "get_company_by_id", fake_get_company)
+    monkeypatch.setattr(asset_importer.syncro, "get_assets", fake_get_assets)
+    monkeypatch.setattr(asset_importer.syncro, "extract_asset_details", lambda asset: asset)
+    monkeypatch.setattr(asset_importer.assets_repo, "upsert_asset", fake_upsert_asset)
+
+    assert await asset_importer.import_assets_for_company(7) == 1
+    assert "syncro_asset_id" not in captured[0]
+    assert captured[0]["match_name"] is True
+
+
+@pytest.mark.anyio
 async def test_import_tactical_assets_for_company_upserts(monkeypatch):
     company_record = {"id": 7, "tacticalrmm_client_id": "abc"}
     agents = [

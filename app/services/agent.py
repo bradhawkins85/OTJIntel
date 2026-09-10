@@ -1294,14 +1294,13 @@ async def _search_asset_sources(
                    WHERE uc.company_id = a.company_id AND uc.user_id = ?
                ))
           AND (a.name LIKE ? OR a.type LIKE ? OR a.serial_number LIKE ? OR a.status LIKE ?
-               OR a.os_name LIKE ? OR a.last_user LIKE ? OR a.syncro_asset_id LIKE ? OR a.tactical_asset_id LIKE ?)
+               OR a.os_name LIKE ? OR a.last_user LIKE ? OR a.tactical_asset_id LIKE ?)
         ORDER BY COALESCE(a.last_sync, a.name) DESC, a.id DESC
         LIMIT ?
         """,
         (
             1 if is_super_admin else 0,
             user_id,
-            like,
             like,
             like,
             like,

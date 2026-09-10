@@ -188,6 +188,6 @@ The admin UI uses `GET /api/companies/{company_id}/assets` to populate the multi
 * `name` – Display name from the asset catalogue.
 * `serial_number` – Optional serial number used for hardware tracking.
 * `status` – Lifecycle status such as `active` or `retired`.
-* `tactical_asset_id` / `syncro_asset_id` – Identifiers from upstream RMM systems.
+* `tactical_asset_id` – Identifier from the upstream Tactical RMM system.
 
 Assets are only returned for companies that the authenticated user is authorised to manage. Requests from non-super admin accounts receive `403 Forbidden`.
