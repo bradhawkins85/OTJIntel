@@ -117,6 +117,102 @@ class Database:
             statements.append(remaining)
         return statements
 
+    @staticmethod
+    def _split_alter_clauses(sql: str) -> list[str]:
+        """Split an ALTER TABLE body on commas outside quotes/parentheses."""
+        clauses: list[str] = []
+        chars: list[str] = []
+        quote: str | None = None
+        depth = 0
+
+        for char in sql:
+            if quote:
+                chars.append(char)
+                if char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"', "`"}:
+                quote = char
+                chars.append(char)
+            elif char == "(":
+                depth += 1
+                chars.append(char)
+            elif char == ")":
+                depth = max(0, depth - 1)
+                chars.append(char)
+            elif char == "," and depth == 0:
+                clauses.append("".join(chars).strip())
+                chars = []
+            else:
+                chars.append(char)
+
+        if chars:
+            clauses.append("".join(chars).strip())
+        return clauses
+
+    async def _execute_mysql_migration_statement(self, cursor: Any, statement: str) -> None:
+        """Execute SQL, emulating MariaDB's conditional column syntax on MySQL.
+
+        MySQL does not accept ``ADD COLUMN IF NOT EXISTS`` even though MariaDB
+        does.  Migrations use that syntax to remain safe when upgrading an
+        installation whose schema predates migration tracking.  Inspecting the
+        table before issuing each ADD preserves that behavior on both servers.
+        """
+        match = re.match(
+            r"^\s*ALTER\s+TABLE\s+(`?[A-Za-z0-9_]+`?)\s+(.+)$",
+            statement,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match or "IF NOT EXISTS" not in statement.upper():
+            await cursor.execute(statement)
+            return
+
+        table = match.group(1)
+        clauses = self._split_alter_clauses(match.group(2))
+        conditional_column = re.compile(
+            r"^\s*ADD\s+(?:COLUMN\s+)?IF\s+NOT\s+EXISTS\s+"
+            r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        conditional_index = re.compile(
+            r"^\s*ADD\s+(INDEX|KEY)\s+IF\s+NOT\s+EXISTS\s+"
+            r"(`?[A-Za-z0-9_]+`?)\s+(.+)$",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        parsed = [
+            ("column", conditional_column.match(clause))
+            if conditional_column.match(clause)
+            else ("index", conditional_index.match(clause))
+            for clause in clauses
+        ]
+        if not all(clause_match for _, clause_match in parsed):
+            await cursor.execute(statement)
+            return
+
+        for kind, clause_match in parsed:
+            assert clause_match is not None
+            if kind == "column":
+                column = clause_match.group(1)
+                await cursor.execute(
+                    f"SHOW COLUMNS FROM {table} WHERE Field = %s",
+                    (column.strip("`"),),
+                )
+                if await cursor.fetchone() is None:
+                    definition = clause_match.group(2)
+                    await cursor.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
+            else:
+                keyword, index, definition = clause_match.groups()
+                await cursor.execute(
+                    f"SHOW INDEX FROM {table} WHERE Key_name = %s",
+                    (index.strip("`"),),
+                )
+                if await cursor.fetchone() is None:
+                    await cursor.execute(
+                        f"ALTER TABLE {table} ADD {keyword.upper()} {index} {definition}"
+                    )
+
     async def connect(self) -> None:
         if self._pool or self._sqlite_conn:
             return
@@ -513,7 +609,7 @@ class Database:
                 await cursor.execute("SET sql_notes = 0")
                 try:
                     for statement in statements:
-                        await cursor.execute(statement)
+                        await self._execute_mysql_migration_statement(cursor, statement)
                 finally:
                     await cursor.execute("SET sql_notes = 1")
                 await cursor.execute(
