@@ -335,14 +335,17 @@ def test_update_module_preserves_ntfy_auth_token_when_blank(monkeypatch):
     assert result["settings"]["auth_token"] == "********"
 
 
-def test_list_modules_redacts_tacticalrmm_and_ntfy(monkeypatch):
+def test_list_modules_hides_removed_feature_pack_modules(monkeypatch):
     async def fake_list_modules():
-        return [
+        removed = [
             {
-                "slug": "tacticalrmm",
+                "slug": slug,
                 "enabled": True,
-                "settings": {"base_url": "https://rmm.example.com", "api_key": "secret-key"},
-            },
+                "settings": {},
+            }
+            for slug in sorted(modules._REMOVED_FEATURE_PACK_MODULE_SLUGS)
+        ]
+        return removed + [
             {
                 "slug": "ntfy",
                 "enabled": True,
@@ -354,8 +357,8 @@ def test_list_modules_redacts_tacticalrmm_and_ntfy(monkeypatch):
 
     module_list = asyncio.run(modules.list_modules())
 
-    assert module_list[0]["settings"]["api_key"] == "********"
-    assert module_list[1]["settings"]["auth_token"] == "********"
+    assert [module["slug"] for module in module_list] == ["ntfy"]
+    assert module_list[0]["settings"]["auth_token"] == "********"
 
 
 def test_invoke_ollama_uses_default_model_when_blank(monkeypatch):

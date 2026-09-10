@@ -1210,6 +1210,30 @@ _ALWAYS_ON_TICKET_ACTION_MODULES_BY_SLUG = {
     module["slug"]: module for module in _ALWAYS_ON_TICKET_ACTION_MODULES
 }
 
+# Integration records can outlive the feature pack that provided their UI and
+# routes.  Keep those records in the database for upgrade/rollback safety, but
+# do not expose orphaned integrations in the modules dashboard or API.
+_REMOVED_FEATURE_PACK_MODULE_SLUGS = frozenset(
+    {
+        "call-recordings",
+        "calls",
+        "hudu",
+        "huntress",
+        "m365-admin",
+        "matrix-chat-assign",
+        "password-pusher",
+        "plausible",
+        "receive-sms",
+        "sms-gateway",
+        "solidtime",
+        "syncro",
+        "tacticalrmm",
+        "uptimekuma",
+        "voice-monitor",
+        "xero",
+    }
+)
+
 
 def _normalise_slug(value: str | None) -> str:
     return str(value or "").strip()
@@ -1217,6 +1241,16 @@ def _normalise_slug(value: str | None) -> str:
 
 def _is_always_on_ticket_action_module(slug: str) -> bool:
     return _normalise_slug(slug) in _ALWAYS_ON_TICKET_ACTION_MODULE_SLUGS
+
+
+def _is_visible_in_module_admin(slug: str) -> bool:
+    """Return whether a persisted integration still has a supported UI."""
+
+    normalised_slug = _normalise_slug(slug)
+    return (
+        normalised_slug not in _ALWAYS_ON_TICKET_ACTION_MODULE_SLUGS
+        and normalised_slug not in _REMOVED_FEATURE_PACK_MODULE_SLUGS
+    )
 
 
 def _get_always_on_ticket_action_module(slug: str) -> dict[str, Any] | None:
@@ -2334,7 +2368,7 @@ async def list_modules() -> list[dict[str, Any]]:
     return [
         _redact_module_settings(_resolve_module_for_runtime(module))
         for module in modules
-        if not _is_always_on_ticket_action_module(str(module.get("slug") or ""))
+        if _is_visible_in_module_admin(str(module.get("slug") or ""))
     ]
 
 
