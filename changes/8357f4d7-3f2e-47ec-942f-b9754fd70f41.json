@@ -1,0 +1,7 @@
+{
+  "guid": "8357f4d7-3f2e-47ec-942f-b9754fd70f41",
+  "occurred_at": "2026-09-10T05:00Z",
+  "change_type": "Fix",
+  "summary": "Corrected conditional foreign key syntax to prevent MySQL migration failures during application startup.",
+  "content_hash": "4c500f3563a7d98862b7a79e49676f0712fd5a7d6fb0a7f62538851d3e739c18"
+}
