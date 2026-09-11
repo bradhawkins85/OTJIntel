@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% from "macros/header.html" import page_header_actions %}
+{% block header_title %}Dropbox import{% endblock %}
+{% block header_actions %}{{ page_header_actions([{"label": "API documentation", "href": "/docs#/Dropbox%20Import"}]) }}{% endblock %}
+{% block content %}
+<div class="management" data-layout>
+  <aside class="management__sidebar">
+    <section class="card card--panel">
+      <h2>Connect Dropbox</h2>
+      <p class="muted">Create a scoped Dropbox app, then enter its credentials. Secrets are encrypted at rest.</p>
+      {% if error_message %}<div class="alert alert--error" role="alert">{{ error_message }}</div>{% endif %}
+      {% if sync_result %}<div class="alert alert--success" role="status">Created {{ sync_result.created }}, skipped {{ sync_result.skipped }}, failed {{ sync_result.failed }}.</div>{% endif %}
+      <form method="post" action="/admin/modules/dropbox/connections" class="form-stack">
+        {% include "partials/csrf.html" %}
+        <label class="form-label">Name<input class="input" name="name" maxlength="255" required placeholder="Support recordings"></label>
+        <label class="form-label">Dropbox app key<input class="input" name="appKey" maxlength="255" required autocomplete="off"></label>
+        <label class="form-label">Dropbox app secret<input class="input" name="appSecret" type="password" maxlength="1024" required autocomplete="new-password"></label>
+        <label class="form-label">Main folder path<input class="input" name="rootPath" maxlength="1024" placeholder="/Ticket Imports"></label>
+        <label class="checkbox"><input type="checkbox" name="active" checked> Enable imports</label>
+        <button class="button button--primary" type="submit">Save configuration</button>
+      </form>
+    </section>
+  </aside>
+  <section class="management__content">
+    <section class="card card--panel">
+      <h2>Connections</h2>
+      <div class="table-wrapper">
+        <table class="table" id="dropbox-connections-table" data-table data-table-id="dropbox-connections">
+          <thead><tr><th data-sort="string">Name</th><th data-sort="string">Account</th><th data-sort="string">Folder</th><th data-sort="string">Status</th><th>Actions</th></tr></thead>
+          <tbody>{% for connection in connections %}<tr>
+            <td data-label="Name"><strong>{{ connection.name }}</strong></td>
+            <td data-label="Account">{{ connection.account_email or 'Not connected' }}</td>
+            <td data-label="Folder"><code>{{ connection.root_path or '/' }}</code></td>
+            <td data-label="Status"><span class="badge {{ 'badge--success' if connection.connected and connection.active else 'badge--warning' }}">{{ 'Ready' if connection.connected and connection.active else ('Disabled' if not connection.active else 'Authorization required') }}</span></td>
+            <td class="table__actions">
+              <a class="button button--secondary" href="/admin/modules/dropbox/connections/{{ connection.id }}/authorize">{{ 'Reconnect' if connection.connected else 'Connect' }}</a>
+              <form class="inline-form" method="post" action="/admin/modules/dropbox/connections/{{ connection.id }}/sync">{% include "partials/csrf.html" %}<button class="button button--primary" {% if not connection.connected or not connection.active %}disabled{% endif %}>Import now</button></form>
+              <form class="inline-form" method="post" action="/admin/modules/dropbox/connections/{{ connection.id }}/delete" onsubmit="return confirm('Delete this Dropbox connection and its import history?')">{% include "partials/csrf.html" %}<button class="button button--danger">Delete</button></form>
+            </td>
+          </tr>{% else %}<tr><td colspan="5">No Dropbox connections configured.</td></tr>{% endfor %}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="card card--panel">
+      <h2>Import history</h2>
+      <div class="table-wrapper"><table class="table" id="dropbox-history-table" data-table data-table-id="dropbox-history">
+        <thead><tr><th data-sort="string">Requester</th><th data-sort="string">Subject</th><th data-sort="string">Status</th><th data-sort="number">Ticket</th><th data-sort="date">Imported</th></tr></thead>
+        <tbody>{% for connection in connections %}{% for item in import_history.get(connection.id, []) %}<tr><td>{{ item.requester_email }}</td><td>{{ item.subject }}{% if item.error_message %}<small class="form-help">{{ item.error_message }}</small>{% endif %}</td><td><span class="badge {{ 'badge--success' if item.status == 'completed' else 'badge--danger' }}">{{ item.status }}</span></td><td>{% if item.ticket_id %}<a href="/admin/tickets/{{ item.ticket_id }}">#{{ item.ticket_id }}</a>{% else %}—{% endif %}</td><td><time data-utc="{{ item.imported_at }}">{{ item.imported_at }}</time></td></tr>{% endfor %}{% endfor %}</tbody>
+      </table></div>
+    </section>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}{{ super() }}<script src="{{ static_url('/static/js/tables.js') }}" defer></script><script>document.querySelectorAll('[data-utc]').forEach(function(el){var raw=el.dataset.utc||'';if(raw&&!/[zZ]|[+-]\d\d:\d\d$/.test(raw)){raw=raw.replace(' ','T')+'Z';}var date=new Date(raw);if(!isNaN(date)){el.textContent=date.toLocaleString();el.dateTime=date.toISOString();}});</script>{% endblock %}
