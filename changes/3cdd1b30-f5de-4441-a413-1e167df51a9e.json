@@ -1,0 +1,7 @@
+{
+  "guid": "3cdd1b30-f5de-4441-a413-1e167df51a9e",
+  "occurred_at": "2026-09-11T00:00:00Z",
+  "change_type": "Fix",
+  "summary": "Restored company deletion by removing cleanup for the retired invoices table.",
+  "content_hash": "9fc242d78a8c1d83d226a2697f9b7735c8d4970e8123bead8606e82272e1e379"
+}
