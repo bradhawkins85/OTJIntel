@@ -263,83 +263,6 @@
               </a>
             </li>
           {% endif %}
-          {% if can_manage_licenses %}
-            {% set m365_active = current_path.startswith('/m365') or current_path.startswith('/licenses') %}
-            <li class="menu__item menu__item--expandable {% if m365_active %}menu__item--expanded{% endif %}" data-menu-key="/m365">
-              <button class="menu__toggle" type="button" data-menu-toggle aria-expanded="{% if m365_active %}true{% else %}false{% endif %}">
-                <span class="menu__icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><path d="M21 3H3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-9 13-5-5 1.41-1.41L12 13.17l7.59-7.59L21 7z"/></svg>
-                </span>
-                <span class="menu__label">Office 365</span>
-                <span class="menu__expand-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><path d="M7 10l5 5 5-5z"/></svg>
-                </span>
-              </button>
-              <ul class="menu__submenu {% if m365_active %}menu__submenu--expanded{% endif %}">
-                {% if can_access_m365_configuration %}
-                <li class="menu__subitem">
-                  <a href="/m365" {% if current_path == '/m365' %}aria-current="page"{% endif %}>Configuration</a>
-                </li>
-                {% endif %}
-                {% if can_view_m365_best_practices %}
-                <li class="menu__subitem">
-                  <a href="/m365/best-practices" {% if current_path.startswith('/m365/best-practices') %}aria-current="page"{% endif %}>Best Practices</a>
-                </li>
-                {% endif %}
-                {% if can_view_m365_user_mailboxes %}
-                <li class="menu__subitem">
-                  <a href="/m365/mailboxes/users" {% if current_path.startswith('/m365/mailboxes/users') %}aria-current="page"{% endif %}>User Mailboxes</a>
-                </li>
-                {% endif %}
-                {% if can_view_m365_shared_mailboxes %}
-                <li class="menu__subitem">
-                  <a href="/m365/mailboxes/shared" {% if current_path.startswith('/m365/mailboxes/shared') %}aria-current="page"{% endif %}>Shared Mailboxes</a>
-                </li>
-                {% endif %}
-                {% if can_access_m365_licenses %}
-                <li class="menu__subitem">
-                  <a href="/licenses" {% if current_path.startswith('/licenses') %}aria-current="page"{% endif %}>Licenses</a>
-                </li>
-                {% endif %}
-                {% if can_access_m365_diagnostics %}
-                <li class="menu__subitem">
-                  <a href="/m365/diagnostics" {% if current_path.startswith('/m365/diagnostics') %}aria-current="page"{% endif %}>Diagnostics</a>
-                </li>
-                {% endif %}
-              </ul>
-            </li>
-          {% endif %}
-          {% if not can_manage_licenses and (can_view_m365_best_practices or can_view_m365_user_mailboxes or can_view_m365_shared_mailboxes) %}
-            {% set m365_active = current_path.startswith('/m365/best-practices') or current_path.startswith('/m365/mailboxes') %}
-            <li class="menu__item menu__item--expandable {% if m365_active %}menu__item--expanded{% endif %}" data-menu-key="/m365">
-              <button class="menu__toggle" type="button" data-menu-toggle aria-expanded="{% if m365_active %}true{% else %}false{% endif %}">
-                <span class="menu__icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><path d="M21 3H3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-9 13-5-5 1.41-1.41L12 13.17l7.59-7.59L21 7z"/></svg>
-                </span>
-                <span class="menu__label">Office 365</span>
-                <span class="menu__expand-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><path d="M7 10l5 5 5-5z"/></svg>
-                </span>
-              </button>
-              <ul class="menu__submenu {% if m365_active %}menu__submenu--expanded{% endif %}">
-                {% if can_view_m365_best_practices %}
-                <li class="menu__subitem">
-                  <a href="/m365/best-practices" {% if current_path.startswith('/m365/best-practices') %}aria-current="page"{% endif %}>Best Practices</a>
-                </li>
-                {% endif %}
-                {% if can_view_m365_user_mailboxes %}
-                <li class="menu__subitem">
-                  <a href="/m365/mailboxes/users" {% if current_path.startswith('/m365/mailboxes/users') %}aria-current="page"{% endif %}>User Mailboxes</a>
-                </li>
-                {% endif %}
-                {% if can_view_m365_shared_mailboxes %}
-                <li class="menu__subitem">
-                  <a href="/m365/mailboxes/shared" {% if current_path.startswith('/m365/mailboxes/shared') %}aria-current="page"{% endif %}>Shared Mailboxes</a>
-                </li>
-                {% endif %}
-              </ul>
-            </li>
-          {% endif %}
           {% if can_access_voice_monitor and 'voice-monitor' in (enabled_module_slugs | default([])) %}
             <li class="menu__item" data-module-slug="voice-monitor">
               <a href="/voice-monitor" {% if current_path.startswith('/voice-monitor') %}aria-current="page"{% endif %}>
@@ -454,16 +377,6 @@
                 <span class="menu__label">Calls</span>
               </a>
             </li>{% endif %}
-            {% if can_access_admin_backup_summary %}
-              <li class="menu__item">
-                <a href="/admin/backup-summary" {% if current_path.startswith('/admin/backup-summary') %}aria-current="page"{% endif %}>
-                  <span class="menu__icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" focusable="false"><path d="M3 3h18v4H3zm0 6h18v4H3zm0 6h18v4H3z"/></svg>
-                  </span>
-                  <span class="menu__label">Backup Summary</span>
-                </a>
-              </li>
-            {% endif %}
             {% if is_super_admin %}
               <li class="menu__item">
                 <a href="/admin/users" {% if current_path.startswith('/admin/users') %}aria-current="page"{% endif %}>
@@ -530,14 +443,6 @@
                 </a>
               </li>
               <li class="menu__item">
-                <a href="/admin/backup-jobs" {% if current_path.startswith('/admin/backup-jobs') %}aria-current="page"{% endif %}>
-                  <span class="menu__icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" focusable="false"><path d="M12 3a8 4 0 0 1 8 4v10a8 4 0 0 1-16 0V7a8 4 0 0 1 8-4zm-6 4c0 1.1 2.69 2 6 2s6-.9 6-2-2.69-2-6-2-6 .9-6 2zm0 3.5V13c0 1.1 2.69 2 6 2s6-.9 6-2v-2.5c-1.36.95-3.7 1.5-6 1.5s-4.64-.55-6-1.5zm0 4.5v2c0 1.1 2.69 2 6 2s6-.9 6-2v-2c-1.36.95-3.7 1.5-6 1.5s-4.64-.55-6-1.5z"/></svg>
-                  </span>
-                  <span class="menu__label">Backup History</span>
-                </a>
-              </li>
-              <li class="menu__item">
                 <a href="/admin/message-templates" {% if current_path.startswith('/admin/message-templates') %}aria-current="page"{% endif %}>
                   <span class="menu__icon" aria-hidden="true">
                     <svg viewBox="0 0 24 24" focusable="false"><path d="M4 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v16l-4-3-4 3-4-3-4 3z"/><path d="M7 6h10v2H7zm0 4h10v2H7zm0 4h6v2H7z"/></svg>
@@ -559,14 +464,6 @@
                     <svg viewBox="0 0 24 24" focusable="false"><path d="M4 3h16a1 1 0 0 1 1 1v17h-6v-6h-6v6H3V4a1 1 0 0 1 1-1zm7 17v-4h2v4h3v-6h2V5H6v9h2v6z"/></svg>
                   </span>
                   <span class="menu__label">Companies</span>
-                </a>
-              </li>
-              <li class="menu__item">
-                <a href="/admin/tray/configurations" {% if current_path.startswith('/admin/tray') %}aria-current="page"{% endif %}>
-                  <span class="menu__icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" focusable="false"><path d="M8 2h8v2H8zm6 4a4 4 0 0 1 4 4v1h1a3 3 0 0 1 0 6h-1v1a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4v-1H5a3 3 0 0 1 0-6h1v-1a4 4 0 0 1 4-4zm-4 2a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2zm2 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/></svg>
-                  </span>
-                  <span class="menu__label">Tray Settings</span>
                 </a>
               </li>
               <li class="menu__item">
