@@ -283,16 +283,6 @@
               </a>
             </li>
           {% endif %}
-          {% if can_view_compliance %}
-            <li class="menu__item">
-              <a href="/compliance" {% if current_path.startswith('/compliance') and not current_path.startswith('/compliance-checks') %}aria-current="page"{% endif %}>
-                <span class="menu__icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><path d="M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg>
-                </span>
-                <span class="menu__label">Compliance</span>
-              </a>
-            </li>
-          {% endif %}
           {% if can_access_reports %}
           <li class="menu__item">
             <a href="/reports/company-overview" {% if current_path.startswith('/reports') %}aria-current="page"{% endif %}>

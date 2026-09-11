@@ -55,9 +55,6 @@ MyPortal combines customer operations, service delivery workflows, and integrati
 ### BCP
 <img width="1393" height="1238" alt="image" src="https://github.com/user-attachments/assets/5a768d47-82c9-413b-85b5-427b64ff398d" />
 
-### Essential 8 Compliance
-<img width="1385" height="1053" alt="image" src="https://github.com/user-attachments/assets/3074d95d-e695-4ca8-a096-a9eb152b6bb9" />
-
 ### Backup Reporting
 <img width="1394" height="1240" alt="image" src="https://github.com/user-attachments/assets/356e1632-efa5-409d-92e3-606ecc00d9dd" />
 

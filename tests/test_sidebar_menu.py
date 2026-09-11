@@ -388,18 +388,14 @@ def test_bcp_menu_replaces_business_continuity(company_admin_context):
     assert response.status_code == 200
     html = response.text
 
-    # Compliance remains available and BCP has replaced the legacy menu
-    assert 'href="/compliance"' in html
+    # Essential 8 compliance is retired and BCP has replaced the legacy menu.
+    assert 'href="/compliance"' not in html
     assert 'href="/bcp"' in html
     assert '/business-continuity/' not in html
 
-    # BCP should appear after Compliance in the menu ordering
-    compliance_pos = html.find('href="/compliance"')
     bcp_pos = html.find('href="/bcp"')
 
-    assert compliance_pos > 0, "Compliance menu not found"
     assert bcp_pos > 0, "BCP menu not found"
-    assert bcp_pos > compliance_pos, "BCP should appear after Compliance in the menu"
 
 
 @pytest.fixture

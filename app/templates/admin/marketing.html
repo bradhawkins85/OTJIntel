@@ -1,15 +1,5 @@
 {% extends "base.html" %}
-{% from "macros/header.html" import page_header_actions %}
-
 {% block header_title %}Marketing pages{% endblock %}
-
-{% block header_actions %}
-  {% if is_super_admin %}
-    {{ page_header_actions([
-      {"label": "Essential 8 help links", "type": "link", "href": "/admin/marketing/essential8-help-links", "variant": "ghost"}
-    ]) }}
-  {% endif %}
-{% endblock %}
 
 {% block content %}
 <div class="admin-grid">
