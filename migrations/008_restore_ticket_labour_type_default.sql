@@ -17,5 +17,11 @@ WHERE id = (
   ) AS first_labour_type
 )
 AND NOT EXISTS (
-  SELECT 1 FROM ticket_labour_types WHERE is_default = 1
+  SELECT 1
+  FROM (
+    SELECT 1 AS default_exists
+    FROM ticket_labour_types
+    WHERE is_default = 1
+    LIMIT 1
+  ) AS existing_labour_type_defaults
 );
