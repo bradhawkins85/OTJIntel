@@ -1,0 +1,7 @@
+{
+  "guid": "d7b50dfd-2f16-43a9-be89-6237f2c48234",
+  "occurred_at": "2026-09-11T00:00:00Z",
+  "change_type": "Fix",
+  "summary": "Repaired ticket status configuration migrations so the admin tickets page loads on SQLite and previously affected databases.",
+  "content_hash": "46242ecf1dac0ca03904d3fb7fb773024dc6abdaea0d5a00b26c4281b5997758"
+}
