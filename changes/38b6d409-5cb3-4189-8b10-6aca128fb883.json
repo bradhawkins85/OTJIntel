@@ -1,0 +1,7 @@
+{
+  "guid": "38b6d409-5cb3-4189-8b10-6aca128fb883",
+  "occurred_at": "2026-09-11T00:00Z",
+  "change_type": "Feature",
+  "summary": "Added default Staff Invitation and Email Verification message templates to automatic installation and upgrade migrations.",
+  "content_hash": "b310a8b0540315485ad667f0c9a8046f4050834fbb74676f67c0f5d756ab6845"
+}
