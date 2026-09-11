@@ -326,6 +326,7 @@ async def test_delete_company_clears_child_records(monkeypatch):
     # The final statement must delete the company itself.
     assert executed[-1] == "DELETE FROM companies WHERE id = %s"
     assert not any("voice_monitor_" in statement for statement in executed)
+    assert not any("invoices" in statement for statement in executed)
 
     # All non-CASCADE child tables must be handled before the company row is removed.
     expected_prefixes = [
@@ -334,7 +335,6 @@ async def test_delete_company_clears_child_records(monkeypatch):
         "DELETE FROM assets",
         "DELETE FROM staff",
         "DELETE FROM licenses",
-        "DELETE FROM invoices",
         "DELETE FROM company_app_prices",
         "DELETE FROM office_groups",
         "DELETE FROM user_companies",

@@ -296,8 +296,6 @@ async def delete_company(company_id: int) -> None:
     await db.execute("DELETE FROM staff WHERE company_id = %s", (company_id,))
     # Remove licenses after staff (and therefore staff_licenses) are gone.
     await db.execute("DELETE FROM licenses WHERE company_id = %s", (company_id,))
-    # invoice_lines and related rows cascade when invoices are deleted.
-    await db.execute("DELETE FROM invoices WHERE company_id = %s", (company_id,))
     await db.execute(
         "DELETE FROM company_app_prices WHERE company_id = %s", (company_id,)
     )
