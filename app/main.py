@@ -1871,6 +1871,35 @@ def _build_plausible_config(
     return config
 
 
+def _build_module_lookup(module_list: Iterable[Any]) -> dict[str, Mapping[str, Any]]:
+    """Index valid integration-module records without trusting database data.
+
+    A malformed ``slug`` value (for example a decoded JSON object) is not
+    hashable and previously caused every page using the shared template
+    context to fail with ``TypeError: unhashable type: 'dict'``.  Ignore
+    malformed records here so one damaged integration row cannot take down
+    otherwise unrelated pages.
+    """
+
+    module_lookup: dict[str, Mapping[str, Any]] = {}
+    for module in module_list:
+        if not isinstance(module, Mapping):
+            log_error(
+                "Ignoring malformed integration module record",
+                record_type=type(module).__name__,
+            )
+            continue
+        slug = module.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            log_error(
+                "Ignoring integration module with invalid slug",
+                slug_type=type(slug).__name__,
+            )
+            continue
+        module_lookup[slug] = module
+    return module_lookup
+
+
 async def _build_base_context(
     request: Request,
     user: dict[str, Any],
@@ -1986,7 +2015,7 @@ async def _build_base_context(
         except Exception as exc:  # pragma: no cover - defensive logging
             log_error("Failed to load integration modules for context", error=str(exc))
             module_list = []
-        module_lookup = {module.get("slug"): module for module in module_list if module.get("slug")}
+        module_lookup = _build_module_lookup(module_list)
         request.state.module_lookup = module_lookup
 
     context: dict[str, Any] = {
