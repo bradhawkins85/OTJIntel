@@ -313,6 +313,109 @@
     });
   }
 
+  function initialiseAssetCreation() {
+    const modal = document.getElementById('create-asset-modal');
+    const form = document.querySelector('[data-create-asset-form]');
+    const triggers = document.querySelectorAll('[data-create-asset-open]');
+    if (!modal || !form || triggers.length === 0) {
+      return;
+    }
+
+    const errorElement = form.querySelector('[data-create-asset-error]');
+    const submitButton = form.querySelector('[data-create-asset-submit]');
+    let returnFocus = null;
+
+    function closeModal() {
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+      document.body.classList.remove('modal-open');
+      form.reset();
+      if (errorElement) {
+        errorElement.hidden = true;
+        errorElement.textContent = '';
+      }
+      if (returnFocus instanceof HTMLElement) {
+        returnFocus.focus();
+      }
+    }
+
+    function openModal(trigger) {
+      returnFocus = trigger;
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+      document.body.classList.add('modal-open');
+      form.querySelector('[name="name"]')?.focus();
+    }
+
+    triggers.forEach((trigger) => trigger.addEventListener('click', () => openModal(trigger)));
+    modal.querySelectorAll('[data-create-asset-close]').forEach((button) => {
+      button.addEventListener('click', closeModal);
+    });
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) {
+        closeModal();
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !modal.hidden) {
+        closeModal();
+      }
+    });
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (!form.reportValidity()) {
+        return;
+      }
+      const formData = new FormData(form);
+      const numericFields = new Set(['ram_gb', 'approx_age', 'performance_score']);
+      const payload = {};
+      formData.forEach((value, key) => {
+        const text = String(value).trim();
+        if (!text) {
+          return;
+        }
+        if (numericFields.has(key)) {
+          payload[key] = Number(text);
+        } else if (key === 'boot_time') {
+          payload[key] = new Date(text).toISOString();
+        } else {
+          payload[key] = text;
+        }
+      });
+
+      if (submitButton) submitButton.disabled = true;
+      if (errorElement) errorElement.hidden = true;
+      try {
+        const response = await fetch('/assets', {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': getCsrfToken(),
+          },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const result = await response.json().catch(() => ({}));
+          const detail = Array.isArray(result.detail)
+            ? result.detail.map((item) => item.msg).join(' ')
+            : result.detail;
+          throw new Error(detail || 'Unable to create the asset.');
+        }
+        const asset = await response.json();
+        window.location.assign(`/assets#asset-${encodeURIComponent(asset.id)}`);
+      } catch (error) {
+        if (errorElement) {
+          errorElement.textContent = error.message || 'Unable to create the asset.';
+          errorElement.hidden = false;
+        }
+      } finally {
+        if (submitButton) submitButton.disabled = false;
+      }
+    });
+  }
+
   function initialiseCustomFieldsEditing() {
     const modal = document.getElementById('asset-fields-modal');
     const form = document.querySelector('[data-asset-fields-form]');
@@ -508,6 +611,7 @@
     initialiseColumnControls(table);
     initialiseCsvExport(table);
     initialiseDeletion(table);
+    initialiseAssetCreation();
     initialiseTrayChat();
     initialiseCustomFieldsEditing();
     updateVisibleCount(table);

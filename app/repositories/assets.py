@@ -61,6 +61,41 @@ async def delete_asset(asset_id: int) -> None:
     await db.execute("DELETE FROM assets WHERE id = %s", (asset_id,))
 
 
+async def create_asset(*, company_id: int, values: dict[str, Any]) -> int:
+    """Create a manual asset without invoking importer upsert matching."""
+    return await db.execute_returning_lastrowid(
+        """
+        INSERT INTO assets (
+            company_id, name, type, machine_type, serial_number, status,
+            os_name, cpu_name, ram_gb, hdd_size, boot_time,
+            motherboard_manufacturer, form_factor, last_user, approx_age,
+            performance_score, warranty_status, warranty_end_date, mac_address
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            company_id,
+            values["name"],
+            values.get("type"),
+            values.get("machine_type"),
+            values.get("serial_number"),
+            values.get("status"),
+            values.get("os_name"),
+            values.get("cpu_name"),
+            values.get("ram_gb"),
+            values.get("hdd_size"),
+            _to_mysql_datetime(values.get("boot_time")),
+            values.get("motherboard_manufacturer"),
+            values.get("form_factor"),
+            values.get("last_user"),
+            values.get("approx_age"),
+            values.get("performance_score"),
+            values.get("warranty_status"),
+            _to_mysql_date(values.get("warranty_end_date")),
+            values.get("mac_address"),
+        ),
+    )
+
+
 def _ensure_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None

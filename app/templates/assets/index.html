@@ -9,10 +9,12 @@
 {% block header_actions %}
   {% from "macros/header.html" import page_header_actions %}
   {% set asset_actions = [] %}
+  {% if can_create_assets %}
+    {% set _ = asset_actions.append({"label": "Create Asset", "type": "button", "attrs": {"data-create-asset-open": "", "aria-haspopup": "dialog", "aria-controls": "create-asset-modal"}}) %}
+  {% endif %}
   {% if is_super_admin %}
     {% set _ = asset_actions.append({"label": "Settings", "type": "link", "href": "/assets/settings"}) %}
   {% endif %}
-  {% set _ = asset_actions.append({"label": "Network devices", "type": "link", "href": "/devices"}) %}
   {{ page_header_actions(asset_actions) }}
 {% endblock %}
 
@@ -296,6 +298,67 @@
     {% endif %}
   </section>
 </div>
+
+{% if can_create_assets %}
+<div class="modal" id="create-asset-modal" role="dialog" aria-modal="true" aria-labelledby="create-asset-title" aria-hidden="true" hidden>
+  <div class="modal__content modal__content--large" role="document">
+    <button type="button" class="modal__close" data-create-asset-close aria-label="Close create asset form">&times;</button>
+    <h2 class="modal__title" id="create-asset-title">Create Asset</h2>
+    <p class="modal__subtitle">Add an asset directly to {{ company.name if company else 'the active company' }}.</p>
+    <form class="form" data-create-asset-form novalidate>
+      <div class="form-grid">
+        {% set fields = [
+          ('name', 'Name', 'text', true, '255'),
+          ('type', 'Type', 'text', false, '100'),
+          ('machine_type', 'Machine type', 'text', false, '255'),
+          ('serial_number', 'Serial number', 'text', false, '255'),
+          ('status', 'Status', 'text', false, '100'),
+          ('os_name', 'OS name', 'text', false, '255'),
+          ('cpu_name', 'CPU', 'text', false, '255'),
+          ('hdd_size', 'Storage', 'text', false, '100'),
+          ('motherboard_manufacturer', 'Motherboard manufacturer', 'text', false, '255'),
+          ('form_factor', 'Form factor', 'text', false, '100'),
+          ('last_user', 'Last user', 'text', false, '255'),
+          ('warranty_status', 'Warranty status', 'text', false, '100'),
+          ('mac_address', 'MAC address', 'text', false, '64')
+        ] %}
+        {% for name, label, input_type, required, maxlength in fields %}
+          <div class="form-field">
+            <label class="form-label" for="create-asset-{{ name }}">{{ label }}{% if required %} <span aria-hidden="true">*</span>{% endif %}</label>
+            <input id="create-asset-{{ name }}" name="{{ name }}" type="{{ input_type }}" class="form-input" maxlength="{{ maxlength }}" {% if required %}required{% endif %} />
+          </div>
+        {% endfor %}
+        <div class="form-field">
+          <label class="form-label" for="create-asset-ram">RAM (GB)</label>
+          <input id="create-asset-ram" name="ram_gb" type="number" class="form-input" min="0" step="0.01" />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="create-asset-age">Approximate age (years)</label>
+          <input id="create-asset-age" name="approx_age" type="number" class="form-input" min="0" step="0.1" />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="create-asset-performance">Performance score</label>
+          <input id="create-asset-performance" name="performance_score" type="number" class="form-input" min="0" step="0.01" />
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="create-asset-boot-time">Boot time</label>
+          <input id="create-asset-boot-time" name="boot_time" type="datetime-local" class="form-input" />
+          <p class="form-help">Interpreted in your local timezone and stored as UTC.</p>
+        </div>
+        <div class="form-field">
+          <label class="form-label" for="create-asset-warranty-end">Warranty end date</label>
+          <input id="create-asset-warranty-end" name="warranty_end_date" type="date" class="form-input" />
+        </div>
+      </div>
+      <p class="alert alert--danger" data-create-asset-error role="alert" hidden></p>
+      <footer class="modal__footer">
+        <button type="button" class="button button--ghost" data-create-asset-close>Cancel</button>
+        <button type="submit" class="button button--primary" data-create-asset-submit>Create Asset</button>
+      </footer>
+    </form>
+  </div>
+</div>
+{% endif %}
 
 <!-- Edit Asset Custom Fields Modal -->
 <div class="modal" id="asset-fields-modal" style="display: none;">
