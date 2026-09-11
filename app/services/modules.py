@@ -933,6 +933,13 @@ DEFAULT_MODULES: list[dict[str, Any]] = [
         },
     },
     {
+        "slug": "dropbox",
+        "name": "Dropbox Ticket Import",
+        "description": "Import recording folders from Dropbox as tickets and attachments.",
+        "icon": "📦",
+        "settings": {"manage_url": "/admin/modules/dropbox"},
+    },
+    {
         "slug": "tacticalrmm",
         "name": "Tactical RMM",
         "description": "Call Tactical RMM webhook endpoints for automation actions.",
@@ -1746,6 +1753,9 @@ def _coerce_settings(
         manage_url = (
             str(merged.get("manage_url") or "").strip() or "/admin/modules/m365-mail"
         )
+        merged.update({"manage_url": manage_url})
+    elif slug == "dropbox":
+        manage_url = str(merged.get("manage_url") or "").strip() or "/admin/modules/dropbox"
         merged.update({"manage_url": manage_url})
     elif slug == "chatgpt-mcp":
         overrides = payload or {}

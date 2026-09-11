@@ -38,6 +38,7 @@ ALLOWED_MIME_TYPES = {
     "application/vnd.ms-powerpoint",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "text/plain",
+    "text/markdown",
     "text/csv",
     # Images (raster only — SVG excluded due to script-injection risk)
     "image/jpeg",
@@ -62,6 +63,7 @@ ALLOWED_MIME_TYPES = {
     "audio/webm",
     "audio/mp4",
     "audio/x-m4a",
+    "application/x-m4a",
     # Video (safe binary media)
     "video/mp4",
     "video/mpeg",
