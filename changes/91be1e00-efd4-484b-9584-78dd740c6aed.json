@@ -1,0 +1,7 @@
+{
+  "guid": "91be1e00-efd4-484b-9584-78dd740c6aed",
+  "occurred_at": "2026-09-11T00:00:00Z",
+  "change_type": "feature",
+  "summary": "Added secure manual asset creation from the Assets action menu and removed its Network devices shortcut.",
+  "content_hash": "27a307ef929ae929e75ed3e707653b4212912920b6cead670b765e076d8ae3b5"
+}

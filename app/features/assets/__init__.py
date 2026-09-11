@@ -3,6 +3,7 @@
 Owns the assets pages and delete endpoint:
 
 * ``GET /assets``
+* ``POST /assets``
 * ``GET /assets/settings``
 * ``GET /assets/{asset_id}``
 * ``DELETE /assets/{asset_id}``
@@ -20,7 +21,7 @@ from .routes import router as assets_router
 
 PACK = FeaturePack(
     slug="assets",
-    version="1.1.1",
+    version="1.2.0",
     routers=(assets_router,),
 )
 
