@@ -1,0 +1,7 @@
+{
+  "guid": "cd650cbd-e5df-4c03-80e6-19751434d247",
+  "occurred_at": "2026-09-11T00:00Z",
+  "change_type": "Fix",
+  "summary": "Removed Office 365, backup summary, backup history, and tray settings links from the left navigation menu.",
+  "content_hash": "34255a355ad0c944b46f2359c476115980420a53d9881b1622305759f929b2eb"
+}

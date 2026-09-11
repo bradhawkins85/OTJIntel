@@ -134,7 +134,10 @@ def test_sidebar_template_does_not_link_to_removed_pages():
     template = Path("app/templates/base.html").read_text()
 
     removed_paths = {
+        "/admin/backup-jobs",
+        "/admin/backup-summary",
         "/admin/marketing",
+        "/admin/tray/configurations",
         "/shop",
         "/quotes",
         "/orders",
@@ -143,87 +146,17 @@ def test_sidebar_template_does_not_link_to_removed_pages():
         "/defender",
         "/subscriptions",
         "/invoices",
+        "/licenses",
         "/dmarc",
+        "/m365",
+        "/m365/best-practices",
+        "/m365/diagnostics",
+        "/m365/mailboxes/shared",
+        "/m365/mailboxes/users",
     }
 
     for path in removed_paths:
         assert f'href="{path}"' not in template
-
-
-def test_m365_menu_item_has_data_menu_key(monkeypatch):
-    """Office 365 expandable menu item must have data-menu-key so it appears in left menu customisation."""
-    user = {"id": 1, "email": "admin@example.com", "is_super_admin": False}
-    membership = {
-        "company_id": 10,
-        "is_admin": True,
-        "can_access_shop": False,
-        "can_access_cart": False,
-        "can_access_orders": False,
-        "can_access_forms": False,
-        "can_manage_assets": False,
-        "can_manage_licenses": True,
-        "can_manage_invoices": False,
-        "can_manage_issues": False,
-        "can_manage_staff": False,
-        "can_view_compliance": False,
-        "staff_permission": 2,
-    }
-
-    async def fake_require_user(request):
-        return user, None
-
-    async def fake_overview(request, current_user):
-        return {"unread_notifications": 0}
-
-    async def fake_run_system_update(*, force_restart: bool = False):
-        return None
-
-    async def fake_build_base_context(request, current_user, *, extra=None):
-        context = {
-            "request": request,
-            "app_name": "MyPortal",
-            "current_year": 2025,
-            "current_user": current_user,
-            "available_companies": [],
-            "active_company": None,
-            "active_company_id": membership["company_id"],
-            "active_membership": membership,
-            "csrf_token": "csrf-token",
-            "cart_summary": {"item_count": 0, "total_quantity": 0, "subtotal": 0},
-            "notification_unread_count": 0,
-            "menu_access": main_module._build_menu_access_map(
-                is_super_admin=False,
-                membership_data=membership,
-            ),
-            "can_access_tickets": False,
-            "can_view_bcp": False,
-            "can_view_compliance": False,
-            "plausible_config": {"enabled": False, "site_domain": "", "base_url": ""},
-        }
-        if extra:
-            context.update(extra)
-        return context
-
-    monkeypatch.setattr(main_module, "_require_authenticated_user", fake_require_user)
-    monkeypatch.setattr(main_module, "_build_consolidated_overview", fake_overview)
-    monkeypatch.setattr(main_module, "_build_base_context", fake_build_base_context)
-    monkeypatch.setattr(scheduler_service, "run_system_update", fake_run_system_update)
-    main_module.templates.env.globals["plausible_config"] = {
-        "enabled": False,
-        "site_domain": "",
-        "base_url": "",
-    }
-
-    with TestClient(app) as client:
-        response = client.get("/")
-
-    assert response.status_code == 200
-    html = response.text
-    assert 'href="/m365"' in html
-    assert 'data-menu-key="/m365"' in html, (
-        "Office 365 expandable menu item must carry data-menu-key so it is included "
-        "in left menu customisation"
-    )
 
 
 def test_hidden_expandable_sidebar_items_are_not_displayed():
@@ -593,36 +526,6 @@ def test_super_admin_keeps_help_and_reports_menu_access():
 
     assert menu_access["menu.help"] == "write"
     assert menu_access["menu.reports"] == "write"
-
-
-def test_backup_summary_menu_permission_shows_admin_menu_without_super_admin():
-    from jinja2 import Environment, FileSystemLoader, select_autoescape
-
-    env = Environment(
-        loader=FileSystemLoader("app/templates"),
-        autoescape=select_autoescape(["html"]),
-    )
-    env.globals["static_url"] = lambda path: path
-    template = env.get_template("base.html")
-    html = template.render(
-        request=type("Request", (), {"url": type("Url", (), {"path": "/admin/backup-summary"})()})(),
-        current_user={"id": 2, "is_super_admin": False},
-        active_membership={},
-        menu_access={"menu.admin.backup_summary": "read"},
-        csrf_token=None,
-        available_companies=[],
-        app_name="MyPortal",
-        current_year=2026,
-        cart_summary={"item_count": 0, "total_quantity": 0},
-        plausible_config={"enabled": False},
-        static_url=lambda path: path,
-    )
-
-    assert "Administration" in html
-    assert 'href="/admin/backup-summary"' in html
-    assert "Backup Summary" in html
-    assert 'href="/admin/backup-jobs"' not in html
-    assert 'href="/admin/impersonation"' not in html
 
 
 def test_staff_menu_no_access_overrides_staff_assignment_levels():
