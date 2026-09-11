@@ -693,6 +693,19 @@ class Database:
             sql,
             flags=re.IGNORECASE,
         )
+
+        # SQLite appends newly-added columns and does not support MySQL's
+        # optional AFTER/FIRST placement clauses.  Leaving an AFTER clause in
+        # place makes the whole ADD COLUMN statement fail; because SQLite
+        # migrations tolerate individual MySQL-specific statements, that can
+        # otherwise leave the migration recorded without the required column.
+        sql = re.sub(
+            r'\s+AFTER\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s*$',
+            '',
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(r'\s+FIRST\s*$', '', sql, flags=re.IGNORECASE)
         
         # Handle ENUM types - convert to VARCHAR with CHECK constraint
         # This is a simplified approach; complex ENUMs may need manual handling

@@ -341,6 +341,18 @@ def test_sqlite_adapter_makes_conditional_add_column_executable() -> None:
     )
 
 
+def test_sqlite_adapter_removes_mysql_column_position_clause() -> None:
+    sql = Database()._adapt_sql_for_sqlite(
+        "ALTER TABLE ticket_statuses ADD COLUMN IF NOT EXISTS "
+        "is_default TINYINT(1) NOT NULL DEFAULT 0 AFTER public_status"
+    )
+
+    assert sql == (
+        "ALTER TABLE ticket_statuses ADD COLUMN "
+        "is_default TINYINT(1) NOT NULL DEFAULT 0"
+    )
+
+
 def test_ticket_relationship_repair_migration_is_complete() -> None:
     migration = Path("migrations/004_restore_ticket_merge_columns.sql").read_text(
         encoding="utf-8"
@@ -366,6 +378,17 @@ def test_ticket_status_configuration_repair_migration_is_complete() -> None:
     assert "idx_ticket_statuses_default" in migration
     assert "idx_ticket_statuses_hide_from_technicians" in migration
     assert "idx_ticket_statuses_hide_from_admins" in migration
+
+
+def test_ticket_status_configuration_follow_up_repairs_recorded_sqlite_migration() -> None:
+    migration = Path(
+        "migrations/007_repair_ticket_status_configuration.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "ADD COLUMN IF NOT EXISTS is_default" in migration
+    assert "ADD COLUMN IF NOT EXISTS hide_from_technicians" in migration
+    assert "ADD COLUMN IF NOT EXISTS hide_from_admins" in migration
+    assert "idx_ticket_statuses_default" in migration
 
 
 @pytest.mark.anyio
