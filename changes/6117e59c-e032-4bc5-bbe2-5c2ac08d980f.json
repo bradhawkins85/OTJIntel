@@ -1,0 +1,7 @@
+{
+  "guid": "6117e59c-e032-4bc5-bbe2-5c2ac08d980f",
+  "occurred_at": "2026-09-11T00:00:00Z",
+  "change_type": "Change",
+  "summary": "Remove the retired Essential 8 compliance pages and their sidebar navigation entry.",
+  "content_hash": "9ba292661b0d603dd8964ad6f77d7fb8ba614d6c3a5684971366bf7dc95e6979"
+}

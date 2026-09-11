@@ -11,8 +11,6 @@ from app.features.compliance import routes as compliance_routes
 
 
 EXPECTED = {
-    ("GET", "/compliance"),
-    ("GET", "/compliance/control/{control_id}"),
     ("GET", "/compliance-checks"),
     ("GET", "/compliance-checks/{assignment_id}"),
     ("GET", "/admin/compliance-checks/library"),
@@ -51,10 +49,7 @@ def test_app_main_no_longer_owns_compliance_routes():
             "feature-pack migration is incomplete."
         )
     for name in (
-        "_load_compliance_context",
         "_load_compliance_checks_context",
-        "compliance_page",
-        "compliance_control_requirements_page",
         "compliance_checks_page",
         "compliance_checks_detail_page",
         "compliance_checks_library_page",
@@ -67,15 +62,23 @@ def test_app_main_no_longer_owns_compliance_routes():
 
 def test_compliance_pack_owns_compliance_handlers():
     for name in (
-        "_load_compliance_context",
         "_load_compliance_checks_context",
-        "compliance_page",
-        "compliance_control_requirements_page",
         "compliance_checks_page",
         "compliance_checks_detail_page",
         "compliance_checks_library_page",
     ):
         assert hasattr(compliance_routes, name)
+
+
+def test_essential8_web_routes_are_not_exposed():
+    test_app = FastAPI()
+    for router in PACK.routers:
+        test_app.include_router(router)
+    declared = _routes_for(main_module.app) | _routes_for(test_app)
+
+    assert ("GET", "/compliance") not in declared
+    assert ("GET", "/compliance/control/{control_id}") not in declared
+    assert ("POST", "/compliance/requirements/{requirement_id}/ticket") not in declared
 
 
 def test_compliance_pack_loads_and_reloads_cleanly():
