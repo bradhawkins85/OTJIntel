@@ -1963,6 +1963,26 @@ CREATE TABLE IF NOT EXISTS ticket_attachments (
 ALTER TABLE ticket_labour_types
     ADD COLUMN IF NOT EXISTS rate DECIMAL(10,2) NULL AFTER name;
 
+-- Source: 133_labour_type_default.sql
+ALTER TABLE ticket_labour_types
+    ADD COLUMN IF NOT EXISTS is_default TINYINT(1) NOT NULL DEFAULT 0 AFTER rate;
+
+CREATE INDEX idx_ticket_labour_types_default
+    ON ticket_labour_types (is_default);
+
+UPDATE ticket_labour_types
+SET is_default = 1
+WHERE id = (
+    SELECT id FROM (
+        SELECT id FROM ticket_labour_types
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+    ) AS first_labour_type
+)
+AND NOT EXISTS (
+    SELECT 1 FROM ticket_labour_types WHERE is_default = 1
+);
+
 -- Source: 134_ticket_status_default.sql
 ALTER TABLE ticket_statuses 
 ADD COLUMN IF NOT EXISTS is_default TINYINT(1) NOT NULL DEFAULT 0 AFTER public_status;
